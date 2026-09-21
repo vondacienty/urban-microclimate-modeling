@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 import math
 
-__all__ = ["compute_uhi", "align_temp", "grid_features"]
+__all__ = ["compute_uhi", "align_temp", "grid_features", "fit_uhi_model"]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
 _SATELLITE_KEYS = frozenset({"cell_id", "timestamp", "lst_c"})
@@ -299,6 +299,23 @@ def align_temp(
     return results
 
 
+def _validate_aligned_row(row: object) -> tuple[int, str, float, float, float]:
+    """Validate one ``align_temp`` ``(t, c, s, l, d)`` five-tuple."""
+    if not isinstance(row, tuple) or len(row) != 5:
+        raise ValueError(
+            "each aligned row must be an align_temp "
+            "(timestamp, cell_id, station_c, satellite_c, diff_c) five-tuple"
+        )
+    timestamp, cell_id, station, satellite, diff = row
+    _validate_timestamp(timestamp)
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+    _validate_temperature(station, "station_c")
+    _validate_temperature(satellite, "satellite_c")
+    _validate_temperature(diff, "diff_c")
+    return timestamp, cell_id, station, satellite, diff
+
+
 def _validate_grid_number(value: object, name: str, *, positive: bool) -> Decimal:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite int or float")
@@ -321,6 +338,7 @@ def _validate_grid_item(item: object) -> tuple[str, str, Decimal, Decimal, Decim
     cell_id, kind, height, area, grid_area = item
     if not isinstance(cell_id, str) or not cell_id:
         raise ValueError("cell_id must be a non-empty string")
+    _check_hashable(kind, "kind")
     if kind not in _ITEM_KINDS:
         raise ValueError(
             "kind must be one of 'building', 'impervious', 'green' or 'other'"
@@ -387,12 +405,7 @@ def grid_features(
         raise TypeError("aligned must be a list")
     if not isinstance(items, list):
         raise TypeError("items must be a list")
-    for row in aligned:
-        if not isinstance(row, tuple) or len(row) != 5:
-            raise ValueError(
-                "each aligned row must be an align_temp "
-                "(timestamp, cell_id, station_c, satellite_c, diff_c) five-tuple"
-            )
+    aligned_rows = [_validate_aligned_row(row) for row in aligned]
 
     parsed = [_validate_grid_item(item) for item in items]
 
@@ -469,7 +482,7 @@ def grid_features(
             )
 
     results = []
-    for row in aligned:
+    for row in aligned_rows:
         cell_features = features.get(row[1])
         if cell_features is None:
             continue
@@ -488,3 +501,171 @@ def grid_features(
         )
     results.sort(key=lambda row: (row[0], row[1]))
     return results
+
+
+_QUANT6 = Decimal("0.000001")
+_RIDGE_PENALTY = Decimal("0.000001")
+_MODEL_PRECISION = 1000
+_MODEL_FEATURES = 4
+
+
+def _validate_model_number(
+    value: object, name: str, *, low: Decimal, high: Decimal
+) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite int or float")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    decimal_value = Decimal(str(value))
+    if decimal_value < low or decimal_value > high:
+        raise ValueError(f"{name} must be between {low} and {high} inclusive")
+    return decimal_value
+
+
+def _quantize6(value: Decimal) -> float:
+    result = float(value.quantize(_QUANT6, rounding=ROUND_HALF_EVEN))
+    return 0.0 if result == 0.0 else result
+
+
+def fit_uhi_model(
+    rows: list,
+) -> tuple[int, float, float, float, float, float, float]:
+    """Fit a ridge-regression model of the temperature difference on grid features.
+
+    ``rows`` is a non-empty list of nine-tuples
+    ``(timestamp, cell_id, station_c, satellite_c, d, h, b, i, g)`` where the
+    first five fields follow the ``align_temp`` row contract, ``h`` (mean
+    building height) is a non-negative finite number and ``b``/``i``/``g``
+    (building, impervious and green area fractions) are finite numbers in
+    ``[0, 1]``; booleans are rejected everywhere. ``(timestamp, cell_id)``
+    pairs must be unique.
+
+    The target is ``d`` and the features are ``h``, ``b``, ``i`` and ``g``,
+    with an intercept. Rows are processed in ascending ``(timestamp,
+    cell_id)`` order. Every number enters the computation as
+    ``Decimal(str(x))``; the ridge normal equations are assembled and solved
+    under a precision-1000, ROUND_HALF_EVEN local context. The penalty
+    ``0.000001`` is added to the four feature diagonal entries (not the
+    intercept's) and the system is solved by Gauss-Jordan elimination, each
+    pivot chosen as the largest absolute value in the remaining rows, ties
+    keeping the earliest row; a zero pivot raises ``ValueError``.
+
+    Returns ``(n, b0, bh, bb, bi, bg, r2)``: the sample count, intercept,
+    feature coefficients and ``1 - SSE/SST`` with
+    ``SST = sum((d - mean(d)) ** 2)`` (``r2`` is 0 when ``SST`` is 0). The
+    final six values are quantized to 6 decimals (ROUND_HALF_EVEN) and
+    returned as floats, with negative zero normalized to ``0.0``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    if not rows:
+        raise ValueError("rows must not be empty")
+
+    parsed: list[tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal]] = []
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) != 9:
+            raise ValueError(
+                "each row must be a "
+                "(timestamp, cell_id, station_c, satellite_c, d, h, b, i, g) "
+                "nine-tuple"
+            )
+        timestamp, cell_id, station, satellite, diff, height, build, imp, green = row
+        _validate_timestamp(timestamp)
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError("cell_id must be a non-empty string")
+        _validate_temperature(station, "station_c")
+        _validate_temperature(satellite, "satellite_c")
+        diff_d = _validate_temperature(diff, "d")
+        height_d = _validate_grid_number(height, "h", positive=False)
+        build_d = _validate_model_number(build, "b", low=Decimal(0), high=Decimal(1))
+        imp_d = _validate_model_number(imp, "i", low=Decimal(0), high=Decimal(1))
+        green_d = _validate_model_number(green, "g", low=Decimal(0), high=Decimal(1))
+        key = (timestamp, cell_id)
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append((timestamp, cell_id, height_d, build_d, imp_d, green_d, diff_d))
+
+    parsed.sort(key=lambda row: (row[0], row[1]))
+    n = len(parsed)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zero = Decimal(0)
+        one = Decimal(1)
+        # Columns: 0 = intercept, 1..4 = h, b, i, g.
+        size = _MODEL_FEATURES + 1
+        xtx = [[zero] * size for _ in range(size)]
+        xty = [zero] * size
+        for _, _, height, build, imp, green, diff in parsed:
+            features = (one, height, build, imp, green)
+            for j in range(size):
+                xty[j] += features[j] * diff
+                for k in range(j, size):
+                    xtx[j][k] += features[j] * features[k]
+        for j in range(size):
+            for k in range(j):
+                xtx[j][k] = xtx[k][j]
+        for j in range(1, size):
+            xtx[j][j] += _RIDGE_PENALTY
+
+        # Augmented matrix for Gauss-Jordan elimination.
+        matrix = [xtx[row_idx] + [xty[row_idx]] for row_idx in range(size)]
+        for col in range(size):
+            pivot = col
+            pivot_magnitude = abs(matrix[col][col])
+            for row_idx in range(col + 1, size):
+                magnitude = abs(matrix[row_idx][col])
+                if magnitude > pivot_magnitude:
+                    pivot_magnitude = magnitude
+                    pivot = row_idx
+            if pivot_magnitude == 0:
+                raise ValueError("singular design matrix: zero pivot in normal equations")
+            if pivot != col:
+                matrix[col], matrix[pivot] = matrix[pivot], matrix[col]
+            pivot_value = matrix[col][col]
+            for k in range(col, size + 1):
+                matrix[col][k] /= pivot_value
+            for row_idx in range(size):
+                if row_idx == col:
+                    continue
+                factor = matrix[row_idx][col]
+                if factor == 0:
+                    continue
+                for k in range(col, size + 1):
+                    matrix[row_idx][k] -= factor * matrix[col][k]
+
+        beta = [matrix[row_idx][size] for row_idx in range(size)]
+
+        diff_sum = zero
+        for _, _, _, _, _, _, diff in parsed:
+            diff_sum += diff
+        diff_mean = diff_sum / n
+
+        sst = zero
+        sse = zero
+        for _, _, height, build, imp, green, diff in parsed:
+            residual = diff - (
+                beta[0]
+                + beta[1] * height
+                + beta[2] * build
+                + beta[3] * imp
+                + beta[4] * green
+            )
+            sse += residual * residual
+            deviation = diff - diff_mean
+            sst += deviation * deviation
+        r2 = zero if sst == 0 else one - sse / sst
+
+        return (
+            n,
+            _quantize6(beta[0]),
+            _quantize6(beta[1]),
+            _quantize6(beta[2]),
+            _quantize6(beta[3]),
+            _quantize6(beta[4]),
+            _quantize6(r2),
+        )
