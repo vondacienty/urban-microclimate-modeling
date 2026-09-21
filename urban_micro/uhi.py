@@ -6,12 +6,15 @@ from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 import math
 
-__all__ = ["compute_uhi", "align_temp"]
+__all__ = ["compute_uhi", "align_temp", "grid_features"]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
 _SATELLITE_KEYS = frozenset({"cell_id", "timestamp", "lst_c"})
 _ZONES = frozenset({"urban", "rural"})
+_ITEM_KINDS = frozenset({"building", "impervious", "green", "other"})
+_COVERAGE_KINDS = frozenset({"impervious", "green", "other"})
 _QUANT = Decimal("0.001")
+_QUANT4 = Decimal("0.0001")
 
 
 def _validate_minutes(minutes: object) -> int:
@@ -293,4 +296,195 @@ def align_temp(
                         _quantize3(diff),
                     )
                 )
+    return results
+
+
+def _validate_grid_number(value: object, name: str, *, positive: bool) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite int or float")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    decimal_value = Decimal(str(value))
+    if positive:
+        if decimal_value <= 0:
+            raise ValueError(f"{name} must be greater than 0")
+    elif decimal_value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return decimal_value
+
+
+def _validate_grid_item(item: object) -> tuple[str, str, Decimal, Decimal, Decimal]:
+    if not isinstance(item, tuple) or len(item) != 5:
+        raise ValueError(
+            "each item must be a (cell_id, kind, height, area, grid_area) tuple"
+        )
+    cell_id, kind, height, area, grid_area = item
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+    if kind not in _ITEM_KINDS:
+        raise ValueError(
+            "kind must be one of 'building', 'impervious', 'green' or 'other'"
+        )
+    height_d = _validate_grid_number(height, "height", positive=False)
+    area_d = _validate_grid_number(area, "area", positive=False)
+    grid_area_d = _validate_grid_number(grid_area, "grid_area", positive=True)
+    if kind != "building" and height_d != 0:
+        raise ValueError("height of non-building items must be 0")
+    return cell_id, kind, height_d, area_d, grid_area_d
+
+
+def _grid_precision(decimals: list[Decimal]) -> int:
+    """Precision wide enough for exact sums/products and guarded division,
+    independent of the default decimal context."""
+    max_adj = 0
+    min_exp = 0
+    n = 0
+    for value in decimals:
+        n += 1
+        if not value.is_zero():
+            max_adj = max(max_adj, value.adjusted())
+            min_exp = min(min_exp, value.as_tuple().exponent)
+    span = max_adj - min_exp + 1
+    # products join two spans; summing n values adds log10(n) digits; keep a
+    # guard margin for division and the 4-decimal quantization.
+    return 2 * span + 5 * len(str(max(n, 1))) + 20
+
+
+def _quantize4(value: Decimal) -> float:
+    result = float(value.quantize(_QUANT4, rounding=ROUND_HALF_EVEN))
+    return 0.0 if result == 0.0 else result
+
+
+def grid_features(
+    aligned: list, items: list
+) -> list[tuple[int, object, float, float, float, float, float, float, float]]:
+    """Attach grid-geometry features to aligned temperature rows.
+
+    ``aligned`` is a list of ``align_temp`` five-tuples
+    ``(timestamp, cell_id, station_c, satellite_c, diff_c)``. ``items`` is a
+    list of ``(cell_id, kind, height, area, grid_area)`` tuples, where kind is
+    ``building``, ``impervious``, ``green`` or ``other``. Heights and areas are
+    non-negative finite numbers (booleans rejected); ``grid_area`` must be
+    positive; non-building items must have height 0. All items sharing a
+    cell_id must have the same grid area (compared via ``Decimal(str(x))``);
+    per cell, both the total building area and the total non-building area
+    must not exceed the grid area.
+
+    Non-building kinds are coverage items (zero-area items still count as
+    present). A grid cell is kept only when it has at least one building
+    item, at least one coverage item and the coverage area equals the grid
+    area. For each kept cell referenced by an aligned row, four features are
+    appended: the area-weighted mean building height
+    ``sum(h*a)/sum(a)`` (0 when the total building area is 0), and the
+    building, impervious and green area fractions (each sum divided by the
+    grid area). All sums, products, comparisons and division use
+    ``Decimal(str(x))`` under a raised-precision local context; features are
+    quantized to 4 decimals (ROUND_HALF_EVEN) and returned as floats, with
+    negative zero normalized to ``0.0``. Rows are sorted by timestamp then
+    cell_id.
+    """
+    if not isinstance(aligned, list):
+        raise TypeError("aligned must be a list")
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    for row in aligned:
+        if not isinstance(row, tuple) or len(row) != 5:
+            raise ValueError(
+                "each aligned row must be an align_temp "
+                "(timestamp, cell_id, station_c, satellite_c, diff_c) five-tuple"
+            )
+
+    parsed = [_validate_grid_item(item) for item in items]
+
+    precision_inputs: list[Decimal] = []
+    for _, _, height, area, grid_area in parsed:
+        precision_inputs.extend((height, area, grid_area))
+
+    zero = Decimal(0)
+    with localcontext() as ctx:
+        ctx.prec = _grid_precision(precision_inputs)
+        # cell_id -> {"g", "buildings": [(h, a)], "b_area", "cov_area",
+        #              "imp_area", "green_area", "n_build", "n_cov"}
+        cells: dict[str, dict] = {}
+        for cell_id, kind, height, area, grid_area in parsed:
+            entry = cells.get(cell_id)
+            if entry is None:
+                entry = {
+                    "g": grid_area,
+                    "buildings": [],
+                    "b_area": zero,
+                    "cov_area": zero,
+                    "imp_area": zero,
+                    "green_area": zero,
+                    "n_build": 0,
+                    "n_cov": 0,
+                }
+                cells[cell_id] = entry
+            elif entry["g"] != grid_area:
+                raise ValueError(
+                    f"grid_area for cell {cell_id!r} must be consistent across items"
+                )
+            if kind == "building":
+                entry["n_build"] += 1
+                entry["b_area"] += area
+                entry["buildings"].append((height, area))
+            else:
+                entry["n_cov"] += 1
+                entry["cov_area"] += area
+                if kind == "impervious":
+                    entry["imp_area"] += area
+                elif kind == "green":
+                    entry["green_area"] += area
+
+        for cell_id, entry in cells.items():
+            if entry["b_area"] > entry["g"]:
+                raise ValueError(
+                    f"total building area for cell {cell_id!r} exceeds grid_area"
+                )
+            if entry["cov_area"] > entry["g"]:
+                raise ValueError(
+                    f"total non-building area for cell {cell_id!r} exceeds grid_area"
+                )
+
+        features: dict[str, tuple[float, float, float, float]] = {}
+        for cell_id, entry in cells.items():
+            if entry["n_build"] < 1 or entry["n_cov"] < 1:
+                continue
+            if entry["cov_area"] != entry["g"]:
+                continue
+            grid_area = entry["g"]
+            building_area = entry["b_area"]
+            if building_area == 0:
+                mean_height = zero
+            else:
+                weighted = zero
+                for height, area in entry["buildings"]:
+                    weighted += height * area
+                mean_height = weighted / building_area
+            features[cell_id] = (
+                _quantize4(mean_height),
+                _quantize4(building_area / grid_area),
+                _quantize4(entry["imp_area"] / grid_area),
+                _quantize4(entry["green_area"] / grid_area),
+            )
+
+    results = []
+    for row in aligned:
+        cell_features = features.get(row[1])
+        if cell_features is None:
+            continue
+        results.append(
+            (
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                cell_features[0],
+                cell_features[1],
+                cell_features[2],
+                cell_features[3],
+            )
+        )
+    results.sort(key=lambda row: (row[0], row[1]))
     return results
