@@ -6,7 +6,14 @@ from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 import math
 
-__all__ = ["compute_uhi", "align_temp", "grid_features", "fit_uhi_model", "scenario"]
+__all__ = [
+    "compute_uhi",
+    "align_temp",
+    "grid_features",
+    "fit_uhi_model",
+    "scenario",
+    "attribute_effects",
+]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
 _SATELLITE_KEYS = frozenset({"cell_id", "timestamp", "lst_c"})
@@ -823,3 +830,136 @@ def scenario(
             _quantize6(delta_sum / count),
         )
     return details, summary
+
+
+def _validate_effect_row(
+    row: object,
+) -> tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal]:
+    """Validate one scenario ``(t, c, base, post, delta, cg, cr, cm)`` eight-tuple."""
+    if not isinstance(row, tuple) or len(row) != 8:
+        raise ValueError(
+            "each detail must be a "
+            "(t, c, base, post, delta, cg, cr, cm) eight-tuple"
+        )
+    timestamp, cell_id, base, post, delta, cg, cr, cm = row
+    _validate_timestamp(timestamp)
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("c must be a non-empty string")
+    return (
+        timestamp,
+        cell_id,
+        _validate_finite_number(base, "base"),
+        _validate_finite_number(post, "post"),
+        _validate_finite_number(delta, "delta"),
+        _validate_finite_number(cg, "cg"),
+        _validate_finite_number(cr, "cr"),
+        _validate_finite_number(cm, "cm"),
+    )
+
+
+def attribute_effects(
+    details: list,
+    *,
+    by: str,
+    minutes: int = 60,
+) -> list[tuple[object, int, float, float, float, float, float, float, float]]:
+    """Aggregate scenario details by time bucket or grid cell.
+
+    ``details`` is a list of scenario eight-tuples
+    ``(t, c, base, post, delta, cg, cr, cm)``: ``t`` is a non-boolean
+    non-negative integer, ``c`` is a non-empty string and the other six
+    fields are non-boolean finite ints or floats; ``(t, c)`` pairs must be
+    unique. An empty list returns ``[]``.
+
+    ``by`` is ``"time"`` (bucket ``t`` by Unix epoch, floored to
+    ``minutes``-sized buckets) or ``"cell"`` (group by ``c``); ``minutes``
+    must be a non-boolean integer in ``1..1440`` that divides 1440.
+
+    Returns ``(key, n, base, post, delta, cg, cr, cm, p)`` tuples sorted by
+    key, with the six numeric fields the arithmetic means over the group.
+    ``p`` is the (capped at 1) two-sided exact sign-test p-value from the
+    ``delta`` values: ``r``/``s`` count positive/negative samples (zeros
+    ignored), ``m = r + s``, ``q = min(r, s)``; ``p = 1`` when ``m == 0``,
+    otherwise ``min(1, 2 * sum(C(m, k), k=0..q) / 2**m)``. Every number
+    enters as ``Decimal(str(x))`` under a precision-1000, ROUND_HALF_EVEN
+    local context; the six means and ``p`` are quantized to 6 decimals and
+    returned as floats, negative zero normalized to ``0.0``.
+
+    ``details`` not being a list raises ``TypeError``; every other contract
+    violation (field types, tuple shape, duplicate ``(t, c)``, ``by`` or
+    ``minutes``) raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if by not in ("time", "cell"):
+        raise ValueError("by must be 'time' or 'cell'")
+    minutes = _validate_minutes(minutes)
+
+    if not details:
+        return []
+
+    parsed = [_validate_effect_row(row) for row in details]
+
+    seen: set[tuple[int, str]] = set()
+    groups: dict[object, list] = {}
+    bucket_seconds = minutes * 60
+    for timestamp, cell_id, base, post, delta, cg, cr, cm in parsed:
+        pair = (timestamp, cell_id)
+        if pair in seen:
+            raise ValueError(f"duplicate (t, c) pair: {pair!r}")
+        seen.add(pair)
+        key = (timestamp // bucket_seconds) * bucket_seconds if by == "time" else cell_id
+        groups.setdefault(key, []).append((base, post, delta, cg, cr, cm))
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zero = Decimal(0)
+        one = Decimal(1)
+        two = Decimal(2)
+        results = []
+        for key in sorted(groups):
+            rows = groups[key]
+            n = len(rows)
+            sums = [zero] * 6
+            positives = 0
+            negatives = 0
+            for base, post, delta, cg, cr, cm in rows:
+                values = (base, post, delta, cg, cr, cm)
+                for j in range(6):
+                    sums[j] += values[j]
+                if delta > 0:
+                    positives += 1
+                elif delta < 0:
+                    negatives += 1
+
+            m = positives + negatives
+            if m == 0:
+                p_value = one
+            else:
+                q = min(positives, negatives)
+                # Exact binomial tail: sum C(m, k), k = 0..q, over 2**m.
+                tail = zero
+                combin = 1
+                for k in range(q + 1):
+                    tail += Decimal(combin)
+                    combin = combin * (m - k) // (k + 1)
+                p_value = two * tail / (two ** m)
+                if p_value > one:
+                    p_value = one
+
+            results.append(
+                (
+                    key,
+                    n,
+                    _quantize6(sums[0] / n),
+                    _quantize6(sums[1] / n),
+                    _quantize6(sums[2] / n),
+                    _quantize6(sums[3] / n),
+                    _quantize6(sums[4] / n),
+                    _quantize6(sums[5] / n),
+                    _quantize6(p_value),
+                )
+            )
+    return results
