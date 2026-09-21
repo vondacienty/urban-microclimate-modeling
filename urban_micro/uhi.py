@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 import math
 
-__all__ = ["compute_uhi", "align_temp", "grid_features", "fit_uhi_model"]
+__all__ = ["compute_uhi", "align_temp", "grid_features", "fit_uhi_model", "scenario"]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
 _SATELLITE_KEYS = frozenset({"cell_id", "timestamp", "lst_c"})
@@ -527,6 +527,55 @@ def _quantize6(value: Decimal) -> float:
     return 0.0 if result == 0.0 else result
 
 
+def _validate_feature_row(row: object) -> tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal]:
+    """Validate one ``(t, c, s, l, d, h, b, i, g)`` nine-tuple.
+
+    Returns ``(timestamp, cell_id, h, b, i, g, d)`` as Decimals, sharing the
+    non-empty rows contract of ``fit_uhi_model`` with ``scenario``.
+    """
+    if not isinstance(row, tuple) or len(row) != 9:
+        raise ValueError(
+            "each row must be a "
+            "(timestamp, cell_id, station_c, satellite_c, d, h, b, i, g) "
+            "nine-tuple"
+        )
+    timestamp, cell_id, station, satellite, diff, height, build, imp, green = row
+    _validate_timestamp(timestamp)
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+    _validate_temperature(station, "station_c")
+    _validate_temperature(satellite, "satellite_c")
+    diff_d = _validate_temperature(diff, "d")
+    height_d = _validate_grid_number(height, "h", positive=False)
+    build_d = _validate_model_number(build, "b", low=Decimal(0), high=Decimal(1))
+    imp_d = _validate_model_number(imp, "i", low=Decimal(0), high=Decimal(1))
+    green_d = _validate_model_number(green, "g", low=Decimal(0), high=Decimal(1))
+    return timestamp, cell_id, height_d, build_d, imp_d, green_d, diff_d
+
+
+def _parse_feature_rows(
+    rows: object,
+) -> list[tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal]]:
+    """Validate the non-empty rows contract shared by model fitting and scenarios."""
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    if not rows:
+        raise ValueError("rows must not be empty")
+    parsed: list[tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal]] = []
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        timestamp, cell_id, height_d, build_d, imp_d, green_d, diff_d = (
+            _validate_feature_row(row)
+        )
+        key = (timestamp, cell_id)
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append((timestamp, cell_id, height_d, build_d, imp_d, green_d, diff_d))
+    parsed.sort(key=lambda row: (row[0], row[1]))
+    return parsed
+
+
 def fit_uhi_model(
     rows: list,
 ) -> tuple[int, float, float, float, float, float, float]:
@@ -556,38 +605,7 @@ def fit_uhi_model(
     final six values are quantized to 6 decimals (ROUND_HALF_EVEN) and
     returned as floats, with negative zero normalized to ``0.0``.
     """
-    if not isinstance(rows, list):
-        raise TypeError("rows must be a list")
-    if not rows:
-        raise ValueError("rows must not be empty")
-
-    parsed: list[tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal]] = []
-    seen: set[tuple[int, str]] = set()
-    for row in rows:
-        if not isinstance(row, tuple) or len(row) != 9:
-            raise ValueError(
-                "each row must be a "
-                "(timestamp, cell_id, station_c, satellite_c, d, h, b, i, g) "
-                "nine-tuple"
-            )
-        timestamp, cell_id, station, satellite, diff, height, build, imp, green = row
-        _validate_timestamp(timestamp)
-        if not isinstance(cell_id, str) or not cell_id:
-            raise ValueError("cell_id must be a non-empty string")
-        _validate_temperature(station, "station_c")
-        _validate_temperature(satellite, "satellite_c")
-        diff_d = _validate_temperature(diff, "d")
-        height_d = _validate_grid_number(height, "h", positive=False)
-        build_d = _validate_model_number(build, "b", low=Decimal(0), high=Decimal(1))
-        imp_d = _validate_model_number(imp, "i", low=Decimal(0), high=Decimal(1))
-        green_d = _validate_model_number(green, "g", low=Decimal(0), high=Decimal(1))
-        key = (timestamp, cell_id)
-        if key in seen:
-            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
-        seen.add(key)
-        parsed.append((timestamp, cell_id, height_d, build_d, imp_d, green_d, diff_d))
-
-    parsed.sort(key=lambda row: (row[0], row[1]))
+    parsed = _parse_feature_rows(rows)
     n = len(parsed)
 
     with localcontext() as ctx:
@@ -669,3 +687,139 @@ def fit_uhi_model(
             _quantize6(beta[4]),
             _quantize6(r2),
         )
+
+
+def _validate_finite_number(value: object, name: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite int or float")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return Decimal(str(value))
+
+
+def scenario(
+    model: tuple,
+    rows: list,
+    actions: list,
+    *,
+    roof_c: float = 0.0,
+    material_c: float = 0.0,
+) -> tuple[list[tuple], tuple[int, float, float, float]]:
+    """Apply green-space, cool-roof and cool-material actions to fitted rows.
+
+    ``model`` is a ``fit_uhi_model`` return value
+    ``(n, b0, bh, bb, bi, bg, r2)`` and ``rows`` follows the same non-empty
+    ``(timestamp, cell_id, station_c, satellite_c, d, h, b, i, g)`` contract
+    as ``fit_uhi_model`` (unique ``(timestamp, cell_id)`` pairs). ``actions``
+    is a list of ``(c, G, R, M)`` tuples: ``c`` is a cell id that must be
+    unique within ``actions`` and occur in ``rows``; ``G`` (green), ``R``
+    (roof) and ``M`` (material) are finite non-boolean numbers in ``[0, 1]``.
+    For every row sharing a listed cell, ``G + M <= i`` and ``R <= b`` must
+    hold; unlisted cells get ``G = R = M = 0``. ``roof_c`` and
+    ``material_c`` are non-negative finite non-boolean cost coefficients
+    (keyword-only, default ``0.0``).
+
+    For each row, ``base = b0 + bh*h + bb*b + bi*i + bg*g``,
+    ``cg = (bg - bi) * G``, ``cr = -roof_c * R``, ``cm = -material_c * M``,
+    ``post = base + cg + cr + cm`` and ``delta = post - base``. All numbers
+    enter as ``Decimal(str(x))`` under a precision-1000, ROUND_HALF_EVEN
+    local context.
+
+    Returns ``(details, summary)``: ``details`` lists
+    ``(timestamp, cell_id, base, post, delta, cg, cr, cm)`` tuples in
+    ascending ``(timestamp, cell_id)`` order, with the six numeric fields
+    quantized to 6 decimals (ROUND_HALF_EVEN) as floats, negative zero
+    normalized to ``0.0``; ``summary`` is
+    ``(count, base_mean, post_mean, delta_mean)`` with the means computed
+    from the unquantized per-row values before 6-decimal quantization.
+    ``rows`` or ``actions`` not being a list raises ``TypeError``; every
+    other contract violation raises ``ValueError``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    if not isinstance(actions, list):
+        raise TypeError("actions must be a list")
+
+    parsed = _parse_feature_rows(rows)
+
+    if not isinstance(model, tuple) or len(model) != 7:
+        raise ValueError(
+            "model must be a fit_uhi_model (n, b0, bh, bb, bi, bg, r2) seven-tuple"
+        )
+    model_n, b0_v, bh_v, bb_v, bi_v, bg_v, r2_v = model
+    if isinstance(model_n, bool) or not isinstance(model_n, int) or model_n < 1:
+        raise ValueError("model n must be a positive integer")
+    b0 = _validate_finite_number(b0_v, "b0")
+    bh = _validate_finite_number(bh_v, "bh")
+    bb = _validate_finite_number(bb_v, "bb")
+    bi = _validate_finite_number(bi_v, "bi")
+    bg = _validate_finite_number(bg_v, "bg")
+    _validate_finite_number(r2_v, "r2")
+
+    roof_cost = _validate_grid_number(roof_c, "roof_c", positive=False)
+    material_cost = _validate_grid_number(material_c, "material_c", positive=False)
+
+    zero = Decimal(0)
+    one = Decimal(1)
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    action_map: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
+    for item in actions:
+        if not isinstance(item, tuple) or len(item) != 4:
+            raise ValueError("each action must be a (c, G, R, M) four-tuple")
+        cell_id, green_v, roof_v, material_v = item
+        _check_hashable(cell_id, "c")
+        if cell_id not in cell_ids:
+            raise ValueError(f"unknown cell id in action: {cell_id!r}")
+        if cell_id in action_map:
+            raise ValueError(f"duplicate action cell id: {cell_id!r}")
+        green = _validate_model_number(green_v, "G", low=zero, high=one)
+        roof = _validate_model_number(roof_v, "R", low=zero, high=one)
+        material = _validate_model_number(material_v, "M", low=zero, high=one)
+        action_map[cell_id] = (green, roof, material)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        details = []
+        base_sum = zero
+        post_sum = zero
+        delta_sum = zero
+        for timestamp, cell_id, height, build, imp, green_frac, _d in parsed:
+            green, roof, material = action_map.get(cell_id, (zero, zero, zero))
+            if cell_id in action_map and (green + material > imp or roof > build):
+                raise ValueError(
+                    f"action for cell {cell_id!r} exceeds available area: "
+                    "G + M must be <= i and R must be <= b"
+                )
+            base = b0 + bh * height + bb * build + bi * imp + bg * green_frac
+            cg = (bg - bi) * green
+            cr = -roof_cost * roof
+            cm = -material_cost * material
+            post = base + cg + cr + cm
+            delta = post - base
+
+            base_sum += base
+            post_sum += post
+            delta_sum += delta
+            details.append(
+                (
+                    timestamp,
+                    cell_id,
+                    _quantize6(base),
+                    _quantize6(post),
+                    _quantize6(delta),
+                    _quantize6(cg),
+                    _quantize6(cr),
+                    _quantize6(cm),
+                )
+            )
+
+        count = len(details)
+        summary = (
+            count,
+            _quantize6(base_sum / count),
+            _quantize6(post_sum / count),
+            _quantize6(delta_sum / count),
+        )
+    return details, summary
