@@ -6,7 +6,14 @@ from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 import math
 
-__all__ = ["compute_uhi", "align_temp", "grid_features", "fit_uhi_model", "scenario"]
+__all__ = [
+    "compute_uhi",
+    "align_temp",
+    "grid_features",
+    "fit_uhi_model",
+    "scenario",
+    "attribute_effects",
+]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
 _SATELLITE_KEYS = frozenset({"cell_id", "timestamp", "lst_c"})
@@ -823,3 +830,114 @@ def scenario(
             _quantize6(delta_sum / count),
         )
     return details, summary
+
+
+_DETAIL_FIELDS = ("base", "post", "delta", "cg", "cr", "cm")
+
+
+def _validate_detail_row(
+    row: object,
+) -> tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal]:
+    """Validate one ``scenario`` ``(t, c, base, post, delta, cg, cr, cm)`` eight-tuple."""
+    if not isinstance(row, tuple) or len(row) != 8:
+        raise ValueError(
+            "each detail must be a scenario "
+            "(timestamp, cell_id, base, post, delta, cg, cr, cm) eight-tuple"
+        )
+    timestamp, cell_id = row[0], row[1]
+    _validate_timestamp(timestamp)
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+    values = tuple(
+        _validate_finite_number(value, name)
+        for value, name in zip(row[2:], _DETAIL_FIELDS)
+    )
+    return (timestamp, cell_id) + values
+
+
+def attribute_effects(
+    details: list,
+    *,
+    by: str,
+    minutes: int = 60,
+) -> list[tuple]:
+    """Aggregate scenario details and sign-test the deltas per group.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``; the six numeric fields must be finite
+    non-boolean int/float values and ``(timestamp, cell_id)`` pairs must be
+    unique. An empty list returns ``[]``. ``by`` is ``"time"`` (rows are
+    bucketed by Unix epoch, floored to ``minutes``-sized buckets) or
+    ``"cell"`` (rows are grouped by cell id); ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440.
+
+    Returns a list of ``(key, n, base, post, delta, cg, cr, cm, p)``
+    nine-tuples sorted by ascending group key, where ``n`` is the group size
+    and ``base``..``cm`` are the within-group arithmetic means. ``p`` is the
+    two-sided sign-test p-value of the deltas: with ``r``/``s`` the counts of
+    positive/negative deltas (zeros ignored), ``m = r + s`` and
+    ``q = min(r, s)``, ``p`` is 1 when ``m`` is 0 and
+    ``min(1, 2 * sum(C(m, k) for k in 0..q) / 2**m)`` otherwise.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context; the six means and ``p``
+    are quantized to 6 decimals (ROUND_HALF_EVEN) and returned as floats,
+    with negative zero normalized to ``0.0``. ``details`` not being a list
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if by not in ("time", "cell"):
+        raise ValueError("by must be 'time' or 'cell'")
+    minutes = _validate_minutes(minutes)
+
+    if not details:
+        return []
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        groups: dict[object, list[tuple[Decimal, ...]]] = {}
+        for validated in parsed:
+            timestamp, cell_id, values = validated[0], validated[1], validated[2:]
+            if by == "time":
+                group_key = (timestamp // bucket_seconds) * bucket_seconds
+            else:
+                group_key = cell_id
+            groups.setdefault(group_key, []).append(values)
+
+        results = []
+        for group_key in sorted(groups):
+            rows = groups[group_key]
+            n = len(rows)
+            means = []
+            for index in range(6):
+                total = Decimal(0)
+                for values in rows:
+                    total += values[index]
+                means.append(_quantize6(total / n))
+
+            r = sum(1 for values in rows if values[2] > 0)
+            s = sum(1 for values in rows if values[2] < 0)
+            m = r + s
+            if m == 0:
+                p = Decimal(1)
+            else:
+                q = min(r, s)
+                tail = sum(math.comb(m, k) for k in range(q + 1))
+                p = min(Decimal(1), 2 * Decimal(tail) / Decimal(2**m))
+            results.append((group_key, n, *means, _quantize6(p)))
+    return results
