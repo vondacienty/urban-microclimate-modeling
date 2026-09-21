@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 import math
 
-__all__ = ["compute_uhi", "align_temp", "grid_features", "fit_uhi_model"]
+__all__ = ["compute_uhi", "align_temp", "grid_features", "fit_uhi_model", "scenario"]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
 _SATELLITE_KEYS = frozenset({"cell_id", "timestamp", "lst_c"})
@@ -527,35 +527,10 @@ def _quantize6(value: Decimal) -> float:
     return 0.0 if result == 0.0 else result
 
 
-def fit_uhi_model(
-    rows: list,
-) -> tuple[int, float, float, float, float, float, float]:
-    """Fit a ridge-regression model of the temperature difference on grid features.
-
-    ``rows`` is a non-empty list of nine-tuples
-    ``(timestamp, cell_id, station_c, satellite_c, d, h, b, i, g)`` where the
-    first five fields follow the ``align_temp`` row contract, ``h`` (mean
-    building height) is a non-negative finite number and ``b``/``i``/``g``
-    (building, impervious and green area fractions) are finite numbers in
-    ``[0, 1]``; booleans are rejected everywhere. ``(timestamp, cell_id)``
-    pairs must be unique.
-
-    The target is ``d`` and the features are ``h``, ``b``, ``i`` and ``g``,
-    with an intercept. Rows are processed in ascending ``(timestamp,
-    cell_id)`` order. Every number enters the computation as
-    ``Decimal(str(x))``; the ridge normal equations are assembled and solved
-    under a precision-1000, ROUND_HALF_EVEN local context. The penalty
-    ``0.000001`` is added to the four feature diagonal entries (not the
-    intercept's) and the system is solved by Gauss-Jordan elimination, each
-    pivot chosen as the largest absolute value in the remaining rows, ties
-    keeping the earliest row; a zero pivot raises ``ValueError``.
-
-    Returns ``(n, b0, bh, bb, bi, bg, r2)``: the sample count, intercept,
-    feature coefficients and ``1 - SSE/SST`` with
-    ``SST = sum((d - mean(d)) ** 2)`` (``r2`` is 0 when ``SST`` is 0). The
-    final six values are quantized to 6 decimals (ROUND_HALF_EVEN) and
-    returned as floats, with negative zero normalized to ``0.0``.
-    """
+def _parse_fit_rows(
+    rows: object,
+) -> list[tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal]]:
+    """Validate ``fit_uhi_model`` rows and return them sorted by (t, cell_id)."""
     if not isinstance(rows, list):
         raise TypeError("rows must be a list")
     if not rows:
@@ -588,6 +563,39 @@ def fit_uhi_model(
         parsed.append((timestamp, cell_id, height_d, build_d, imp_d, green_d, diff_d))
 
     parsed.sort(key=lambda row: (row[0], row[1]))
+    return parsed
+
+
+def fit_uhi_model(
+    rows: list,
+) -> tuple[int, float, float, float, float, float, float]:
+    """Fit a ridge-regression model of the temperature difference on grid features.
+
+    ``rows`` is a non-empty list of nine-tuples
+    ``(timestamp, cell_id, station_c, satellite_c, d, h, b, i, g)`` where the
+    first five fields follow the ``align_temp`` row contract, ``h`` (mean
+    building height) is a non-negative finite number and ``b``/``i``/``g``
+    (building, impervious and green area fractions) are finite numbers in
+    ``[0, 1]``; booleans are rejected everywhere. ``(timestamp, cell_id)``
+    pairs must be unique.
+
+    The target is ``d`` and the features are ``h``, ``b``, ``i`` and ``g``,
+    with an intercept. Rows are processed in ascending ``(timestamp,
+    cell_id)`` order. Every number enters the computation as
+    ``Decimal(str(x))``; the ridge normal equations are assembled and solved
+    under a precision-1000, ROUND_HALF_EVEN local context. The penalty
+    ``0.000001`` is added to the four feature diagonal entries (not the
+    intercept's) and the system is solved by Gauss-Jordan elimination, each
+    pivot chosen as the largest absolute value in the remaining rows, ties
+    keeping the earliest row; a zero pivot raises ``ValueError``.
+
+    Returns ``(n, b0, bh, bb, bi, bg, r2)``: the sample count, intercept,
+    feature coefficients and ``1 - SSE/SST`` with
+    ``SST = sum((d - mean(d)) ** 2)`` (``r2`` is 0 when ``SST`` is 0). The
+    final six values are quantized to 6 decimals (ROUND_HALF_EVEN) and
+    returned as floats, with negative zero normalized to ``0.0``.
+    """
+    parsed = _parse_fit_rows(rows)
     n = len(parsed)
 
     with localcontext() as ctx:
@@ -669,3 +677,148 @@ def fit_uhi_model(
             _quantize6(beta[4]),
             _quantize6(r2),
         )
+
+
+def _validate_model_fit(model: object) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal]:
+    """Validate a ``fit_uhi_model`` return value and return ``b0, bh, bb, bi, bg``."""
+    if not isinstance(model, tuple) or len(model) != 7:
+        raise ValueError(
+            "model must be a fit_uhi_model (n, b0, bh, bb, bi, bg, r2) seven-tuple"
+        )
+    n = model[0]
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise ValueError("model n must be an integer")
+    if n < 1:
+        raise ValueError("model n must be a positive integer")
+    coefficients = []
+    for value, name in zip(model[1:], ("b0", "bh", "bb", "bi", "bg", "r2")):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"model {name} must be a finite int or float")
+        if not math.isfinite(value):
+            raise ValueError(f"model {name} must be finite")
+        coefficients.append(Decimal(str(value)))
+    return coefficients[0], coefficients[1], coefficients[2], coefficients[3], coefficients[4]
+
+
+def _validate_action(item: object) -> tuple[str, Decimal, Decimal, Decimal]:
+    """Validate one ``(cell_id, G, R, M)`` action tuple."""
+    if not isinstance(item, tuple) or len(item) != 4:
+        raise ValueError("each action must be a (cell_id, G, R, M) four-tuple")
+    cell_id, green, roof, material = item
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("action cell_id must be a non-empty string")
+    green_d = _validate_model_number(green, "G", low=Decimal(0), high=Decimal(1))
+    roof_d = _validate_model_number(roof, "R", low=Decimal(0), high=Decimal(1))
+    material_d = _validate_model_number(material, "M", low=Decimal(0), high=Decimal(1))
+    return cell_id, green_d, roof_d, material_d
+
+
+def scenario(
+    model: tuple,
+    rows: list,
+    actions: list,
+    *,
+    roof_c: float = 0.0,
+    material_c: float = 0.0,
+) -> tuple[list[tuple[int, str, float, float, float, float, float, float]], tuple[int, float, float, float]]:
+    """Evaluate green/roof/material intervention scenarios against a fitted model.
+
+    ``model`` is a ``fit_uhi_model`` return value ``(n, b0, bh, bb, bi, bg,
+    r2)`` and ``rows`` follows the ``fit_uhi_model`` non-empty input contract
+    (unique ``(timestamp, cell_id)`` nine-tuples). ``actions`` is a list of
+    ``(cell_id, G, R, M)`` tuples giving the added green, roof and material
+    fractions for a cell; each cell_id must be unique and appear in ``rows``.
+    ``G``, ``R``, ``M``, ``roof_c`` and ``material_c`` must be non-bool finite
+    ints or floats, the first three in ``[0, 1]`` and the latter two
+    non-negative. For every row of an action's cell, ``G + M <= i`` and
+    ``R <= b`` must hold. Cells without an action use ``G = R = M = 0``.
+
+    For each row, ``base = b0 + bh*h + bb*b + bi*i + bg*g``,
+    ``(cg, cr, cm) = ((bg - bi)*G, -roof_c*R, -material_c*M)``,
+    ``post = base + cg + cr + cm`` and ``delta = post - base``. All arithmetic
+    uses ``Decimal(str(x))`` under a precision-1000, ROUND_HALF_EVEN local
+    context; results are quantized to 6 decimals (ROUND_HALF_EVEN), returned
+    as floats with negative zero normalized to ``0.0``.
+
+    Returns ``(details, summary)``: ``details`` is a list of
+    ``(timestamp, cell_id, base, post, delta, cg, cr, cm)`` tuples sorted by
+    ``(timestamp, cell_id)``; ``summary`` is ``(count, base_mean, post_mean,
+    delta_mean)`` with the means computed from the unquantized values.
+    """
+    parsed = _parse_fit_rows(rows)
+    if not isinstance(actions, list):
+        raise TypeError("actions must be a list")
+    b0, bh, bb, bi, bg = _validate_model_fit(model)
+    roof_c_d = _validate_grid_number(roof_c, "roof_c", positive=False)
+    material_c_d = _validate_grid_number(material_c, "material_c", positive=False)
+
+    action_map: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
+    row_cells = {cell_id for _, cell_id, *_ in parsed}
+    for item in actions:
+        cell_id, green_d, roof_d, material_d = _validate_action(item)
+        if cell_id in action_map:
+            raise ValueError(f"duplicate action cell_id: {cell_id!r}")
+        if cell_id not in row_cells:
+            raise ValueError(f"action cell_id not present in rows: {cell_id!r}")
+        action_map[cell_id] = (green_d, roof_d, material_d)
+
+    for cell_id, (green_d, roof_d, material_d) in action_map.items():
+        for _, row_cell, _, build_d, imp_d, _, _ in parsed:
+            if row_cell != cell_id:
+                continue
+            if green_d + material_d > imp_d:
+                raise ValueError(
+                    f"G + M for cell {cell_id!r} exceeds the row's impervious fraction"
+                )
+            if roof_d > build_d:
+                raise ValueError(
+                    f"R for cell {cell_id!r} exceeds the row's building fraction"
+                )
+
+    zero = Decimal(0)
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        details = []
+        base_sum = zero
+        post_sum = zero
+        delta_sum = zero
+        for timestamp, cell_id, height_d, build_d, imp_d, green_d, _ in parsed:
+            action_g, action_r, action_m = action_map.get(cell_id, (zero, zero, zero))
+            base = (
+                b0
+                + bh * height_d
+                + bb * build_d
+                + bi * imp_d
+                + bg * green_d
+            )
+            cg = (bg - bi) * action_g
+            cr = -roof_c_d * action_r
+            cm = -material_c_d * action_m
+            post = base + cg + cr + cm
+            delta = post - base
+            base_sum += base
+            post_sum += post
+            delta_sum += delta
+            details.append(
+                (
+                    timestamp,
+                    cell_id,
+                    _quantize6(base),
+                    _quantize6(post),
+                    _quantize6(delta),
+                    _quantize6(cg),
+                    _quantize6(cr),
+                    _quantize6(cm),
+                )
+            )
+
+        count = len(details)
+        summary = (
+            count,
+            _quantize6(base_sum / count),
+            _quantize6(post_sum / count),
+            _quantize6(delta_sum / count),
+        )
+    return details, summary
