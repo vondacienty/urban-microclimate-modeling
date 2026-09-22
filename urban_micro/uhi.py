@@ -18,6 +18,7 @@ __all__ = [
     "effect_report_csv",
     "effect_jackknife_report",
     "effect_permutation_report",
+    "effect_significance_report",
     "effect_trend_report",
     "effect_fdr_report",
 ]
@@ -1706,6 +1707,127 @@ def effect_fdr_report(
                 + ',"p":' + _format6(p)
                 + ',"q":' + _format6(q_value)
                 + ',"reject":' + ("true" if reject else "false")
+                + '}'
+            )
+
+        return (
+            '{"by":' + json.dumps(by)
+            + ',"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+def effect_significance_report(
+    details: list,
+    *,
+    by: str,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Aggregate scenario deltas per group and emit a z-test JSON report.
+
+    ``details`` follows the ``effect_report`` contract: a list of
+    ``scenario`` eight-tuples ``(timestamp, cell_id, base, post, delta, cg,
+    cr, cm)`` with finite non-boolean numeric fields and unique
+    ``(timestamp, cell_id)`` pairs; an empty list yields empty ``groups``.
+    ``by`` is ``"time"`` (Unix-epoch buckets floored to ``minutes``-sized
+    buckets, with key ``floor(t / (minutes * 60)) * (minutes * 60)``) or
+    ``"cell"`` (grouped by cell id, key ``c``); ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440. ``alpha`` is a
+    non-boolean finite number with ``0 < alpha <= 1``.
+
+    Groups are emitted in ascending key order (bucket-start seconds for
+    ``time``, cell id strings for ``cell``). With ``d`` the per-row deltas
+    and ``n`` the group size, ``delta`` is ``mu = sum(d) / n``; the standard
+    error is ``sqrt(sum((d - mu) ** 2) / (n * (n - 1)))`` when ``n > 1`` and
+    0 otherwise. When ``se`` is 0, ``z`` is 0 and ``p`` is 1; otherwise
+    ``z = mu / se`` and ``p = erfc(abs(z) / sqrt(2))``. ``significant`` is
+    ``p <= alpha`` (compared on the unquantized values).
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context; the erfc evaluation uses
+    ``Decimal.to_eng_string`` -> ``float`` and :func:`math.erfc`. Returns a
+    compact UTF-8 JSON string with no spaces and no trailing newline; the
+    top-level key order is ``by, minutes, alpha, groups`` and each group
+    object uses the key order ``key, n, delta, se, z, p, significant``.
+    ``alpha`` and every numeric result are rendered with exactly six
+    decimals, negative zero normalized to ``0.000000``. ``details`` not being
+    a list raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if by not in ("time", "cell"):
+        raise ValueError("by must be 'time' or 'cell'")
+    minutes = _validate_minutes(minutes)
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        groups: dict[object, list[Decimal]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id = validated[0], validated[1]
+                delta = validated[4]
+                if by == "time":
+                    group_key = (timestamp // bucket_seconds) * bucket_seconds
+                else:
+                    group_key = cell_id
+                groups.setdefault(group_key, []).append(delta)
+
+        items = []
+        for group_key in sorted(groups):
+            deltas = groups[group_key]
+            n = len(deltas)
+            total = Decimal(0)
+            for delta in deltas:
+                total += delta
+            mu = total / n
+            if n > 1:
+                squared = Decimal(0)
+                for delta in deltas:
+                    deviation = delta - mu
+                    squared += deviation * deviation
+                se = (squared / (n * (n - 1))).sqrt()
+            else:
+                se = Decimal(0)
+
+            if se == 0:
+                z_value = Decimal(0)
+                p_value = Decimal(1)
+            else:
+                z_value = mu / se
+                p_value = Decimal(str(math.erfc(abs(float(z_value)) / math.sqrt(2.0))))
+            significant = p_value <= alpha_value
+
+            if by == "time":
+                key_json = str(group_key)
+            else:
+                key_json = json.dumps(group_key, ensure_ascii=False)
+            items.append(
+                '{"key":' + key_json
+                + ',"n":' + str(n)
+                + ',"delta":' + _format6(mu)
+                + ',"se":' + _format6(se)
+                + ',"z":' + _format6(z_value)
+                + ',"p":' + _format6(p_value)
+                + ',"significant":' + ("true" if significant else "false")
                 + '}'
             )
 
