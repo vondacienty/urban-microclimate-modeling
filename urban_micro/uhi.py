@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Mapping
-from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
 import json
 import math
 
@@ -19,6 +20,7 @@ __all__ = [
     "effect_jackknife_report",
     "effect_permutation_report",
     "effect_trend_report",
+    "effect_bootstrap_report",
     "effect_fdr_report",
     "effect_significance_report",
 ]
@@ -1835,5 +1837,161 @@ def effect_significance_report(
             '{"by":' + json.dumps(by)
             + ',"minutes":' + str(minutes)
             + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+_BOOTSTRAP_MAX_N = 8
+
+
+def effect_bootstrap_report(
+    details: list,
+    *,
+    confidence: float = 0.95,
+) -> str:
+    """Group scenario deltas by cell id and emit a bootstrap CI JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. Timestamps do not participate in grouping: rows are
+    grouped by ``cell_id`` only, and groups are emitted in ascending cell id
+    order. An empty list yields empty ``groups``. Every group must contain at
+    most 8 rows; a larger group raises ``ValueError``. ``confidence`` is a
+    non-boolean finite number with ``0 < confidence < 1``.
+
+    With ``d`` the per-row deltas and ``n`` the group size, ``delta`` is the
+    original sample mean ``sum(d) / n``. The multiset of resample means is
+    defined by the ``n ** n`` index tuples with replacement (the base-``n``
+    digits of ``k`` for ``k`` in ``0 .. n**n - 1``, in index-dictionary
+    order), each giving the mean ``sum(d_i for i in digits) / n``; the means
+    are then sorted. With ``q = (1 - confidence) / 2`` and
+    ``r = (n ** n - 1) * q``, ``lower`` and ``upper`` linearly interpolate
+    the sorted resample means between the positions ``floor(r)`` and
+    ``ceil(r)``, taking the value at that position when ``r`` is integral.
+    The sorted multiset is built directly from the draw-count compositions
+    (each composition ``c`` with sum ``n`` has multiplicity
+    ``n! / prod(c_j!)``), so the result is identical to the full
+    enumeration without materializing all ``n ** n`` means.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``confidence, groups`` and each group object uses the key order
+    ``key, n, delta, lower, upper``. ``confidence`` and every numeric result
+    are rendered with exactly six decimals, negative zero normalized to
+    ``0.000000``. ``details`` not being a list raises ``TypeError``; every
+    other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    confidence_value = _validate_finite_number(confidence, "confidence")
+    if confidence_value <= 0 or confidence_value >= 1:
+        raise ValueError("confidence must be greater than 0 and less than 1")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        groups: dict[str, list[Decimal]] = {}
+        for validated in parsed:
+            groups.setdefault(validated[1], []).append(validated[4])
+
+        items = []
+        for cell_id in sorted(groups):
+            deltas = groups[cell_id]
+            n = len(deltas)
+            if n > _BOOTSTRAP_MAX_N:
+                raise ValueError(
+                    f"group {cell_id!r} has {n} rows; bootstrap report "
+                    f"requires at most {_BOOTSTRAP_MAX_N} rows per group"
+                )
+            total = Decimal(0)
+            for delta in deltas:
+                total += delta
+            mu = total / n
+
+            # The sorted multiset of the n**n resample means only depends on
+            # how many times each delta is drawn: a composition
+            # (c_0, ..., c_{n-1}) with sum c_j = n contributes the mean
+            # sum(c_j * d_j) / n with multiplicity n! / prod(c_j!).
+            weighted_sums: list[tuple[Decimal, int]] = []
+            counts = [0] * n
+            factorial_n = math.factorial(n)
+
+            def enumerate_compositions(index: int, remaining: int) -> None:
+                if index == n - 1:
+                    counts[index] = remaining
+                    weighted_sum = Decimal(0)
+                    multiplicity = factorial_n
+                    for j, count_j in enumerate(counts):
+                        if count_j:
+                            weighted_sum += count_j * deltas[j]
+                            multiplicity //= math.factorial(count_j)
+                    weighted_sums.append((weighted_sum, multiplicity))
+                    return
+                for count_j in range(remaining + 1):
+                    counts[index] = count_j
+                    enumerate_compositions(index + 1, remaining - count_j)
+
+            enumerate_compositions(0, n)
+            weighted_sums.sort(key=lambda item: item[0])
+
+            # Merge equal means into (sorted mean numerator, cumulative count);
+            # block_sums[k] repeats block_cumulative[k] - block_cumulative[k-1]
+            # times in the sorted n**n-length sequence of resample means.
+            block_sums: list[Decimal] = []
+            block_cumulative: list[int] = []
+            running = 0
+            for weighted_sum, multiplicity in weighted_sums:
+                running += multiplicity
+                if block_sums and block_sums[-1] == weighted_sum:
+                    block_cumulative[-1] = running
+                else:
+                    block_sums.append(weighted_sum)
+                    block_cumulative.append(running)
+
+            def value_at(position: int) -> Decimal:
+                block = bisect_left(block_cumulative, position + 1)
+                return block_sums[block] / n
+
+            resample_count = n**n
+            q_value = (Decimal(1) - confidence_value) / 2
+            r_value = (Decimal(resample_count) - 1) * q_value
+            floor_index = int(r_value.to_integral_value(rounding=ROUND_FLOOR))
+            lower = value_at(floor_index)
+            upper = value_at(resample_count - 1 - floor_index)
+            weight = r_value - Decimal(floor_index)
+            if weight != 0:
+                # r is non-integral: interpolate against ceil(r) using the
+                # unrounded fractional part of r; the symmetric upper bound
+                # interpolates with the same weight at N-1-floor(r).
+                lower = lower + weight * (value_at(floor_index + 1) - lower)
+                upper = upper + weight * (
+                    value_at(resample_count - 2 - floor_index) - upper
+                )
+
+            items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"delta":' + _format6(mu)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + '}'
+            )
+
+        return (
+            '{"confidence":' + _format6(confidence_value)
             + ',"groups":[' + ",".join(items) + ']}'
         )
