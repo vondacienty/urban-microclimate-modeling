@@ -23,6 +23,7 @@ __all__ = [
     "effect_bootstrap_report",
     "effect_fdr_report",
     "effect_significance_report",
+    "effect_matrix_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -1994,4 +1995,123 @@ def effect_bootstrap_report(
         return (
             '{"confidence":' + _format6(confidence_value)
             + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+def effect_matrix_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario details into a time-bucket by cell matrix JSON report.
+
+    ``details`` follows the ``effect_report`` contract: a list of
+    ``scenario`` eight-tuples ``(timestamp, cell_id, base, post, delta, cg,
+    cr, cm)``: ``timestamp`` must be a non-boolean non-negative integer,
+    ``cell_id`` a non-empty string and the other six fields finite
+    non-boolean int/float values; ``(timestamp, cell_id)`` pairs must be
+    unique. An empty list yields
+    ``{"minutes":60,"z":1.960000,"groups":[]}``. ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440. ``z`` is a
+    non-boolean finite number greater than or equal to 0.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and buckets are emitted in
+    ascending key order; within each bucket the cell ids are sorted as
+    strings. The six fields are averaged within each bucket/cell group; with
+    ``n`` the group size and ``mu`` the mean of the deltas, ``se`` is
+    ``sqrt(sum((delta - mu) ** 2) / (n * (n - 1)))`` when ``n > 1`` and 0
+    otherwise, and ``lower``/``upper`` are ``mu - z * se`` / ``mu + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, z, groups``, each group object uses the key order
+    ``key, cells`` and each cell object the key order
+    ``key, n, base, post, delta, cg, cr, cm, se, lower, upper`` with
+    ``key`` the cell id. ``z`` and every numeric result are rendered with
+    exactly six decimals, negative zero normalized to ``0.000000``.
+    ``details`` not being a list raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> [six-field value tuples]
+        groups: dict[int, dict[str, list[tuple[Decimal, ...]]]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, values = validated[0], validated[1], validated[2:]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                groups.setdefault(bucket, {}).setdefault(cell_id, []).append(values)
+
+        group_items = []
+        for bucket in sorted(groups):
+            cells = groups[bucket]
+            cell_items = []
+            for cell_id in sorted(cells):
+                group_rows = cells[cell_id]
+                n = len(group_rows)
+                means = []
+                for index in range(6):
+                    total = Decimal(0)
+                    for values in group_rows:
+                        total += values[index]
+                    means.append(total / n)
+
+                mu = means[2]
+                if n > 1:
+                    squared = Decimal(0)
+                    for values in group_rows:
+                        deviation = values[2] - mu
+                        squared += deviation * deviation
+                    se = (squared / (n * (n - 1))).sqrt()
+                else:
+                    se = Decimal(0)
+                lower = mu - z_value * se
+                upper = mu + z_value * se
+
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"base":' + _format6(means[0])
+                    + ',"post":' + _format6(means[1])
+                    + ',"delta":' + _format6(means[2])
+                    + ',"cg":' + _format6(means[3])
+                    + ',"cr":' + _format6(means[4])
+                    + ',"cm":' + _format6(means[5])
+                    + ',"se":' + _format6(se)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + '}'
+                )
+            group_items.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"z":' + _format6(z_value)
+            + ',"groups":[' + ",".join(group_items) + ']}'
         )
