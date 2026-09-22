@@ -26,6 +26,7 @@ __all__ = [
     "effect_matrix_report",
     "effect_matrix_csv",
     "effect_matrix_significance_report",
+    "effect_matrix_fdr_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -2323,6 +2324,149 @@ def effect_matrix_significance_report(
                     + ',"z":' + _format6(z_value)
                     + ',"p":' + _format6(p_value)
                     + ',"significant":' + ("true" if significant else "false")
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def effect_matrix_fdr_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Aggregate scenario details into a time-bucket x cell matrix FDR report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``alpha`` is a non-boolean finite number
+    with ``0 < alpha <= 1``.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted in
+    ascending order and, within each bucket, cells in ascending string order.
+    Each cell object carries the group size ``n``, the within-group arithmetic
+    means ``base``..``cm`` and the two-sided sign-test p-value ``p`` of the
+    deltas: with ``r``/``s`` the counts of positive/negative deltas (zeros
+    ignored), ``m = r + s``, ``p`` is 1 when ``m`` is 0 and
+    ``min(1, 2 * sum(C(m, k) for k in 0..min(r, s)) / 2**m)`` otherwise.
+
+    With ``N`` the total number of bucket/cell cells, the p-values are ranked
+    ascending by ``(p, bucket, cell)`` and each rank ``j`` (1-based) gets the
+    Benjamini-Hochberg q-value ``q_j = min(1, min(N * p_l / l for l in
+    j..N))``, mapped back to its cell; ``reject`` is ``q <= alpha`` (compared
+    on the unquantized values).
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, alpha, groups``, each group object uses the key order
+    ``key, cells`` and each cell object the key order
+    ``key, n, base, post, delta, cg, cr, cm, p, q, reject`` with ``key`` the
+    cell id. An empty ``details`` yields
+    ``{"minutes":60,"alpha":0.050000,"groups":[]}``. ``alpha`` and every
+    numeric result are rendered with exactly six decimals, negative zero
+    normalized to ``0.000000``. ``details`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> list of six-tuples of Decimal values
+        buckets: dict[int, dict[str, list[tuple[Decimal, ...]]]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, values = validated[0], validated[1], validated[2:]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(values)
+
+        # (bucket, cell_id) -> (n, six means, sign-test p)
+        stats: dict[tuple[int, str], tuple[int, list[Decimal], Decimal]] = {}
+        for bucket in sorted(buckets):
+            for cell_id in sorted(buckets[bucket]):
+                rows = buckets[bucket][cell_id]
+                n = len(rows)
+                means = []
+                for index in range(6):
+                    total = Decimal(0)
+                    for values in rows:
+                        total += values[index]
+                    means.append(total / n)
+                r = sum(1 for values in rows if values[2] > 0)
+                s = sum(1 for values in rows if values[2] < 0)
+                m = r + s
+                if m == 0:
+                    p_value = Decimal(1)
+                else:
+                    q0 = min(r, s)
+                    tail = sum(math.comb(m, k) for k in range(q0 + 1))
+                    p_value = min(Decimal(1), 2 * Decimal(tail) / Decimal(2**m))
+                stats[(bucket, cell_id)] = (n, means, p_value)
+
+        # Benjamini-Hochberg q-values: rank ascending by (p, bucket, cell),
+        # then accumulate the running minimum of N * p_l / l from the top
+        # rank down.
+        count = len(stats)
+        ranked = sorted(stats, key=lambda cell: (stats[cell][2], cell[0], cell[1]))
+        q_values: dict[tuple[int, str], Decimal] = {}
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            cell = ranked[rank - 1]
+            candidate = Decimal(count) * stats[cell][2] / rank
+            if candidate < running:
+                running = candidate
+            q_values[cell] = running
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                n, means, p_value = stats[(bucket, cell_id)]
+                q_value = q_values[(bucket, cell_id)]
+                reject = q_value <= alpha_value
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"base":' + _format6(means[0])
+                    + ',"post":' + _format6(means[1])
+                    + ',"delta":' + _format6(means[2])
+                    + ',"cg":' + _format6(means[3])
+                    + ',"cr":' + _format6(means[4])
+                    + ',"cm":' + _format6(means[5])
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
                     + '}'
                 )
             groups.append(
