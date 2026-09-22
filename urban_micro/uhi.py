@@ -18,6 +18,7 @@ __all__ = [
     "effect_report_csv",
     "effect_jackknife_report",
     "effect_permutation_report",
+    "effect_trend_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -43,6 +44,14 @@ def _validate_min_count(min_count: object) -> int:
     if min_count < 1:
         raise ValueError("min_count must be a positive integer")
     return min_count
+
+
+def _validate_min_points(min_points: object) -> int:
+    if isinstance(min_points, bool) or not isinstance(min_points, int):
+        raise ValueError("min_points must be an integer")
+    if min_points < 2:
+        raise ValueError("min_points must be an integer greater than or equal to 2")
+    return min_points
 
 
 def _validate_stations(stations: object) -> dict:
@@ -1435,6 +1444,139 @@ def effect_permutation_report(
         return (
             '{"by":' + json.dumps(by)
             + ',"minutes":' + str(minutes)
+            + ',"z":' + _format6(z_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+def effect_trend_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    min_points: int = 2,
+    z: float = 1.96,
+) -> str:
+    """Regress bucketed mean scenario deltas on time per cell and emit JSON.
+
+    ``details`` follows the ``effect_report`` contract: a list of
+    ``scenario`` eight-tuples ``(timestamp, cell_id, base, post, delta, cg,
+    cr, cm)`` with finite non-boolean numeric fields and unique
+    ``(timestamp, cell_id)`` pairs; an empty list yields empty ``groups``.
+    ``minutes`` must be a non-boolean integer in ``1..1440`` that divides
+    1440; ``min_points`` must be a non-boolean integer greater than or equal
+    to 2; ``z`` is a non-boolean finite number greater than or equal to 0.
+
+    Rows are bucketed per cell id by Unix epoch, with bucket start
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; within each bucket the
+    deltas are averaged. A cell with fewer than ``min_points`` occupied
+    buckets is omitted. For each kept cell, an ordinary least-squares line
+    ``y = a + slope * x`` is fit with ``x`` the bucket starts and ``y`` the
+    bucket mean deltas: with ``n`` the point count,
+    ``Sxx = sum((x - x_bar) ** 2)``,
+    ``Sxy = sum((x - x_bar) * (y - y_bar))``, ``slope = Sxy / Sxx``,
+    ``a = y_bar - slope * x_bar`` and
+    ``SSE = sum((y - a - slope * x) ** 2)``; the slope standard error is
+    ``sqrt(SSE / ((n - 2) * Sxx))`` when ``n > 2`` and 0 otherwise, and
+    ``lower``/``upper`` are ``slope - z * se`` / ``slope + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, min_points, z, groups`` and each group object uses
+    the key order ``key, n, slope, se, lower, upper``. Groups are sorted by
+    cell id ascending. ``z`` and every numeric result are rendered with
+    exactly six decimals, negative zero normalized to ``0.000000``.
+    ``details`` not being a list raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    min_points = _validate_min_points(min_points)
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # cell_id -> bucket start -> [delta sum, count]
+        cells: dict[str, dict[int, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                bucket_acc = cells.setdefault(cell_id, {}).setdefault(
+                    bucket, [Decimal(0), 0]
+                )
+                bucket_acc[0] += delta
+                bucket_acc[1] += 1
+
+        items = []
+        for cell_id in sorted(cells):
+            buckets = cells[cell_id]
+            if len(buckets) < min_points:
+                continue
+            points = [
+                (Decimal(bucket), total / count)
+                for bucket, (total, count) in sorted(buckets.items())
+            ]
+            n = len(points)
+
+            x_sum = Decimal(0)
+            y_sum = Decimal(0)
+            for x_value, y_value in points:
+                x_sum += x_value
+                y_sum += y_value
+            x_bar = x_sum / n
+            y_bar = y_sum / n
+
+            sxx = Decimal(0)
+            sxy = Decimal(0)
+            for x_value, y_value in points:
+                x_dev = x_value - x_bar
+                y_dev = y_value - y_bar
+                sxx += x_dev * x_dev
+                sxy += x_dev * y_dev
+            slope = sxy / sxx
+            intercept = y_bar - slope * x_bar
+
+            sse = Decimal(0)
+            for x_value, y_value in points:
+                residual = y_value - intercept - slope * x_value
+                sse += residual * residual
+            if n > 2:
+                se = (sse / (Decimal(n - 2) * sxx)).sqrt()
+            else:
+                se = Decimal(0)
+            lower = slope - z_value * se
+            upper = slope + z_value * se
+
+            items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"slope":' + _format6(slope)
+                + ',"se":' + _format6(se)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"min_points":' + str(min_points)
             + ',"z":' + _format6(z_value)
             + ',"groups":[' + ",".join(items) + ']}'
         )
