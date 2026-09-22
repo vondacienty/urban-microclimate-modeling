@@ -19,6 +19,7 @@ __all__ = [
     "effect_jackknife_report",
     "effect_permutation_report",
     "effect_trend_report",
+    "effect_fdr_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -1576,5 +1577,141 @@ def effect_trend_report(
             '{"minutes":' + str(minutes)
             + ',"min_points":' + str(min_points)
             + ',"z":' + _format6(z_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+def effect_fdr_report(
+    details: list,
+    *,
+    by: str,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Aggregate scenario deltas per group and emit an FDR JSON report.
+
+    ``details`` follows the ``effect_report`` contract: a list of
+    ``scenario`` eight-tuples ``(timestamp, cell_id, base, post, delta, cg,
+    cr, cm)`` with finite non-boolean numeric fields and unique
+    ``(timestamp, cell_id)`` pairs; an empty list yields empty ``groups``.
+    ``by`` is ``"time"`` (Unix-epoch buckets floored to ``minutes``-sized
+    buckets, with key ``floor(t / (minutes * 60)) * (minutes * 60)``) or
+    ``"cell"`` (grouped by cell id, key ``c``); ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440. ``alpha`` is a
+    non-boolean finite number with ``0 < alpha <= 1``.
+
+    Groups are emitted in ascending key order (bucket-start seconds for
+    ``time``, cell id strings for ``cell``). With ``d`` the per-row deltas
+    and ``n`` the group size, ``delta`` is ``sum(d) / n`` and ``p`` is the
+    two-sided sign-test p-value of the deltas: with ``r``/``s`` the counts
+    of positive/negative deltas (zeros ignored), ``m = r + s`` and
+    ``q0 = min(r, s)``, ``p`` is 1 when ``m`` is 0 and
+    ``min(1, 2 * sum(C(m, k) for k in 0..q0) / 2**m)`` otherwise.
+
+    With ``N`` the number of groups, the p-values are ranked ascending by
+    ``(p, key)`` and each rank ``j`` (1-based) gets the Benjamini-Hochberg
+    q-value ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to
+    its group key; ``reject`` is ``q <= alpha`` (compared on the unquantized
+    values).
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``by, minutes, alpha, groups`` and each group object uses the
+    key order ``key, n, delta, p, q, reject``. ``alpha`` and every numeric
+    result are rendered with exactly six decimals, negative zero normalized
+    to ``0.000000``. ``details`` not being a list raises ``TypeError``;
+    every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if by not in ("time", "cell"):
+        raise ValueError("by must be 'time' or 'cell'")
+    minutes = _validate_minutes(minutes)
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        groups: dict[object, list[Decimal]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id = validated[0], validated[1]
+                delta = validated[4]
+                if by == "time":
+                    group_key = (timestamp // bucket_seconds) * bucket_seconds
+                else:
+                    group_key = cell_id
+                groups.setdefault(group_key, []).append(delta)
+
+        # group_key -> (n, mean delta, sign-test p)
+        stats: dict[object, tuple[int, Decimal, Decimal]] = {}
+        for group_key, deltas in groups.items():
+            n = len(deltas)
+            total = Decimal(0)
+            for delta in deltas:
+                total += delta
+            mu = total / n
+            r = sum(1 for delta in deltas if delta > 0)
+            s = sum(1 for delta in deltas if delta < 0)
+            m = r + s
+            if m == 0:
+                p = Decimal(1)
+            else:
+                q0 = min(r, s)
+                tail = sum(math.comb(m, k) for k in range(q0 + 1))
+                p = min(Decimal(1), 2 * Decimal(tail) / Decimal(2**m))
+            stats[group_key] = (n, mu, p)
+
+        # Benjamini-Hochberg q-values: rank ascending by (p, key), then
+        # accumulate the running minimum of N * p_l / l from the top rank down.
+        count = len(stats)
+        ranked = sorted(stats, key=lambda group_key: (stats[group_key][2], group_key))
+        q_values: dict[object, Decimal] = {}
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            group_key = ranked[rank - 1]
+            candidate = Decimal(count) * stats[group_key][2] / rank
+            if candidate < running:
+                running = candidate
+            q_values[group_key] = running
+
+        items = []
+        for group_key in sorted(groups):
+            n, mu, p = stats[group_key]
+            q_value = q_values[group_key]
+            reject = q_value <= alpha_value
+            if by == "time":
+                key_json = str(group_key)
+            else:
+                key_json = json.dumps(group_key, ensure_ascii=False)
+            items.append(
+                '{"key":' + key_json
+                + ',"n":' + str(n)
+                + ',"delta":' + _format6(mu)
+                + ',"p":' + _format6(p)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if reject else "false")
+                + '}'
+            )
+
+        return (
+            '{"by":' + json.dumps(by)
+            + ',"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
             + ',"groups":[' + ",".join(items) + ']}'
         )
