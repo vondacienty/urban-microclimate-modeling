@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from itertools import combinations_with_replacement
 import json
 import math
 
@@ -21,6 +22,7 @@ __all__ = [
     "effect_trend_report",
     "effect_fdr_report",
     "effect_significance_report",
+    "effect_bootstrap_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -1835,5 +1837,149 @@ def effect_significance_report(
             '{"by":' + json.dumps(by)
             + ',"minutes":' + str(minutes)
             + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+_BOOTSTRAP_MAX_N = 8
+
+
+def effect_bootstrap_report(
+    details: list,
+    *,
+    confidence: float = 0.95,
+) -> str:
+    """Group scenario deltas by cell id and emit a bootstrap-CI JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` is a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the remaining
+    six fields are finite non-boolean int/float values; ``(timestamp,
+    cell_id)`` pairs must be unique. The timestamp does not participate in
+    grouping: rows are grouped solely by cell id, and groups are emitted in
+    ascending cell id order. An empty list yields empty ``groups``.
+    ``confidence`` is a non-boolean finite number with
+    ``0 < confidence < 1``. Each group must contain at most 8 rows; a
+    larger group raises ``ValueError``.
+
+    For a group of size ``n``, all ``n ** n`` resamples with replacement are
+    taken in index-lexicographic order. Each resample's mean delta is
+    ``sum(delta_i) / n``; the resulting means are sorted ascending. With
+    ``q = (1 - confidence) / 2`` and ``r = (n ** n - 1) * q``, ``lower`` and
+    ``upper`` linearly interpolate the sorted means at positions ``r`` and
+    ``(n ** n - 1) - r`` respectively, between ``floor`` and ``ceil``
+    positions (an integral position takes that value). ``delta`` is the
+    original sample mean ``sum(delta_i) / n``. Because the finite-decimal
+    inputs sum exactly under precision 1000, resamples sharing a count
+    vector share an exactly equal mean, so the ``C(2*n - 1, n)`` distinct
+    count vectors are enumerated once and repeated by their multinomial
+    multiplicities, reproducing the sorted ``n ** n`` sequence exactly.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``confidence, groups`` and each group object uses the key order
+    ``key, n, delta, lower, upper``. ``confidence`` and every numeric result
+    are rendered with exactly six decimals, negative zero normalized to
+    ``0.000000``. ``details`` not being a list raises ``TypeError``; every
+    other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    confidence_value = _validate_finite_number(confidence, "confidence")
+    if confidence_value <= 0 or confidence_value >= 1:
+        raise ValueError("confidence must be greater than 0 and less than 1")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        groups: dict[str, list[Decimal]] = {}
+        for validated in parsed:
+            groups.setdefault(validated[1], []).append(validated[4])
+
+        q_value = (Decimal(1) - confidence_value) / 2
+        items = []
+        for cell_id in sorted(groups):
+            deltas = groups[cell_id]
+            n = len(deltas)
+            if n > _BOOTSTRAP_MAX_N:
+                raise ValueError(
+                    f"group {cell_id!r} has {n} rows; bootstrap report "
+                    f"requires at most {_BOOTSTRAP_MAX_N} rows per group"
+                )
+            total = Decimal(0)
+            for delta in deltas:
+                total += delta
+            mean = total / n
+
+            resample_count = n**n
+            last_position = Decimal(resample_count - 1)
+            lower_position = last_position * q_value
+            upper_position = last_position - lower_position
+
+            # Enumerate the C(2n-1, n) sorted count vectors (n-multisets of
+            # indices) once each; a vector's mean repeats with multinomial
+            # multiplicity n! / prod(k_i!), which reproduces the full n**n
+            # resample sequence and hence its sorted order.
+            factorial_n = math.factorial(n)
+            weighted_means: list[tuple[Decimal, int]] = []
+            for combo in combinations_with_replacement(range(n), n):
+                weighted_sum = Decimal(0)
+                multiplicity = factorial_n
+                run = 1
+                for index in range(1, n):
+                    if combo[index] == combo[index - 1]:
+                        run += 1
+                    else:
+                        multiplicity //= math.factorial(run)
+                        run = 1
+                multiplicity //= math.factorial(run)
+                for chosen in combo:
+                    weighted_sum += deltas[chosen]
+                weighted_means.append((weighted_sum / n, multiplicity))
+            weighted_means.sort(key=lambda pair: pair[0])
+
+            def value_at(index: int) -> Decimal:
+                offset = 0
+                for value, multiplicity in weighted_means:
+                    if index < offset + multiplicity:
+                        return value
+                    offset += multiplicity
+                raise AssertionError("bootstrap quantile index out of range")
+
+            def interpolate(position: Decimal) -> Decimal:
+                lower_index = int(position)  # floor; position is non-negative
+                fraction = position - lower_index
+                at_lower = value_at(lower_index)
+                if fraction == 0:
+                    return at_lower
+                at_upper = value_at(lower_index + 1)
+                return at_lower + (at_upper - at_lower) * fraction
+
+            lower_value = interpolate(lower_position)
+            upper_value = interpolate(upper_position)
+
+            items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"delta":' + _format6(mean)
+                + ',"lower":' + _format6(lower_value)
+                + ',"upper":' + _format6(upper_value)
+                + '}'
+            )
+
+        return (
+            '{"confidence":' + _format6(confidence_value)
             + ',"groups":[' + ",".join(items) + ']}'
         )
