@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+import json
 import math
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "fit_uhi_model",
     "scenario",
     "attribute_effects",
+    "effect_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -941,3 +943,142 @@ def attribute_effects(
                 p = min(Decimal(1), 2 * Decimal(tail) / Decimal(2**m))
             results.append((group_key, n, *means, _quantize6(p)))
     return results
+
+
+def _format6(value: Decimal) -> str:
+    """Quantize to 6 decimals (ROUND_HALF_EVEN) and render with exactly six
+    fractional digits, normalizing negative zero to ``0.000000``."""
+    quantized = value.quantize(_QUANT6, rounding=ROUND_HALF_EVEN)
+    if quantized == 0:
+        quantized = abs(quantized)
+    return f"{quantized:.6f}"
+
+
+def effect_report(
+    details: list,
+    *,
+    by: str,
+    minutes: int = 60,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario details per group and emit a compact JSON report.
+
+    ``details`` follows the ``attribute_effects`` contract: a list of
+    ``scenario`` eight-tuples ``(timestamp, cell_id, base, post, delta, cg,
+    cr, cm)`` with finite non-boolean numeric fields and unique
+    ``(timestamp, cell_id)`` pairs; an empty list yields empty ``groups``.
+    ``by`` is ``"time"`` (Unix-epoch buckets floored to ``minutes``-sized
+    buckets) or ``"cell"`` (grouped by cell id); ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440. ``z`` is a
+    non-boolean finite number greater than or equal to 0.
+
+    Groups are emitted in ascending key order (bucket-start seconds for
+    ``time``, cell id strings for ``cell``). The six means and the sign-test
+    ``p`` are computed exactly as in ``attribute_effects``. With ``n`` the
+    group size and ``mu`` the mean of the deltas, ``se`` is
+    ``sqrt(sum((delta - mu) ** 2) / (n * (n - 1)))`` when ``n > 1`` and 0
+    otherwise, and ``lower``/``upper`` are ``mu - z * se`` / ``mu + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``by, minutes, z, groups`` and each group object uses the key
+    order ``key, n, base, post, delta, cg, cr, cm, p, se, lower, upper``.
+    ``z`` and every numeric result are rendered with exactly six decimals,
+    negative zero normalized to ``0.000000``. ``details`` not being a list
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if by not in ("time", "cell"):
+        raise ValueError("by must be 'time' or 'cell'")
+    minutes = _validate_minutes(minutes)
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        items = []
+        if parsed:
+            bucket_seconds = minutes * 60
+            groups: dict[object, list[tuple[Decimal, ...]]] = {}
+            for validated in parsed:
+                timestamp, cell_id, values = validated[0], validated[1], validated[2:]
+                if by == "time":
+                    group_key = (timestamp // bucket_seconds) * bucket_seconds
+                else:
+                    group_key = cell_id
+                groups.setdefault(group_key, []).append(values)
+
+            for group_key in sorted(groups):
+                rows = groups[group_key]
+                n = len(rows)
+                means = []
+                for index in range(6):
+                    total = Decimal(0)
+                    for values in rows:
+                        total += values[index]
+                    means.append(total / n)
+
+                mu = means[2]
+                if n > 1:
+                    squared = Decimal(0)
+                    for values in rows:
+                        deviation = values[2] - mu
+                        squared += deviation * deviation
+                    se = (squared / (n * (n - 1))).sqrt()
+                else:
+                    se = Decimal(0)
+                lower = mu - z_value * se
+                upper = mu + z_value * se
+
+                r = sum(1 for values in rows if values[2] > 0)
+                s = sum(1 for values in rows if values[2] < 0)
+                m = r + s
+                if m == 0:
+                    p = Decimal(1)
+                else:
+                    q = min(r, s)
+                    tail = sum(math.comb(m, k) for k in range(q + 1))
+                    p = min(Decimal(1), 2 * Decimal(tail) / Decimal(2**m))
+
+                if by == "time":
+                    key_json = str(group_key)
+                else:
+                    key_json = json.dumps(group_key, ensure_ascii=False)
+                items.append(
+                    '{"key":' + key_json
+                    + ',"n":' + str(n)
+                    + ',"base":' + _format6(means[0])
+                    + ',"post":' + _format6(means[1])
+                    + ',"delta":' + _format6(means[2])
+                    + ',"cg":' + _format6(means[3])
+                    + ',"cr":' + _format6(means[4])
+                    + ',"cm":' + _format6(means[5])
+                    + ',"p":' + _format6(p)
+                    + ',"se":' + _format6(se)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + '}'
+                )
+
+        return (
+            '{"by":' + json.dumps(by)
+            + ',"minutes":' + str(minutes)
+            + ',"z":' + _format6(z_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
