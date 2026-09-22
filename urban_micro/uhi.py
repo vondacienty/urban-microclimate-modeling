@@ -17,6 +17,7 @@ __all__ = [
     "effect_report",
     "effect_report_csv",
     "effect_jackknife_report",
+    "effect_permutation_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -1278,6 +1279,153 @@ def effect_jackknife_report(
                 '{"key":' + key_json
                 + ',"n":' + str(n)
                 + ',"delta":' + _format6(mu)
+                + ',"se":' + _format6(se)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + '}'
+            )
+
+        return (
+            '{"by":' + json.dumps(by)
+            + ',"minutes":' + str(minutes)
+            + ',"z":' + _format6(z_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+_PERMUTATION_MAX_N = 16
+
+
+def effect_permutation_report(
+    details: list,
+    *,
+    by: str,
+    minutes: int = 60,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario deltas per group and emit a permutation JSON report.
+
+    ``details`` follows the ``effect_report`` contract: a list of
+    ``scenario`` eight-tuples ``(timestamp, cell_id, base, post, delta, cg,
+    cr, cm)`` with finite non-boolean numeric fields and unique
+    ``(timestamp, cell_id)`` pairs; an empty list yields empty ``groups``.
+    ``by`` is ``"time"`` (Unix-epoch buckets floored to ``minutes``-sized
+    buckets, with key ``floor(t / (minutes * 60)) * (minutes * 60)``) or
+    ``"cell"`` (grouped by cell id, key ``c``); ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440. ``z`` is a
+    non-boolean finite number greater than or equal to 0. Every group must
+    contain at most 16 rows; a larger group raises ``ValueError``.
+
+    Groups are emitted in ascending key order (bucket-start seconds for
+    ``time``, cell id strings for ``cell``). With ``d`` the per-row deltas
+    and ``n`` the group size, ``delta`` is ``sum(d) / n``; ``p`` is the
+    exact two-sided sign-flip permutation p-value: all ``2 ** n`` sign
+    vectors ``s_i`` in ``{-1, 1}`` are enumerated and
+    ``p = 2 ** -n * #{|sum(s_i * d_i) / n| >= |delta|}``. The jackknife
+    standard error is 0 when ``n <= 1`` and otherwise
+    ``sqrt((n - 1) / n * sum((mu_i - mu_bar) ** 2))`` where
+    ``mu_i = (sum(d) - d_i) / (n - 1)`` and ``mu_bar = sum(mu_i) / n``;
+    ``lower``/``upper`` are ``delta - z * se`` / ``delta + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``by, minutes, z, groups`` and each group object uses the key
+    order ``key, n, delta, p, se, lower, upper``. ``z`` and every numeric
+    result are rendered with exactly six decimals, negative zero
+    normalized to ``0.000000``; ``cell`` keys render as the original cell
+    id strings. ``details`` not being a list raises ``TypeError``; every
+    other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if by not in ("time", "cell"):
+        raise ValueError("by must be 'time' or 'cell'")
+    minutes = _validate_minutes(minutes)
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        groups: dict[object, list[Decimal]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id = validated[0], validated[1]
+                delta = validated[4]
+                if by == "time":
+                    group_key = (timestamp // bucket_seconds) * bucket_seconds
+                else:
+                    group_key = cell_id
+                groups.setdefault(group_key, []).append(delta)
+
+        items = []
+        for group_key in sorted(groups):
+            deltas = groups[group_key]
+            n = len(deltas)
+            if n > _PERMUTATION_MAX_N:
+                raise ValueError(
+                    f"group {group_key!r} has {n} rows; permutation report "
+                    f"requires at most {_PERMUTATION_MAX_N} rows per group"
+                )
+            total = Decimal(0)
+            for delta in deltas:
+                total += delta
+            mu = total / n
+
+            # |sum(s_i * d_i) / n| >= |delta| is equivalent (n > 0) to
+            # |sum(s_i * d_i)| >= |sum(d_i)|; compare the raw sums so exact
+            # ties are decided without any division rounding.
+            hits = 0
+            for mask in range(1 << n):
+                signed_sum = Decimal(0)
+                for index, delta in enumerate(deltas):
+                    if (mask >> index) & 1:
+                        signed_sum -= delta
+                    else:
+                        signed_sum += delta
+                if abs(signed_sum) >= abs(total):
+                    hits += 1
+            p = Decimal(hits) / Decimal(1 << n)
+
+            if n > 1:
+                leave_one_means = [(total - delta) / (n - 1) for delta in deltas]
+                mean_sum = Decimal(0)
+                for leave_one in leave_one_means:
+                    mean_sum += leave_one
+                mean_of_means = mean_sum / n
+                squared = Decimal(0)
+                for leave_one in leave_one_means:
+                    deviation = leave_one - mean_of_means
+                    squared += deviation * deviation
+                se = (Decimal(n - 1) / n * squared).sqrt()
+            else:
+                se = Decimal(0)
+            lower = mu - z_value * se
+            upper = mu + z_value * se
+
+            if by == "time":
+                key_json = str(group_key)
+            else:
+                key_json = json.dumps(group_key, ensure_ascii=False)
+            items.append(
+                '{"key":' + key_json
+                + ',"n":' + str(n)
+                + ',"delta":' + _format6(mu)
+                + ',"p":' + _format6(p)
                 + ',"se":' + _format6(se)
                 + ',"lower":' + _format6(lower)
                 + ',"upper":' + _format6(upper)
