@@ -24,6 +24,7 @@ __all__ = [
     "effect_fdr_report",
     "effect_significance_report",
     "effect_matrix_report",
+    "effect_matrix_csv",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -2110,3 +2111,114 @@ def effect_matrix_report(
             + ',"z":' + _format6(z_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
+
+
+_MATRIX_CSV_HEADER = "timestamp,cell_id,n,base,post,delta,cg,cr,cm,se,lower,upper"
+
+
+def effect_matrix_csv(
+    details: list,
+    *,
+    minutes: int = 60,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario details into a time-bucket x cell RFC4180 CSV report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``z`` is a non-boolean finite number
+    greater than or equal to 0.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted in
+    ascending order and, within each bucket, cells in ascending string
+    order, one line per bucket/cell pair. Each line carries the group size
+    ``n``, the within-group arithmetic means of the six numeric fields and
+    the delta confidence interval: with ``mu`` the mean of the deltas,
+    ``se`` is ``sqrt(sum((delta - mu) ** 2) / (n * (n - 1)))`` when
+    ``n > 1`` and 0 otherwise, and ``lower``/``upper`` are
+    ``mu - z * se`` / ``mu + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a UTF-8 RFC4180
+    CSV string whose first line is the fixed header
+    ``timestamp,cell_id,n,base,post,delta,cg,cr,cm,se,lower,upper``,
+    followed by one line per bucket/cell pair (an empty ``details`` still
+    yields the header). Lines end with CRLF, including the final line. The
+    timestamp is the decimal bucket start and the cell id is its original
+    string; any field containing a comma, a double quote or a line break is
+    wrapped in double quotes with inner double quotes doubled. ``n`` is a
+    decimal integer and every other numeric field is rendered with exactly
+    six decimals, negative zero normalized to ``0.000000``. ``details`` not
+    being a list raises ``TypeError``; every other contract violation
+    raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> list of six-tuples of Decimal values
+        buckets: dict[int, dict[str, list[tuple[Decimal, ...]]]] = {}
+        bucket_seconds = minutes * 60
+        for validated in parsed:
+            timestamp, cell_id, values = validated[0], validated[1], validated[2:]
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(values)
+
+        lines = [_MATRIX_CSV_HEADER]
+        for bucket in sorted(buckets):
+            for cell_id in sorted(buckets[bucket]):
+                rows = buckets[bucket][cell_id]
+                n = len(rows)
+                means = []
+                for index in range(6):
+                    total = Decimal(0)
+                    for values in rows:
+                        total += values[index]
+                    means.append(total / n)
+                mu = means[2]
+                if n > 1:
+                    squared = Decimal(0)
+                    for values in rows:
+                        deviation = values[2] - mu
+                        squared += deviation * deviation
+                    se = (squared / (n * (n - 1))).sqrt()
+                else:
+                    se = Decimal(0)
+                lower = mu - z_value * se
+                upper = mu + z_value * se
+                lines.append(
+                    str(bucket)
+                    + "," + _csv_field(cell_id)
+                    + "," + str(n)
+                    + "," + _format6(means[0])
+                    + "," + _format6(means[1])
+                    + "," + _format6(means[2])
+                    + "," + _format6(means[3])
+                    + "," + _format6(means[4])
+                    + "," + _format6(means[5])
+                    + "," + _format6(se)
+                    + "," + _format6(lower)
+                    + "," + _format6(upper)
+                )
+        return "\r\n".join(lines) + "\r\n"
