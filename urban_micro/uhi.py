@@ -15,6 +15,7 @@ __all__ = [
     "scenario",
     "attribute_effects",
     "effect_report",
+    "effect_report_csv",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -954,6 +955,96 @@ def _format6(value: Decimal) -> str:
     return f"{quantized:.6f}"
 
 
+def _parse_effect_details(
+    details: object,
+) -> list[tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal]]:
+    """Validate the ``details`` contract shared by ``effect_report`` and
+    ``effect_report_csv``."""
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+    return parsed
+
+
+def _validate_effect_args(by: object, minutes: object, z: object) -> tuple[int, Decimal]:
+    """Validate the ``by``/``minutes``/``z`` arguments shared by
+    ``effect_report`` and ``effect_report_csv``."""
+    if by not in ("time", "cell"):
+        raise ValueError("by must be 'time' or 'cell'")
+    minutes = _validate_minutes(minutes)
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+    return minutes, z_value
+
+
+def _effect_groups(
+    parsed: list, by: str, minutes: int, z_value: Decimal
+) -> list[tuple]:
+    """Group validated detail rows and compute per-group statistics.
+
+    Must be called inside the precision-1000, ROUND_HALF_EVEN local context.
+    Returns a list of ``(group_key, n, means, p, se, lower, upper)`` tuples in
+    ascending group-key order, where ``means`` holds the six unquantized
+    within-group means ``(base, post, delta, cg, cr, cm)``.
+    """
+    if not parsed:
+        return []
+
+    bucket_seconds = minutes * 60
+    groups: dict[object, list[tuple[Decimal, ...]]] = {}
+    for validated in parsed:
+        timestamp, cell_id, values = validated[0], validated[1], validated[2:]
+        if by == "time":
+            group_key = (timestamp // bucket_seconds) * bucket_seconds
+        else:
+            group_key = cell_id
+        groups.setdefault(group_key, []).append(values)
+
+    results = []
+    for group_key in sorted(groups):
+        rows = groups[group_key]
+        n = len(rows)
+        means = []
+        for index in range(6):
+            total = Decimal(0)
+            for values in rows:
+                total += values[index]
+            means.append(total / n)
+
+        mu = means[2]
+        if n > 1:
+            squared = Decimal(0)
+            for values in rows:
+                deviation = values[2] - mu
+                squared += deviation * deviation
+            se = (squared / (n * (n - 1))).sqrt()
+        else:
+            se = Decimal(0)
+        lower = mu - z_value * se
+        upper = mu + z_value * se
+
+        r = sum(1 for values in rows if values[2] > 0)
+        s = sum(1 for values in rows if values[2] < 0)
+        m = r + s
+        if m == 0:
+            p = Decimal(1)
+        else:
+            q = min(r, s)
+            tail = sum(math.comb(m, k) for k in range(q + 1))
+            p = min(Decimal(1), 2 * Decimal(tail) / Decimal(2**m))
+        results.append((group_key, n, means, p, se, lower, upper))
+    return results
+
+
 def effect_report(
     details: list,
     *,
@@ -989,92 +1080,36 @@ def effect_report(
     raises ``TypeError``; every other contract violation raises
     ``ValueError``.
     """
-    if not isinstance(details, list):
-        raise TypeError("details must be a list")
-    if by not in ("time", "cell"):
-        raise ValueError("by must be 'time' or 'cell'")
-    minutes = _validate_minutes(minutes)
-    z_value = _validate_finite_number(z, "z")
-    if z_value < 0:
-        raise ValueError("z must be non-negative")
-
-    parsed = []
-    seen: set[tuple[int, str]] = set()
-    for row in details:
-        validated = _validate_detail_row(row)
-        key = (validated[0], validated[1])
-        if key in seen:
-            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
-        seen.add(key)
-        parsed.append(validated)
+    parsed = _parse_effect_details(details)
+    minutes, z_value = _validate_effect_args(by, minutes, z)
 
     with localcontext() as ctx:
         ctx.prec = _MODEL_PRECISION
         ctx.rounding = ROUND_HALF_EVEN
 
         items = []
-        if parsed:
-            bucket_seconds = minutes * 60
-            groups: dict[object, list[tuple[Decimal, ...]]] = {}
-            for validated in parsed:
-                timestamp, cell_id, values = validated[0], validated[1], validated[2:]
-                if by == "time":
-                    group_key = (timestamp // bucket_seconds) * bucket_seconds
-                else:
-                    group_key = cell_id
-                groups.setdefault(group_key, []).append(values)
-
-            for group_key in sorted(groups):
-                rows = groups[group_key]
-                n = len(rows)
-                means = []
-                for index in range(6):
-                    total = Decimal(0)
-                    for values in rows:
-                        total += values[index]
-                    means.append(total / n)
-
-                mu = means[2]
-                if n > 1:
-                    squared = Decimal(0)
-                    for values in rows:
-                        deviation = values[2] - mu
-                        squared += deviation * deviation
-                    se = (squared / (n * (n - 1))).sqrt()
-                else:
-                    se = Decimal(0)
-                lower = mu - z_value * se
-                upper = mu + z_value * se
-
-                r = sum(1 for values in rows if values[2] > 0)
-                s = sum(1 for values in rows if values[2] < 0)
-                m = r + s
-                if m == 0:
-                    p = Decimal(1)
-                else:
-                    q = min(r, s)
-                    tail = sum(math.comb(m, k) for k in range(q + 1))
-                    p = min(Decimal(1), 2 * Decimal(tail) / Decimal(2**m))
-
-                if by == "time":
-                    key_json = str(group_key)
-                else:
-                    key_json = json.dumps(group_key, ensure_ascii=False)
-                items.append(
-                    '{"key":' + key_json
-                    + ',"n":' + str(n)
-                    + ',"base":' + _format6(means[0])
-                    + ',"post":' + _format6(means[1])
-                    + ',"delta":' + _format6(means[2])
-                    + ',"cg":' + _format6(means[3])
-                    + ',"cr":' + _format6(means[4])
-                    + ',"cm":' + _format6(means[5])
-                    + ',"p":' + _format6(p)
-                    + ',"se":' + _format6(se)
-                    + ',"lower":' + _format6(lower)
-                    + ',"upper":' + _format6(upper)
-                    + '}'
-                )
+        for group_key, n, means, p, se, lower, upper in _effect_groups(
+            parsed, by, minutes, z_value
+        ):
+            if by == "time":
+                key_json = str(group_key)
+            else:
+                key_json = json.dumps(group_key, ensure_ascii=False)
+            items.append(
+                '{"key":' + key_json
+                + ',"n":' + str(n)
+                + ',"base":' + _format6(means[0])
+                + ',"post":' + _format6(means[1])
+                + ',"delta":' + _format6(means[2])
+                + ',"cg":' + _format6(means[3])
+                + ',"cr":' + _format6(means[4])
+                + ',"cm":' + _format6(means[5])
+                + ',"p":' + _format6(p)
+                + ',"se":' + _format6(se)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + '}'
+            )
 
         return (
             '{"by":' + json.dumps(by)
@@ -1082,3 +1117,81 @@ def effect_report(
             + ',"z":' + _format6(z_value)
             + ',"groups":[' + ",".join(items) + ']}'
         )
+
+
+def _csv_field(text: str) -> str:
+    """Render an RFC4180 CSV field, double-quoting it when it contains a
+    comma, double quote or line break and doubling interior double quotes."""
+    if any(char in text for char in '",\r\n'):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def effect_report_csv(
+    details: list,
+    *,
+    by: str,
+    minutes: int = 60,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario details per group and emit an RFC4180 CSV report.
+
+    ``details`` follows the ``effect_report`` contract: a list of ``scenario``
+    eight-tuples ``(timestamp, cell_id, base, post, delta, cg, cr, cm)`` with
+    finite non-boolean numeric fields and unique ``(timestamp, cell_id)``
+    pairs; an empty list still yields the header row. ``by`` is ``"time"``
+    (Unix-epoch buckets floored to ``minutes``-sized buckets) or ``"cell"``
+    (grouped by cell id); ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440. ``z`` is a non-boolean finite number
+    greater than or equal to 0.
+
+    Grouping, ascending key order, the six within-group means, the sign-test
+    ``p``, ``se`` and the ``lower``/``upper`` interval are computed exactly as
+    in ``effect_report``: every number enters the computation as
+    ``Decimal(str(x))`` under a precision-1000, ROUND_HALF_EVEN local context.
+
+    Returns a UTF-8 RFC4180 CSV string whose first line is the fixed header
+    ``key,n,base,post,delta,cg,cr,cm,p,se,lower,upper``, followed by one line
+    per group in ascending key order. Lines end with CRLF, including the last
+    one. Fields containing a comma, double quote or line break are wrapped in
+    double quotes with interior double quotes doubled. ``time`` keys are
+    decimal bucket-start seconds, ``cell`` keys the original cell id strings,
+    ``n`` a decimal integer and every other number is rendered with exactly
+    six decimals, negative zero normalized to ``0.000000``. ``details`` not
+    being a list raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    parsed = _parse_effect_details(details)
+    minutes, z_value = _validate_effect_args(by, minutes, z)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        lines = ["key,n,base,post,delta,cg,cr,cm,p,se,lower,upper"]
+        for group_key, n, means, p, se, lower, upper in _effect_groups(
+            parsed, by, minutes, z_value
+        ):
+            if by == "time":
+                key_field = str(group_key)
+            else:
+                key_field = _csv_field(group_key)
+            lines.append(
+                ",".join(
+                    (
+                        key_field,
+                        str(n),
+                        _format6(means[0]),
+                        _format6(means[1]),
+                        _format6(means[2]),
+                        _format6(means[3]),
+                        _format6(means[4]),
+                        _format6(means[5]),
+                        _format6(p),
+                        _format6(se),
+                        _format6(lower),
+                        _format6(upper),
+                    )
+                )
+            )
+    return "\r\n".join(lines) + "\r\n"
