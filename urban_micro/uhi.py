@@ -16,6 +16,7 @@ __all__ = [
     "attribute_effects",
     "effect_report",
     "effect_report_csv",
+    "effect_jackknife_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -1172,3 +1173,117 @@ def effect_report_csv(
                 + "," + _format6(upper)
             )
         return "\r\n".join(lines) + "\r\n"
+
+
+def effect_jackknife_report(
+    details: list,
+    *,
+    by: str,
+    minutes: int = 60,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario deltas per group with a jackknife standard error.
+
+    ``details`` follows the ``effect_report`` contract: a list of
+    ``scenario`` eight-tuples ``(timestamp, cell_id, base, post, delta, cg,
+    cr, cm)`` with finite non-boolean numeric fields and unique
+    ``(timestamp, cell_id)`` pairs; an empty list yields empty ``groups``.
+    ``by`` is ``"time"`` (Unix-epoch buckets floored to ``minutes``-sized
+    buckets) or ``"cell"`` (grouped by cell id); ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440. ``z`` is a
+    non-boolean finite number greater than or equal to 0.
+
+    Groups are emitted in ascending key order (bucket-start seconds for
+    ``time``, cell id strings for ``cell``). With ``d_i`` the group deltas,
+    ``n`` the group size and ``mu = sum(d_i) / n``, the leave-one-out means
+    are ``mu_i = (sum(d) - d_i) / (n - 1)`` and the jackknife standard
+    error is ``sqrt((n - 1) / n * sum((mu_i - mean(mu_i)) ** 2))`` when
+    ``n > 1`` (0 otherwise); ``lower``/``upper`` are ``mu - z * se`` /
+    ``mu + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``by, minutes, z, groups`` and each group object uses the key
+    order ``key, n, delta, se, lower, upper``. ``z`` and every numeric
+    result are rendered with exactly six decimals, negative zero
+    normalized to ``0.000000``; ``cell`` keys are JSON-escaped with
+    Unicode preserved. ``details`` not being a list raises ``TypeError``;
+    every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if by not in ("time", "cell"):
+        raise ValueError("by must be 'time' or 'cell'")
+    minutes = _validate_minutes(minutes)
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        parsed = []
+        seen: set[tuple[int, str]] = set()
+        for row in details:
+            validated = _validate_detail_row(row)
+            key = (validated[0], validated[1])
+            if key in seen:
+                raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+            seen.add(key)
+            parsed.append(validated)
+
+        items = []
+        if parsed:
+            bucket_seconds = minutes * 60
+            groups: dict[object, list[Decimal]] = {}
+            for validated in parsed:
+                timestamp, cell_id, values = validated[0], validated[1], validated[2:]
+                if by == "time":
+                    group_key = (timestamp // bucket_seconds) * bucket_seconds
+                else:
+                    group_key = cell_id
+                groups.setdefault(group_key, []).append(values[2])
+
+            for group_key in sorted(groups):
+                deltas = groups[group_key]
+                n = len(deltas)
+                total = Decimal(0)
+                for d in deltas:
+                    total += d
+                n_dec = Decimal(n)
+                mu = total / n_dec
+                if n > 1:
+                    leave_one = [(total - d) / (n_dec - 1) for d in deltas]
+                    leave_mean = sum(leave_one, Decimal(0)) / n_dec
+                    squared = Decimal(0)
+                    for value in leave_one:
+                        deviation = value - leave_mean
+                        squared += deviation * deviation
+                    se = (((n_dec - 1) / n_dec) * squared).sqrt()
+                else:
+                    se = Decimal(0)
+                lower = mu - z_value * se
+                upper = mu + z_value * se
+
+                if by == "time":
+                    key_json = str(group_key)
+                else:
+                    key_json = json.dumps(group_key, ensure_ascii=False)
+                items.append(
+                    '{"key":' + key_json
+                    + ',"n":' + str(n)
+                    + ',"delta":' + _format6(mu)
+                    + ',"se":' + _format6(se)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + '}'
+                )
+
+        return (
+            '{"by":' + json.dumps(by)
+            + ',"minutes":' + str(minutes)
+            + ',"z":' + _format6(z_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
