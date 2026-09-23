@@ -39,6 +39,7 @@ __all__ = [
     "effect_matrix_autocorr_report",
     "effect_matrix_moran_report",
     "effect_matrix_local_moran_report",
+    "effect_matrix_hotspot_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -3930,6 +3931,284 @@ def effect_matrix_local_moran_report(
 
         return (
             '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def effect_matrix_hotspot_report(
+    details: list,
+    neighbors: list,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Aggregate scenario deltas per bucket into a local-Moran hotspot report.
+
+    ``details`` and ``neighbors`` follow the ``effect_matrix_local_moran_report``
+    contract: ``details`` is a list of ``scenario`` eight-tuples
+    ``(timestamp, cell_id, base, post, delta, cg, cr, cm)`` with a
+    non-boolean non-negative integer timestamp, a non-empty string cell id,
+    finite non-boolean numeric fields and unique ``(timestamp, cell_id)``
+    pairs; ``neighbors`` is a list of distinct undirected ``(a, b)``
+    two-tuples of distinct non-empty cell id strings occurring in
+    ``details``. ``minutes`` must be a non-boolean integer in ``1..1440``
+    that divides 1440; ``alpha`` is a non-boolean finite number with
+    ``0 < alpha <= 1``.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within each
+    bucket/cell pair are averaged. Each bucket holds the vector ``d`` of its
+    per-cell mean deltas in ascending cell id order; a bucket with more than
+    8 cells raises ``ValueError``. With ``n`` the size of ``d``,
+    ``x_i = d_i - mean(d)`` and ``S = sum(x_i ** 2)``, the local Moran
+    statistic of cell ``c`` is
+    ``L_c = n * x_c * sum(x_j over the neighbors of c inside the bucket) /
+    S``. When ``S`` is 0 or ``c`` has no neighbor inside the bucket,
+    ``L_c`` is 0 and ``p`` is 1; otherwise ``p`` is the exact permutation
+    p-value: all ``n!`` permutations of ``d`` are enumerated in
+    lexicographic order (duplicate values not deduplicated), the local
+    statistic is recomputed for each and ``p`` is the proportion with
+    ``|L_perm| >= |L|``, compared on the unquantized values via exact
+    rational arithmetic so theoretically-equal statistics are never split
+    by rounding.
+
+    With ``N`` the total number of bucket/cell cells, all cells are ranked
+    ascending by ``(p, bucket, cell)`` and each rank ``j`` (1-based) gets the
+    Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    bucket/cell; ``reject`` is ``q <= alpha``, compared on the unquantized
+    exact values. Each rejected cell is classified from the signs of
+    ``x_c`` and ``v_c = sum(x_j over its in-bucket neighbors)``:
+    ``(+, +)`` is ``HH``, ``(-, -)`` is ``LL``, ``(+, -)`` is ``HL`` and
+    ``(-, +)`` is ``LH``; non-rejected cells and cells with ``x_c = 0`` or
+    ``v_c = 0`` are ``NS``.
+
+    Numbers enter as ``Decimal(str(x))`` and bucket accumulation happens
+    under a precision-1000, ROUND_HALF_EVEN local context; the per-bucket
+    means are then lifted to exact fractions for the statistic, its
+    permutation test and the q-values. Returns a compact UTF-8 JSON string
+    with no spaces and no trailing newline; the top-level key order is
+    ``minutes, alpha, groups``, each group object uses the key order
+    ``key, n, cells`` (groups in ascending bucket order) and each cell
+    object the key order ``key, local, p, q, reject, kind`` with cells in
+    ascending cell id order. ``alpha``, ``local``, ``p`` and ``q`` are
+    rendered with exactly six decimals, negative zero normalized to
+    ``0.000000``; bucket keys and ``n`` are integers and cell ids are
+    JSON-escaped with Unicode preserved. An empty ``details`` yields
+    ``{"minutes":60,"alpha":0.050000,"groups":[]}``. ``details`` or
+    ``neighbors`` not being a list raises ``TypeError``; every other
+    contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(neighbors, list):
+        raise TypeError("neighbors must be a list")
+    minutes = _validate_minutes(minutes)
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    parsed = _validate_detail_rows(details)
+
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    edges: set[tuple[str, str]] = set()
+    for item in neighbors:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each neighbor must be an (a, b) two-tuple")
+        endpoint_a, endpoint_b = item
+        for endpoint in (endpoint_a, endpoint_b):
+            if not isinstance(endpoint, str) or not endpoint:
+                raise ValueError(
+                    "neighbor endpoints must be non-empty cell id strings"
+                )
+            if endpoint not in cell_ids:
+                raise ValueError(f"unknown cell id in neighbor: {endpoint!r}")
+        if endpoint_a == endpoint_b:
+            raise ValueError("neighbor self-loops are not allowed")
+        edge = (
+            (endpoint_a, endpoint_b)
+            if endpoint_a < endpoint_b
+            else (endpoint_b, endpoint_a)
+        )
+        if edge in edges:
+            raise ValueError(f"duplicate neighbor edge: {edge!r}")
+        edges.add(edge)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> [delta sum, row count]
+        buckets: dict[int, dict[str, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = buckets.setdefault(bucket, {}).setdefault(
+                    cell_id, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        # Flat records in ascending (bucket, cell) output order:
+        # ``[bucket, n, cell_id, local, p, x_c, v_c]`` with fractions.
+        records: list[list] = []
+        for bucket in sorted(buckets):
+            cells = sorted(buckets[bucket])
+            n = len(cells)
+            if n > _LOCAL_MORAN_MAX_N:
+                raise ValueError(
+                    f"bucket {bucket} has {n} cells; hotspot report "
+                    f"requires at most {_LOCAL_MORAN_MAX_N} cells per bucket"
+                )
+            d = []
+            for cell_id in cells:
+                total, count = buckets[bucket][cell_id]
+                d.append(Fraction(total) / count)
+            position = {cell_id: index for index, cell_id in enumerate(cells)}
+            adjacency: list[list[int]] = [[] for _ in range(n)]
+            for a, b in sorted(edges):
+                if a in position and b in position:
+                    i, j = position[a], position[b]
+                    adjacency[i].append(j)
+                    adjacency[j].append(i)
+            for neighbors_of in adjacency:
+                neighbors_of.sort()
+
+            mean_d = sum(d, Fraction(0)) / n
+            deviations = [value - mean_d for value in d]
+            sxx = sum((value * value for value in deviations), Fraction(0))
+            neighbor_sums = [
+                sum((deviations[j] for j in neighbors_of), Fraction(0))
+                for neighbors_of in adjacency
+            ]
+
+            if sxx == 0:
+                observed = [Fraction(0)] * n
+                p_values = [Fraction(1)] * n
+            else:
+                observed = [
+                    Fraction(n)
+                    * deviations[index]
+                    * neighbor_sums[index]
+                    / sxx
+                    for index in range(n)
+                ]
+                active = [bool(neighbors_of) for neighbors_of in adjacency]
+                # As in effect_matrix_local_moran_report, write d_i = p_i / D
+                # with a shared denominator D and z_i = n*p_i - T; the
+                # permutation-invariant factor drops out of |L_perm| >= |L|,
+                # so the test is decided by the exact integer products
+                # z_i * sum_{j~i} z_j.
+                denominator = 1
+                for value in d:
+                    denominator = denominator * value.denominator // math.gcd(
+                        denominator, value.denominator
+                    )
+                p_values = [Fraction(1)] * n
+                if any(active):
+                    numerators = [
+                        value.numerator * (denominator // value.denominator)
+                        for value in d
+                    ]
+                    total_numerators = sum(numerators)
+                    z = [
+                        n * numerator - total_numerators
+                        for numerator in numerators
+                    ]
+                    observed_scores = [
+                        z[index] * sum((z[j] for j in adjacency[index]), 0)
+                        for index in range(n)
+                    ]
+                    hits = [0] * n
+                    factorial = math.factorial(n)
+                    for perm in permutations(z):
+                        for index in range(n):
+                            if not active[index]:
+                                continue
+                            perm_score = perm[index] * sum(
+                                (perm[j] for j in adjacency[index]), 0
+                            )
+                            if abs(perm_score) >= abs(observed_scores[index]):
+                                hits[index] += 1
+                    for index in range(n):
+                        if active[index]:
+                            p_values[index] = Fraction(hits[index], factorial)
+
+            for index, cell_id in enumerate(cells):
+                records.append(
+                    [
+                        bucket,
+                        n,
+                        cell_id,
+                        observed[index],
+                        p_values[index],
+                        deviations[index],
+                        neighbor_sums[index],
+                    ]
+                )
+
+        # Benjamini-Hochberg q-values across ALL bucket/cell cells: rank
+        # ascending by (p, bucket, cell), then accumulate the running minimum
+        # of N * p_l / l from the top rank down, mapping q back to each cell.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (records[idx][4], records[idx][0], records[idx][2]),
+        )
+        q_values: list[Fraction | None] = [None] * count
+        running = Fraction(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate = Fraction(count) * records[idx][4] / rank
+            if candidate < running:
+                running = candidate
+            q_values[idx] = running
+        alpha_fraction = Fraction(alpha_value)
+
+        groups = []
+        cell_items = []
+        current_bucket = None
+        current_n = 0
+        for idx, (bucket, n, cell_id, local, p_value, x_c, v_c) in enumerate(records):
+            if current_bucket is not None and bucket != current_bucket:
+                groups.append(
+                    '{"key":' + str(current_bucket)
+                    + ',"n":' + str(current_n)
+                    + ',"cells":[' + ",".join(cell_items) + ']}'
+                )
+                cell_items = []
+            current_bucket = bucket
+            current_n = n
+            q_value = q_values[idx]
+            reject = q_value <= alpha_fraction
+            if reject and x_c != 0 and v_c != 0:
+                if x_c > 0:
+                    kind = "HH" if v_c > 0 else "HL"
+                else:
+                    kind = "LH" if v_c > 0 else "LL"
+            else:
+                kind = "NS"
+            cell_items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"local":' + _format6(_fraction_to_decimal(local))
+                + ',"p":' + _format6(_fraction_to_decimal(p_value))
+                + ',"q":' + _format6(_fraction_to_decimal(q_value))
+                + ',"reject":' + ("true" if reject else "false")
+                + ',"kind":' + json.dumps(kind)
+                + '}'
+            )
+        if current_bucket is not None:
+            groups.append(
+                '{"key":' + str(current_bucket)
+                + ',"n":' + str(current_n)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
 
