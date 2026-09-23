@@ -28,6 +28,7 @@ __all__ = [
     "effect_matrix_significance_report",
     "effect_matrix_fdr_report",
     "effect_matrix_bootstrap_report",
+    "effect_matrix_compare_report",
     "effect_matrix_jackknife_report",
     "effect_matrix_permutation_report",
     "effect_matrix_contribution_report",
@@ -3104,5 +3105,194 @@ def effect_matrix_contribution_report(
 
         return (
             '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def _parse_compare_deltas(rows: list) -> dict[tuple[int, str], Decimal]:
+    """Validate one already-list-typed ``effect_matrix_compare_report`` input.
+
+    Each row must be a ``scenario`` ``(timestamp, cell_id, base, post, delta,
+    cg, cr, cm)`` eight-tuple with finite non-boolean numeric fields and
+    unique ``(timestamp, cell_id)`` pairs. Returns a mapping from
+    ``(timestamp, cell_id)`` to the row delta as a ``Decimal``.
+    """
+    deltas: dict[tuple[int, str], Decimal] = {}
+    for row in rows:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in deltas:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        deltas[key] = validated[4]
+    return deltas
+
+
+def effect_matrix_compare_report(
+    before: list,
+    after: list,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Pair before/after scenario deltas into a time-bucket x cell FDR report.
+
+    ``before`` and ``after`` are lists of ``scenario`` eight-tuples
+    ``(timestamp, cell_id, base, post, delta, cg, cr, cm)``: ``timestamp``
+    must be a non-boolean non-negative integer, ``cell_id`` a non-empty
+    string and the other six fields finite non-boolean int/float values;
+    ``(timestamp, cell_id)`` pairs must be unique within each list and the
+    two lists must contain exactly the same set of pairs. An empty pair of
+    lists yields empty ``groups``. ``minutes`` must be a non-boolean integer
+    in ``1..1440`` that divides 1440; ``alpha`` is a non-boolean finite
+    number with ``0 < alpha <= 1``.
+
+    Each matched ``(timestamp, cell_id)`` row is bucketed by Unix epoch with
+    key ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted
+    in ascending order and, within each bucket, cells in ascending string
+    order. Paired rows sharing a bucket/cell are aggregated: with ``n`` the
+    pair count, ``before``/``after`` are the within-cell arithmetic means of
+    the before/after deltas and ``change`` is ``after - before``. Its ``p``
+    is the two-sided sign-test p-value of the changes: with ``r``/``s`` the
+    counts of positive/negative changes (zeros ignored), ``m = r + s``,
+    ``p`` is 1 when ``m`` is 0 and
+    ``min(1, 2 * sum(C(m, k) for k in 0..min(r, s)) / 2**m)`` otherwise.
+
+    With ``N`` the number of bucket/cell cells, all cells are ranked
+    ascending by ``(p, bucket, cell)`` and each rank ``j`` (1-based) gets the
+    Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    bucket/cell; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, alpha, groups``, each group object uses the key order
+    ``key, cells`` and each cell object the key order
+    ``key, n, before, after, change, p, q, reject`` with ``key`` the cell id.
+    An empty pair of lists yields
+    ``{"minutes":60,"alpha":0.050000,"groups":[]}``. ``alpha`` and every
+    numeric result are rendered with exactly six decimals, negative zero
+    normalized to ``0.000000``; bucket keys and cell sizes are integers and
+    cell ids are JSON-escaped with Unicode preserved. ``before`` or
+    ``after`` not being a list raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(before, list):
+        raise TypeError("before must be a list")
+    if not isinstance(after, list):
+        raise TypeError("after must be a list")
+    minutes = _validate_minutes(minutes)
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    before_deltas = _parse_compare_deltas(before)
+    after_deltas = _parse_compare_deltas(after)
+    if before_deltas.keys() != after_deltas.keys():
+        raise ValueError(
+            "before and after must contain the same (timestamp, cell_id) pairs"
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> list of (before_delta, after_delta)
+        buckets: dict[int, dict[str, list[tuple[Decimal, Decimal]]]] = {}
+        if before_deltas:
+            bucket_seconds = minutes * 60
+            for key, before_delta in before_deltas.items():
+                timestamp, cell_id = key
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(
+                    (before_delta, after_deltas[key])
+                )
+
+        # One record per bucket/cell in ascending (bucket, cell) output order:
+        # ``[bucket, cell_id, n, before_mean, after_mean, change, p, q]`` with
+        # q filled in below.
+        records: list[list] = []
+        for bucket in sorted(buckets):
+            for cell_id in sorted(buckets[bucket]):
+                pairs = buckets[bucket][cell_id]
+                n = len(pairs)
+                before_total = Decimal(0)
+                after_total = Decimal(0)
+                for before_delta, after_delta in pairs:
+                    before_total += before_delta
+                    after_total += after_delta
+                before_mean = before_total / n
+                after_mean = after_total / n
+                change = after_mean - before_mean
+                r = 0
+                s = 0
+                for before_delta, after_delta in pairs:
+                    if after_delta > before_delta:
+                        r += 1
+                    elif after_delta < before_delta:
+                        s += 1
+                m = r + s
+                if m == 0:
+                    p_value = Decimal(1)
+                else:
+                    q0 = min(r, s)
+                    tail = sum(math.comb(m, k) for k in range(q0 + 1))
+                    p_value = min(Decimal(1), 2 * Decimal(tail) / Decimal(2**m))
+                records.append(
+                    [bucket, cell_id, n, before_mean, after_mean, change, p_value, None]
+                )
+
+        # Benjamini-Hochberg q-values across ALL bucket/cell cells: rank
+        # ascending by (p, bucket, cell), then accumulate the running minimum
+        # of N * p_l / l from the top rank down, mapping q back to each cell.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (records[idx][6], records[idx][0], records[idx][1]),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate = Decimal(count) * records[idx][6] / rank
+            if candidate < running:
+                running = candidate
+            records[idx][7] = running
+
+        groups = []
+        cell_items = []
+        current_bucket = None
+        for record in records:
+            bucket, cell_id, n = record[0], record[1], record[2]
+            before_mean, after_mean = record[3], record[4]
+            change, p_value, q_value = record[5], record[6], record[7]
+            if current_bucket is not None and bucket != current_bucket:
+                groups.append(
+                    '{"key":' + str(current_bucket)
+                    + ',"cells":[' + ",".join(cell_items) + ']}'
+                )
+                cell_items = []
+            current_bucket = bucket
+            reject = q_value <= alpha_value
+            cell_items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"before":' + _format6(before_mean)
+                + ',"after":' + _format6(after_mean)
+                + ',"change":' + _format6(change)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if reject else "false")
+                + '}'
+            )
+        if current_bucket is not None:
+            groups.append(
+                '{"key":' + str(current_bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
