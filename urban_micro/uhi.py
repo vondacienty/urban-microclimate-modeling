@@ -36,6 +36,7 @@ __all__ = [
     "effect_matrix_contribution_report",
     "effect_matrix_autocorr_report",
     "effect_matrix_moran_report",
+    "effect_matrix_theilsen_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -3717,4 +3718,150 @@ def effect_matrix_moran_report(
         return (
             '{"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_THEILSEN_MAX_N = 8
+
+
+def effect_matrix_theilsen_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    min_points: int = 3,
+) -> str:
+    """Aggregate scenario deltas into per-cell Theil-Sen/Kendall JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``min_points`` must be a non-boolean
+    integer greater than or equal to 3.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within
+    each ``(B, cell_id)`` pair are averaged. For each cell id, the occupied
+    buckets form points ``(x, y)`` with ``x = B`` and ``y`` the bucket mean
+    delta, ordered by ascending ``B``. Cells with fewer than ``min_points``
+    occupied buckets are omitted; every remaining cell must have at most 8
+    buckets, otherwise ``ValueError`` is raised. Kept cells are emitted in
+    ascending cell id order.
+
+    For each kept cell with ``n`` points, ``slope`` is the Theil-Sen
+    estimator: the median of the ``C(n, 2)`` pairwise slopes
+    ``(y_j - y_i) / (x_j - x_i)`` for ``i < j`` (the mean of the two middle
+    slopes when their count is even). ``S`` is
+    ``sum(sign(y_j - y_i))`` for ``i < j`` with ``sign`` in ``{-1, 0, 1}``
+    and ``tau`` is Kendall's ``S / C(n, 2)``. ``p`` is the exact two-sided
+    permutation p-value: all ``n!`` permutations of ``y`` are enumerated
+    without deduplicating equal values, ``S'`` is recomputed for each and
+    ``p`` is the proportion with ``|S'| >= |S|``, compared on the exact
+    integer values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups`` and each group object uses the key order
+    ``key, n, slope, tau, p`` with ``key`` the cell id and ``n`` the number
+    of fitted buckets. Every numeric result is rendered with exactly six
+    decimals, negative zero normalized to ``0.000000``; cell ids are
+    JSON-escaped with Unicode preserved. An empty ``details`` yields
+    ``{"minutes":60,"groups":[]}``. ``details`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    if isinstance(min_points, bool) or not isinstance(min_points, int):
+        raise ValueError("min_points must be an integer")
+    if min_points < 3:
+        raise ValueError("min_points must be an integer greater than or equal to 3")
+
+    parsed = _validate_detail_rows(details)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # cell_id -> bucket start -> [delta sum, row count]
+        cells: dict[str, dict[int, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = cells.setdefault(cell_id, {}).setdefault(
+                    bucket, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        def sign(value: Decimal) -> int:
+            if value > 0:
+                return 1
+            if value < 0:
+                return -1
+            return 0
+
+        items = []
+        for cell_id in sorted(cells):
+            buckets = cells[cell_id]
+            if len(buckets) < min_points:
+                continue
+            n = len(buckets)
+            if n > _THEILSEN_MAX_N:
+                raise ValueError(
+                    f"cell {cell_id!r} has {n} buckets; Theil-Sen report "
+                    f"requires at most {_THEILSEN_MAX_N} buckets per cell"
+                )
+            points = [
+                (Decimal(bucket), total / count)
+                for bucket, (total, count) in sorted(buckets.items())
+            ]
+            ys = [y for _, y in points]
+
+            slopes = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    slopes.append((ys[j] - ys[i]) / (points[j][0] - points[i][0]))
+            slopes.sort()
+            slope_count = len(slopes)
+            if slope_count % 2:
+                slope = slopes[slope_count // 2]
+            else:
+                slope = (
+                    slopes[slope_count // 2 - 1] + slopes[slope_count // 2]
+                ) / 2
+
+            s_value = 0
+            for i in range(n):
+                for j in range(i + 1, n):
+                    s_value += sign(ys[j] - ys[i])
+            tau = Decimal(s_value) / Decimal(math.comb(n, 2))
+
+            hits = 0
+            abs_s = abs(s_value)
+            for perm in permutations(ys):
+                perm_s = 0
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        perm_s += sign(perm[j] - perm[i])
+                if abs(perm_s) >= abs_s:
+                    hits += 1
+            p_value = Decimal(hits) / Decimal(math.factorial(n))
+
+            items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"slope":' + _format6(slope)
+                + ',"tau":' + _format6(tau)
+                + ',"p":' + _format6(p_value)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(items) + ']}'
         )
