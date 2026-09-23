@@ -33,6 +33,7 @@ __all__ = [
     "effect_matrix_jackknife_report",
     "effect_matrix_permutation_report",
     "effect_matrix_robust_report",
+    "effect_matrix_theilsen_report",
     "effect_matrix_contribution_report",
     "effect_matrix_autocorr_report",
     "effect_matrix_moran_report",
@@ -3711,6 +3712,152 @@ def effect_matrix_moran_report(
                 + ',"n":' + str(n)
                 + ',"moran":' + _format6(moran)
                 + ',"p":' + _format6(p)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_THEILSEN_MAX_N = 8
+
+
+def _s_score(values: list[Decimal]) -> int:
+    """Kendall score ``S = sum_{i < j} sign(values[j] - values[i])`` with
+    ``sign`` in ``{-1, 0, 1}``."""
+    score = 0
+    size = len(values)
+    for i in range(size):
+        for j in range(i + 1, size):
+            if values[j] > values[i]:
+                score += 1
+            elif values[j] < values[i]:
+                score -= 1
+    return score
+
+
+def effect_matrix_theilsen_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    min_points: int = 3,
+) -> str:
+    """Aggregate scenario deltas into a per-cell Theil-Sen / Kendall trend report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``min_points`` must be a non-boolean
+    integer greater than or equal to 3.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within each
+    ``(bucket, cell_id)`` pair are averaged. For each cell id ``c`` the
+    occupied buckets, in ascending bucket order, give the points
+    ``(x, y) = (bucket, mean delta)``; cells with fewer than
+    ``min_points`` occupied buckets are omitted and a cell with more than 8
+    occupied buckets raises ``ValueError``. The kept cells are emitted in
+    ascending cell id order.
+
+    With ``n`` the number of points, ``slope`` is the Theil-Sen estimator:
+    the median of the ``C(n, 2)`` pairwise slopes
+    ``(y_j - y_i) / (x_j - x_i)`` for ``i < j`` (the interpolated median of
+    the sorted slopes when their count is even). ``S`` is the Kendall score
+    ``sum_{i < j} sign(y_j - y_i)`` with ``sign`` in ``{-1, 0, 1}`` and
+    ``tau = S / C(n, 2)``. ``p`` is the exact two-sided permutation
+    p-value: all ``n!`` permutations of ``y`` are enumerated in lexicographic
+    order (duplicate values not deduplicated), ``S'`` is recomputed for each
+    and ``p`` is the proportion with ``|S'| >= |S|``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups`` and each group object uses the key order
+    ``key, n, slope, tau, p`` with ``key`` the cell id. Every numeric result
+    is rendered with exactly six decimals, negative zero normalized to
+    ``0.000000``; ``n`` is an integer and cell ids are JSON-escaped with
+    Unicode preserved. An empty ``details`` yields
+    ``{"minutes":60,"groups":[]}``. ``details`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    if isinstance(min_points, bool) or not isinstance(min_points, int):
+        raise ValueError("min_points must be an integer")
+    if min_points < 3:
+        raise ValueError("min_points must be an integer greater than or equal to 3")
+
+    parsed = _validate_detail_rows(details)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # cell_id -> bucket start -> [delta sum, row count]
+        cells: dict[str, dict[int, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = cells.setdefault(cell_id, {}).setdefault(
+                    bucket, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        groups = []
+        for cell_id in sorted(cells):
+            buckets = cells[cell_id]
+            n = len(buckets)
+            if n < min_points:
+                continue
+            if n > _THEILSEN_MAX_N:
+                raise ValueError(
+                    f"cell {cell_id!r} has {n} occupied buckets; Theil-Sen "
+                    f"report requires at most {_THEILSEN_MAX_N} buckets per cell"
+                )
+            points = [
+                (Decimal(bucket), total / count)
+                for bucket, (total, count) in sorted(buckets.items())
+            ]
+            ys = [y for _, y in points]
+
+            pairwise_slopes = []
+            for i in range(n):
+                x_i, y_i = points[i]
+                for j in range(i + 1, n):
+                    x_j, y_j = points[j]
+                    pairwise_slopes.append((y_j - y_i) / (x_j - x_i))
+            pairwise_slopes.sort()
+            mid = len(pairwise_slopes) // 2
+            if len(pairwise_slopes) % 2:
+                slope = pairwise_slopes[mid]
+            else:
+                slope = (pairwise_slopes[mid - 1] + pairwise_slopes[mid]) / 2
+
+            s_value = _s_score(ys)
+            pair_count = n * (n - 1) // 2
+            tau = Decimal(s_value) / pair_count
+
+            abs_s = abs(s_value)
+            hits = 0
+            for perm in permutations(ys):
+                if abs(_s_score(list(perm))) >= abs_s:
+                    hits += 1
+            p_value = Decimal(hits) / Decimal(math.factorial(n))
+
+            groups.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"slope":' + _format6(slope)
+                + ',"tau":' + _format6(tau)
+                + ',"p":' + _format6(p_value)
                 + '}'
             )
 
