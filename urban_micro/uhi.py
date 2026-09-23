@@ -31,6 +31,7 @@ __all__ = [
     "effect_matrix_bootstrap_report",
     "effect_matrix_jackknife_report",
     "effect_matrix_permutation_report",
+    "effect_matrix_robust_report",
     "effect_matrix_contribution_report",
 ]
 
@@ -3287,5 +3288,113 @@ def effect_matrix_compare_report(
         return (
             '{"minutes":' + str(minutes)
             + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def effect_matrix_robust_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario deltas into a robust (median/MAD) matrix JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``z`` is a non-boolean finite number
+    greater than or equal to 0.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted in
+    ascending order and, within each bucket, cells in ascending string
+    order. Within each cell the deltas are sorted ascending as ``d`` of size
+    ``n`` and the order-statistic quantile is
+    ``Q(q) = (1 - f) * d[i] + f * d[min(i + 1, n - 1)]`` with
+    ``r = (n - 1) * q``, ``i = floor(r)`` and ``f = r - i``; the cell
+    reports ``median = Q(0.5)``, ``mad`` the same ``Q(0.5)`` of the ascending
+    absolute deviations ``|d - median|``, ``se = 1.4826 * mad / sqrt(n)`` and
+    ``lower``/``upper`` as ``median - z * se`` / ``median + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, z, groups``, each group object uses the key order
+    ``key, cells`` and each cell object the key order
+    ``key, n, median, mad, se, lower, upper`` with ``key`` the cell id. An
+    empty ``details`` yields
+    ``{"minutes":60,"z":1.960000,"groups":[]}``. ``z`` and every numeric
+    result are rendered with exactly six decimals, negative zero normalized
+    to ``0.000000``; bucket keys and cell sizes are integers and cell ids are
+    JSON-escaped with Unicode preserved. ``details`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    parsed = _validate_detail_rows(details)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> list of delta Decimal values
+        buckets: dict[int, dict[str, list[Decimal]]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(delta)
+
+        half = Decimal("0.5")
+        mad_scale = Decimal("1.4826")
+
+        def quantile(sorted_values: list[Decimal], q: Decimal) -> Decimal:
+            n = len(sorted_values)
+            r = Decimal(n - 1) * q
+            i = int(r.to_integral_value(rounding=ROUND_FLOOR))
+            f = r - Decimal(i)
+            if i + 1 < n:
+                return (Decimal(1) - f) * sorted_values[i] + f * sorted_values[i + 1]
+            return sorted_values[i]
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                deltas = sorted(buckets[bucket][cell_id])
+                n = len(deltas)
+                median = quantile(deltas, half)
+                deviations = sorted(abs(delta - median) for delta in deltas)
+                mad = quantile(deviations, half)
+                se = mad_scale * mad / Decimal(n).sqrt()
+                lower = median - z_value * se
+                upper = median + z_value * se
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"median":' + _format6(median)
+                    + ',"mad":' + _format6(mad)
+                    + ',"se":' + _format6(se)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"z":' + _format6(z_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
