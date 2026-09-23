@@ -27,6 +27,7 @@ __all__ = [
     "effect_matrix_csv",
     "effect_matrix_significance_report",
     "effect_matrix_fdr_report",
+    "effect_matrix_jackknife_report",
     "effect_matrix_bootstrap_report",
 ]
 
@@ -2606,5 +2607,118 @@ def effect_matrix_bootstrap_report(
         return (
             '{"minutes":' + str(minutes)
             + ',"confidence":' + _format6(confidence_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def effect_matrix_jackknife_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario deltas into a time-bucket x cell jackknife JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``z`` is a non-boolean finite number
+    greater than or equal to 0.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted in
+    ascending order and, within each bucket, cells in ascending string order.
+    With ``d`` the per-row deltas within a bucket/cell and ``n`` the cell
+    size, ``delta`` is ``sum(d) / n``; the jackknife standard error is 0 when
+    ``n <= 1`` and otherwise
+    ``sqrt((n - 1) / n * sum((mu_i - mu_bar) ** 2))`` where
+    ``mu_i = (sum(d) - d_i) / (n - 1)`` and ``mu_bar = sum(mu_i) / n``;
+    ``lower``/``upper`` are ``delta - z * se`` / ``delta + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, z, groups``, each group object uses the key order
+    ``key, cells`` and each cell object the key order
+    ``key, n, delta, se, lower, upper`` with ``key`` the cell id. An empty
+    ``details`` yields ``{"minutes":60,"z":1.960000,"groups":[]}``. ``z`` and
+    every numeric result are rendered with exactly six decimals, negative
+    zero normalized to ``0.000000``. ``details`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> list of delta Decimal values
+        buckets: dict[int, dict[str, list[Decimal]]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(delta)
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                deltas = buckets[bucket][cell_id]
+                n = len(deltas)
+                total = Decimal(0)
+                for delta in deltas:
+                    total += delta
+                mu = total / n
+                if n > 1:
+                    leave_one_means = [(total - delta) / (n - 1) for delta in deltas]
+                    mean_sum = Decimal(0)
+                    for leave_one in leave_one_means:
+                        mean_sum += leave_one
+                    mean_of_means = mean_sum / n
+                    squared = Decimal(0)
+                    for leave_one in leave_one_means:
+                        deviation = leave_one - mean_of_means
+                        squared += deviation * deviation
+                    se = (Decimal(n - 1) / n * squared).sqrt()
+                else:
+                    se = Decimal(0)
+                lower = mu - z_value * se
+                upper = mu + z_value * se
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"delta":' + _format6(mu)
+                    + ',"se":' + _format6(se)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"z":' + _format6(z_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
