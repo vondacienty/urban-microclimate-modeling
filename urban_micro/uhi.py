@@ -5,6 +5,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections.abc import Mapping
 from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
+from itertools import permutations
 import json
 import math
 
@@ -34,6 +35,7 @@ __all__ = [
     "effect_matrix_robust_report",
     "effect_matrix_contribution_report",
     "effect_matrix_autocorr_report",
+    "effect_matrix_moran_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -3544,4 +3546,186 @@ def effect_matrix_autocorr_report(
             '{"minutes":' + str(minutes)
             + ',"lag":' + str(lag)
             + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_MORAN_MAX_N = 8
+
+
+def effect_matrix_moran_report(
+    details: list,
+    neighbors: list,
+    *,
+    minutes: int = 60,
+) -> str:
+    """Aggregate scenario deltas into a per-time-bucket Moran's I JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``neighbors`` is a list of ``(a, b)`` two-tuples:
+    ``a`` and ``b`` must be distinct non-empty cell id strings that both
+    occur in ``details``; edges are undirected and self loops and duplicate
+    edges (in either orientation) are forbidden. ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within
+    each ``(B, cell_id)`` pair are averaged. Within a bucket the occupied
+    cells are taken in ascending string order, giving values ``d`` of size
+    ``n``; a bucket with ``n > 8`` raises ``ValueError``. Only neighbor edges
+    whose two endpoints both exist in the bucket are retained, giving ``e``
+    edges; with ``x_i = d_i - mean(d)``, when ``e == 0`` or
+    ``sum(x_i ** 2) == 0`` the Moran statistic is ``I = 0`` and ``p = 1``,
+    otherwise ``I = n / (2 * e) * (2 * sum_edges(x_i * x_j)) / sum(x_i ** 2)``.
+
+    ``p`` is the exact permutation p-value: all ``n!`` permutations of the
+    ``d`` values are enumerated in lexicographic order of indices (duplicate
+    values are not deduplicated) and ``I`` is recomputed for each, with
+    ``p`` the fraction satisfying ``|I_perm| >= |I|``; comparisons use the
+    unquantized values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups`` and each group object uses the key order
+    ``key, n, moran, p`` with ``key`` the bucket start. Buckets are emitted
+    in ascending order; an empty ``details`` yields
+    ``{"minutes":60,"groups":[]}``. ``moran`` and ``p`` are rendered with
+    exactly six decimals, negative zero normalized to ``0.000000``, and
+    ``key`` and ``n`` as integers. ``details`` or ``neighbors`` not being a
+    list raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(neighbors, list):
+        raise TypeError("neighbors must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = _validate_detail_rows(details)
+
+    # Validate the neighbor list against the set of cell ids seen in details.
+    known_cells = {cell_id for _, cell_id, *_ in parsed}
+    edge_set: set[frozenset[str]] = set()
+    edge_pairs: list[tuple[str, str]] = []
+    for edge in neighbors:
+        if not isinstance(edge, tuple) or len(edge) != 2:
+            raise ValueError("each neighbor edge must be an (a, b) two-tuple")
+        a, b = edge
+        if not isinstance(a, str) or not a:
+            raise ValueError("neighbor endpoint a must be a non-empty string")
+        if not isinstance(b, str) or not b:
+            raise ValueError("neighbor endpoint b must be a non-empty string")
+        if a == b:
+            raise ValueError(f"neighbor edges must not be self loops: {a!r}")
+        if a not in known_cells:
+            raise ValueError(f"unknown cell id in neighbor edge: {a!r}")
+        if b not in known_cells:
+            raise ValueError(f"unknown cell id in neighbor edge: {b!r}")
+        undirected = frozenset((a, b))
+        if undirected in edge_set:
+            raise ValueError(f"duplicate neighbor edge: {(a, b)!r}")
+        edge_set.add(undirected)
+        edge_pairs.append((a, b))
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> [delta sum, row count]
+        buckets: dict[int, dict[str, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = buckets.setdefault(bucket, {}).setdefault(
+                    cell_id, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        items = []
+        for bucket in sorted(buckets):
+            cell_ids = sorted(buckets[bucket])
+            n = len(cell_ids)
+            if n > _MORAN_MAX_N:
+                raise ValueError(
+                    f"bucket {bucket} has {n} cells; moran report requires "
+                    f"at most {_MORAN_MAX_N} cells per bucket"
+                )
+            index_of = {cell_id: index for index, cell_id in enumerate(cell_ids)}
+            d = [
+                buckets[bucket][cell_id][0] / buckets[bucket][cell_id][1]
+                for cell_id in cell_ids
+            ]
+
+            # Retain only edges whose two endpoints both exist in this bucket.
+            bucket_edges: list[tuple[int, int]] = []
+            for a, b in edge_pairs:
+                if a in index_of and b in index_of:
+                    bucket_edges.append((index_of[a], index_of[b]))
+            e = len(bucket_edges)
+
+            total = Decimal(0)
+            for value in d:
+                total += value
+            mean = total / n
+            # x_i = d_i - mean; both the mean and the sum of squares are
+            # invariant under permutation, so permuting d amounts to
+            # permuting these deviations.
+            x = [value - mean for value in d]
+            denominator = Decimal(0)
+            for deviation in x:
+                denominator += deviation * deviation
+
+            def cross_sum(values: list[Decimal]) -> Decimal:
+                total_cross = Decimal(0)
+                for i, j in bucket_edges:
+                    total_cross += values[i] * values[j]
+                return total_cross
+
+            # e == 0 or sum(x_i ** 2) == 0 fixes I at 0 for every
+            # permutation, hence p = 1.
+            if e == 0 or denominator == 0:
+                moran_value = Decimal(0)
+                p_value = Decimal(1)
+            else:
+                observed_cross = cross_sum(x)
+                moran_value = (
+                    Decimal(n)
+                    / Decimal(2 * e)
+                    * (2 * observed_cross)
+                    / denominator
+                )
+
+                # Exact permutation reference distribution: all n! index
+                # permutations in lexicographic order, duplicate values kept.
+                hits = 0
+                for ordering in permutations(range(n)):
+                    permuted = [x[index] for index in ordering]
+                    perm_cross = cross_sum(permuted)
+                    perm_moran = (
+                        Decimal(n)
+                        / Decimal(2 * e)
+                        * (2 * perm_cross)
+                        / denominator
+                    )
+                    if abs(perm_moran) >= abs(moran_value):
+                        hits += 1
+                p_value = Decimal(hits) / Decimal(math.factorial(n))
+
+            items.append(
+                '{"key":' + str(bucket)
+                + ',"n":' + str(n)
+                + ',"moran":' + _format6(moran_value)
+                + ',"p":' + _format6(p_value)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(items) + ']}'
         )
