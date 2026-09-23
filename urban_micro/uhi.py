@@ -30,6 +30,7 @@ __all__ = [
     "effect_matrix_bootstrap_report",
     "effect_matrix_jackknife_report",
     "effect_matrix_permutation_report",
+    "effect_matrix_contribution_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -2984,5 +2985,118 @@ def effect_matrix_quantile_report(
             '{"minutes":' + str(minutes)
             + ',"low":' + _format6(low_value)
             + ',"high":' + _format6(high_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def effect_matrix_contribution_report(
+    details: list,
+    *,
+    minutes: int = 60,
+) -> str:
+    """Aggregate scenario details into a time-bucket x cell contribution report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted in
+    ascending order and, within each bucket, cells in ascending string
+    order. Each cell object carries the group size ``n`` and the within-group
+    arithmetic means of ``delta``, ``cg``, ``cr`` and ``cm``. With
+    ``ag = abs(cg)``, ``ar = abs(cr)``, ``am = abs(cm)`` and
+    ``A = ag + ar + am`` computed from those means, the contribution shares
+    ``share_g``/``share_r``/``share_m`` are ``ag / A``, ``ar / A`` and
+    ``am / A`` when ``A > 0`` and 0 otherwise; ``dominant`` is ``"g"``,
+    ``"r"`` or ``"m"`` for the largest share (ties broken in g, r, m order)
+    and ``"none"`` when ``A`` is 0.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups``, each group object uses the key order
+    ``key, cells`` and each cell object the key order
+    ``key, n, delta, cg, cr, cm, share_g, share_r, share_m, dominant`` with
+    ``key`` the cell id. An empty ``details`` yields
+    ``{"minutes":60,"groups":[]}``. Every numeric result is rendered with
+    exactly six decimals, negative zero normalized to ``0.000000``; bucket
+    keys and cell sizes are integers and cell ids are JSON-escaped with
+    Unicode preserved. ``details`` not being a list raises ``TypeError``;
+    every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> list of (delta, cg, cr, cm) Decimal tuples
+        buckets: dict[int, dict[str, list[tuple[Decimal, ...]]]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id = validated[0], validated[1]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(
+                    validated[4:]
+                )
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                rows = buckets[bucket][cell_id]
+                n = len(rows)
+                means = []
+                for index in range(4):
+                    total = Decimal(0)
+                    for values in rows:
+                        total += values[index]
+                    means.append(total / n)
+                delta, cg, cr, cm = means
+                contributions = (abs(cg), abs(cr), abs(cm))
+                total_abs = sum(contributions)
+                if total_abs > 0:
+                    shares = tuple(part / total_abs for part in contributions)
+                    dominant = "grm"[shares.index(max(shares))]
+                else:
+                    shares = (Decimal(0), Decimal(0), Decimal(0))
+                    dominant = "none"
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"delta":' + _format6(delta)
+                    + ',"cg":' + _format6(cg)
+                    + ',"cr":' + _format6(cr)
+                    + ',"cm":' + _format6(cm)
+                    + ',"share_g":' + _format6(shares[0])
+                    + ',"share_r":' + _format6(shares[1])
+                    + ',"share_m":' + _format6(shares[2])
+                    + ',"dominant":' + json.dumps(dominant)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
