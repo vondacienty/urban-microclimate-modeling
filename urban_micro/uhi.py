@@ -2865,3 +2865,124 @@ def effect_matrix_permutation_report(
             + ',"z":' + _format6(z_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
+
+
+def effect_matrix_quantile_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    low: float = 0.25,
+    high: float = 0.75,
+) -> str:
+    """Aggregate scenario deltas into a time-bucket x cell quantile JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``low`` and ``high`` are non-boolean
+    finite numbers with ``0 <= low < high <= 1``.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted in
+    ascending order and, within each bucket, cells in ascending string
+    order. Within each cell the deltas are sorted ascending. With ``d`` the
+    sorted per-row deltas and ``n`` the cell size, ``mean`` is
+    ``sum(d) / n`` and the order-statistic quantile is
+    ``Q(q) = (1 - f) * d[i] + f * d[min(i + 1, n - 1)]`` with
+    ``r = (n - 1) * q``, ``i = floor(r)`` and ``f = r - i``; the cell
+    reports ``median = Q(0.5)``, ``lower = Q(low)``, ``upper = Q(high)``
+    and ``iqr = upper - lower``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, low, high, groups``, each group object uses the key
+    order ``key, cells`` and each cell object the key order
+    ``key, n, mean, median, lower, upper, iqr`` with ``key`` the cell id.
+    An empty ``details`` yields
+    ``{"minutes":60,"low":0.250000,"high":0.750000,"groups":[]}``. ``low``
+    and ``high`` and every numeric result are rendered with exactly six
+    decimals, negative zero normalized to ``0.000000``; bucket keys and
+    cell sizes are integers and cell ids are JSON-escaped with Unicode
+    preserved. ``details`` not being a list raises ``TypeError``; every
+    other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    low_value = _validate_finite_number(low, "low")
+    high_value = _validate_finite_number(high, "high")
+    if low_value < 0 or high_value > 1 or low_value >= high_value:
+        raise ValueError("low and high must satisfy 0 <= low < high <= 1")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> list of delta Decimal values
+        buckets: dict[int, dict[str, list[Decimal]]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(delta)
+
+        half = Decimal("0.5")
+
+        def quantile(sorted_deltas: list[Decimal], q: Decimal) -> Decimal:
+            n = len(sorted_deltas)
+            r = Decimal(n - 1) * q
+            i = int(r.to_integral_value(rounding=ROUND_FLOOR))
+            f = r - Decimal(i)
+            if i + 1 < n:
+                return (Decimal(1) - f) * sorted_deltas[i] + f * sorted_deltas[i + 1]
+            return sorted_deltas[i]
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                deltas = sorted(buckets[bucket][cell_id])
+                n = len(deltas)
+                total = Decimal(0)
+                for delta in deltas:
+                    total += delta
+                mean = total / n
+                median = quantile(deltas, half)
+                lower = quantile(deltas, low_value)
+                upper = quantile(deltas, high_value)
+                iqr = upper - lower
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"mean":' + _format6(mean)
+                    + ',"median":' + _format6(median)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + ',"iqr":' + _format6(iqr)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"low":' + _format6(low_value)
+            + ',"high":' + _format6(high_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
