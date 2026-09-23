@@ -37,6 +37,7 @@ __all__ = [
     "effect_matrix_contribution_report",
     "effect_matrix_autocorr_report",
     "effect_matrix_moran_report",
+    "effect_matrix_local_moran_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -3713,6 +3714,190 @@ def effect_matrix_moran_report(
                 + ',"moran":' + _format6(moran)
                 + ',"p":' + _format6(p)
                 + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_LOCAL_MORAN_MAX_N = 8
+
+
+def effect_matrix_local_moran_report(
+    details: list,
+    neighbors: list,
+    *,
+    minutes: int = 60,
+) -> str:
+    """Aggregate scenario deltas per bucket and emit a local Moran's I JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``neighbors`` is a list of ``(a, b)`` two-tuples
+    describing an undirected adjacency: ``a`` and ``b`` must be distinct
+    non-empty cell id strings occurring in ``details``; self-loops and
+    repeated edges (in either orientation) are illegal. ``minutes`` must be
+    a non-boolean integer in ``1..1440`` that divides 1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within each
+    bucket/cell pair are averaged. Each bucket holds the vector ``d`` of its
+    per-cell mean deltas in ascending cell id order; a bucket with more than
+    8 cells raises ``ValueError``. With ``n`` the size of ``d``,
+    ``x_i = d_i - mean(d)`` and ``S = sum(x_i ** 2)``, the local Moran's I
+    of cell ``c`` is ``L_c = n * x_c * sum(x_j for j in c's in-bucket
+    neighbors) / S``. When ``S`` is 0 or ``c`` has no neighbor inside the
+    bucket, ``L_c`` is 0 and ``p`` is 1; otherwise all ``n!`` permutations
+    of ``d`` are enumerated in lexicographic order (duplicate values not
+    deduplicated), ``L_c`` is recomputed for each permuted assignment and
+    ``p`` is the proportion with ``|L_c_perm| >= |L_c|``, compared on the
+    unquantized values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups``, each group object uses the key order
+    ``key, n, cells`` (groups in ascending bucket order) and each cell object
+    the key order ``key, local, p`` (cells in ascending cell id order).
+    ``local`` and ``p`` are rendered with exactly six decimals, negative
+    zero normalized to ``0.000000``; bucket keys and ``n`` are integers. An
+    empty ``details`` yields ``{"minutes":60,"groups":[]}``. ``details`` or
+    ``neighbors`` not being a list raises ``TypeError``; every other
+    contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(neighbors, list):
+        raise TypeError("neighbors must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = _validate_detail_rows(details)
+
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    edges: set[tuple[str, str]] = set()
+    for item in neighbors:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each neighbor must be an (a, b) two-tuple")
+        endpoint_a, endpoint_b = item
+        for endpoint in (endpoint_a, endpoint_b):
+            if not isinstance(endpoint, str) or not endpoint:
+                raise ValueError(
+                    "neighbor endpoints must be non-empty cell id strings"
+                )
+            if endpoint not in cell_ids:
+                raise ValueError(f"unknown cell id in neighbor: {endpoint!r}")
+        if endpoint_a == endpoint_b:
+            raise ValueError("neighbor self-loops are not allowed")
+        edge = (
+            (endpoint_a, endpoint_b)
+            if endpoint_a < endpoint_b
+            else (endpoint_b, endpoint_a)
+        )
+        if edge in edges:
+            raise ValueError(f"duplicate neighbor edge: {edge!r}")
+        edges.add(edge)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> [delta sum, row count]
+        buckets: dict[int, dict[str, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = buckets.setdefault(bucket, {}).setdefault(
+                    cell_id, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        groups = []
+        for bucket in sorted(buckets):
+            cells = sorted(buckets[bucket])
+            n = len(cells)
+            if n > _LOCAL_MORAN_MAX_N:
+                raise ValueError(
+                    f"bucket {bucket} has {n} cells; local Moran report "
+                    f"requires at most {_LOCAL_MORAN_MAX_N} cells per bucket"
+                )
+            d = []
+            for cell_id in cells:
+                total, count = buckets[bucket][cell_id]
+                d.append(total / count)
+            position = {cell_id: index for index, cell_id in enumerate(cells)}
+            adjacency: list[list[int]] = [[] for _ in range(n)]
+            for a, b in sorted(edges):
+                i = position.get(a)
+                j = position.get(b)
+                if i is None or j is None:
+                    continue
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+            for neighbors_of in adjacency:
+                neighbors_of.sort()
+
+            total_d = Decimal(0)
+            for value in d:
+                total_d += value
+            mean_d = total_d / n
+            x = [value - mean_d for value in d]
+            s = Decimal(0)
+            for deviation in x:
+                s += deviation * deviation
+
+            if s == 0:
+                cell_stats = [(Decimal(0), Decimal(1)) for _ in range(n)]
+            else:
+                # Permuting d merely permutes x (mean and S are invariant),
+                # so each permuted assignment is re-centered on the same
+                # mean_d. An isolated cell has neighbor sum 0 for every
+                # permutation, hence L = 0 and p = 1 automatically.
+                n_factor = Decimal(n)
+                observed = []
+                for c_index in range(n):
+                    neighbor_sum = Decimal(0)
+                    for j in adjacency[c_index]:
+                        neighbor_sum += x[j]
+                    observed.append(n_factor * x[c_index] * neighbor_sum / s)
+                hits = [0] * n
+                factorial = Decimal(math.factorial(n))
+                for perm in permutations(d):
+                    x_perm = [value - mean_d for value in perm]
+                    for c_index in range(n):
+                        neighbor_sum = Decimal(0)
+                        for j in adjacency[c_index]:
+                            neighbor_sum += x_perm[j]
+                        perm_local = (
+                            n_factor * x_perm[c_index] * neighbor_sum / s
+                        )
+                        if abs(perm_local) >= abs(observed[c_index]):
+                            hits[c_index] += 1
+                cell_stats = [
+                    (observed[c_index], Decimal(hits[c_index]) / factorial)
+                    for c_index in range(n)
+                ]
+
+            cell_items = []
+            for index, cell_id in enumerate(cells):
+                local, p_value = cell_stats[index]
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"local":' + _format6(local)
+                    + ',"p":' + _format6(p_value)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"n":' + str(n)
+                + ',"cells":[' + ",".join(cell_items)
+                + ']}'
             )
 
         return (
