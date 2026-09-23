@@ -33,6 +33,7 @@ __all__ = [
     "effect_matrix_permutation_report",
     "effect_matrix_robust_report",
     "effect_matrix_contribution_report",
+    "effect_matrix_autocorr_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -3396,5 +3397,159 @@ def effect_matrix_robust_report(
         return (
             '{"minutes":' + str(minutes)
             + ',"z":' + _format6(z_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def _validate_lag(lag: object) -> int:
+    if isinstance(lag, bool) or not isinstance(lag, int):
+        raise ValueError("lag must be an integer")
+    if lag < 1:
+        raise ValueError("lag must be a positive integer")
+    return lag
+
+
+def effect_matrix_autocorr_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    lag: int = 1,
+) -> str:
+    """Aggregate scenario deltas into a per-cell lagged autocorrelation report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``lag`` must be a positive non-boolean
+    integer.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within
+    each ``(B, cell_id)`` bucket are averaged. For each cell id, every
+    occupied bucket ``B`` whose predecessor bucket
+    ``B - lag * minutes * 60`` is also occupied forms a pair with
+    ``prev``/``curr`` the two bucket mean deltas and
+    ``change = curr - prev``; buckets without a paired predecessor are
+    skipped. Cells with no pairs are omitted; the remaining cells are
+    emitted in ascending cell id order with ``n`` the number of pairs,
+    ``mean_change`` the arithmetic mean of the changes, ``se`` equal to
+    ``sqrt(sum((change - mean_change) ** 2) / (n * (n - 1)))`` when
+    ``n > 1`` and 0 otherwise, and ``corr`` the Pearson correlation of the
+    paired ``prev``/``curr`` values,
+    ``sum((prev - prev_bar) * (curr - curr_bar)) /
+    sqrt(sum((prev - prev_bar) ** 2) * sum((curr - curr_bar) ** 2))``,
+    which is 0 whenever any of its three sums is 0.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, lag, groups``, each group object uses the key order
+    ``key, n, mean_change, se, corr, pairs`` and each pair object the key
+    order ``bucket, prev, curr, change`` with pairs sorted by ascending
+    ``bucket``. An empty ``details`` yields
+    ``{"minutes":60,"lag":1,"groups":[]}``. Every numeric result is
+    rendered with exactly six decimals, negative zero normalized to
+    ``0.000000``; ``bucket`` and ``n`` are integers and cell ids are
+    JSON-escaped with Unicode preserved. ``details`` not being a list
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    lag = _validate_lag(lag)
+
+    parsed = _validate_detail_rows(details)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # cell_id -> bucket start -> [delta sum, row count]
+        cells: dict[str, dict[int, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            step = lag * bucket_seconds
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = cells.setdefault(cell_id, {}).setdefault(
+                    bucket, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        groups = []
+        for cell_id in sorted(cells):
+            means = {
+                bucket: total / count
+                for bucket, (total, count) in cells[cell_id].items()
+            }
+            pairs = []
+            for bucket in sorted(means):
+                prev_bucket = bucket - step
+                if prev_bucket not in means:
+                    continue
+                prev = means[prev_bucket]
+                curr = means[bucket]
+                pairs.append((bucket, prev, curr, curr - prev))
+            if not pairs:
+                continue
+
+            n = len(pairs)
+            change_total = Decimal(0)
+            prev_total = Decimal(0)
+            curr_total = Decimal(0)
+            for _, prev, curr, change in pairs:
+                change_total += change
+                prev_total += prev
+                curr_total += curr
+            mean_change = change_total / n
+            if n > 1:
+                squared = Decimal(0)
+                for _, _, _, change in pairs:
+                    deviation = change - mean_change
+                    squared += deviation * deviation
+                se = (squared / (n * (n - 1))).sqrt()
+            else:
+                se = Decimal(0)
+
+            prev_bar = prev_total / n
+            curr_bar = curr_total / n
+            sxy = Decimal(0)
+            sxx = Decimal(0)
+            syy = Decimal(0)
+            for _, prev, curr, _ in pairs:
+                prev_deviation = prev - prev_bar
+                curr_deviation = curr - curr_bar
+                sxy += prev_deviation * curr_deviation
+                sxx += prev_deviation * prev_deviation
+                syy += curr_deviation * curr_deviation
+            denominator = sxx * syy
+            corr = Decimal(0) if denominator == 0 else sxy / denominator.sqrt()
+
+            pair_items = []
+            for bucket, prev, curr, change in pairs:
+                pair_items.append(
+                    '{"bucket":' + str(bucket)
+                    + ',"prev":' + _format6(prev)
+                    + ',"curr":' + _format6(curr)
+                    + ',"change":' + _format6(change)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"mean_change":' + _format6(mean_change)
+                + ',"se":' + _format6(se)
+                + ',"corr":' + _format6(corr)
+                + ',"pairs":[' + ",".join(pair_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"lag":' + str(lag)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
