@@ -31,6 +31,7 @@ __all__ = [
     "effect_matrix_fdr_report",
     "effect_matrix_compare_report",
     "effect_matrix_bootstrap_report",
+    "effect_matrix_block_bootstrap_report",
     "effect_matrix_jackknife_report",
     "effect_matrix_permutation_report",
     "effect_matrix_robust_report",
@@ -1860,6 +1861,235 @@ def effect_significance_report(
 
 
 _BOOTSTRAP_MAX_N = 8
+_BLOCK_BOOTSTRAP_MAX_N = 8
+_BLOCK_BOOTSTRAP_MAX_BLOCK = 8
+
+
+def _validate_block(block: object) -> int:
+    if isinstance(block, bool) or not isinstance(block, int):
+        raise ValueError("block must be an integer")
+    if not 1 <= block <= _BLOCK_BOOTSTRAP_MAX_BLOCK:
+        raise ValueError(
+            f"block must be an integer in 1..{_BLOCK_BOOTSTRAP_MAX_BLOCK}"
+        )
+    return block
+
+
+def _block_bootstrap_interval(
+    y: list[Decimal], n: int, block: int, confidence_value: Decimal
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Return ``(delta, lower, upper)`` for one circular-block bootstrap group.
+
+    ``delta`` is the sample mean ``sum(y) / n``. With ``k = ceil(n / block)``,
+    the resample multiset is defined by the ``n ** k`` index tuples in
+    ``{0, …, n − 1} ** k`` (index-dictionary order). Each draw starts a
+    circular block of ``block`` terms ``y[(idx + j) % n]``; the ``k`` blocks
+    are concatenated and the first ``n`` terms averaged. The ``n ** k``
+    resample means are sorted and ``lower``/``upper`` linearly interpolate
+    them at ``q = (1 - confidence) / 2`` and ``1 - q`` via
+    ``r = (n ** k - 1) * q``.
+
+    The sorted multiset is built without materializing the ``n ** k`` means:
+    the first ``k - 1`` full blocks aggregate into draw-count compositions
+    (multiplicity ``(k - 1)! / prod(c_j!)``), while the last (possibly
+    truncated) block is expanded over its ``n`` starts.
+    """
+    total = Decimal(0)
+    for value in y:
+        total += value
+    mu = total / n
+
+    k = (n + block - 1) // block
+    full_blocks = k - 1
+    # Sum of each circular block of ``block`` terms by its start index; a
+    # composition count for a start contributes that whole block sum.
+    block_values = [
+        sum((y[(start + j) % n] for j in range(block)), Decimal(0))
+        for start in range(n)
+    ]
+    # Resample mean numerator = (sum of drawn values) / n.
+    weighted_sums: list[tuple[Decimal, int]] = []
+    counts = [0] * n
+    factorial_full = math.factorial(full_blocks)
+
+    def emit(last_start: int, full_numerator: Decimal, multiplicity: int) -> None:
+        numerator = full_numerator
+        for j in range(n - full_blocks * block):
+            numerator += y[(last_start + j) % n]
+        weighted_sums.append((numerator, multiplicity))
+
+    def enumerate_compositions(index: int, remaining: int) -> None:
+        if index == n - 1:
+            counts[index] = remaining
+            full_numerator = Decimal(0)
+            multiplicity = factorial_full
+            for j, count_j in enumerate(counts):
+                if count_j:
+                    full_numerator += count_j * block_values[j]
+                    multiplicity //= math.factorial(count_j)
+            for last_start in range(n):
+                emit(last_start, full_numerator, multiplicity)
+            return
+        for count_j in range(remaining + 1):
+            counts[index] = count_j
+            enumerate_compositions(index + 1, remaining - count_j)
+
+    if full_blocks:
+        enumerate_compositions(0, full_blocks)
+    else:
+        for last_start in range(n):
+            emit(last_start, Decimal(0), 1)
+    weighted_sums.sort(key=lambda item: item[0])
+
+    # Merge equal numerators into (sorted numerator, cumulative count), so
+    # block_cumulative[k] is the count of the sorted n**k-length sequence up
+    # to and including block_sums[k].
+    block_sums: list[Decimal] = []
+    block_cumulative: list[int] = []
+    running = 0
+    for weighted_sum, multiplicity in weighted_sums:
+        running += multiplicity
+        if block_sums and block_sums[-1] == weighted_sum:
+            block_cumulative[-1] = running
+        else:
+            block_sums.append(weighted_sum)
+            block_cumulative.append(running)
+
+    def value_at(position: int) -> Decimal:
+        idx = bisect_left(block_cumulative, position + 1)
+        return block_sums[idx] / n
+
+    resample_count = n**k
+    q_value = (Decimal(1) - confidence_value) / 2
+    r_value = (Decimal(resample_count) - 1) * q_value
+    floor_index = int(r_value.to_integral_value(rounding=ROUND_FLOOR))
+    lower = value_at(floor_index)
+    upper = value_at(resample_count - 1 - floor_index)
+    weight = r_value - Decimal(floor_index)
+    if weight != 0:
+        lower = lower + weight * (value_at(floor_index + 1) - lower)
+        upper = upper + weight * (
+            value_at(resample_count - 2 - floor_index) - upper
+        )
+    return mu, lower, upper
+
+
+def effect_matrix_block_bootstrap_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    block: int = 2,
+    confidence: float = 0.95,
+) -> str:
+    """Aggregate per-cell bucket deltas into a circular-block bootstrap CI report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``block`` a non-boolean integer in
+    ``1..8``; ``confidence`` a non-boolean finite number with
+    ``0 < confidence < 1``.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)`` and, within each
+    ``(B, cell_id)`` pair, the row deltas are averaged. Each cell then gives
+    the series ``y`` of these bucket means in ascending ``B`` order; a cell
+    seen in fewer than two buckets is omitted and a cell seen in more than
+    eight buckets raises ``ValueError``. Groups are emitted in ascending
+    cell id order.
+
+    With ``n`` the length of ``y`` and ``k = ceil(n / block)``, the block
+    bootstrap resample multiset is the ``n ** k`` means obtained from the
+    index tuples ``{0, …, n − 1} ** k`` in index-dictionary order: each
+    index starts a circular block of ``block`` terms
+    ``y[(idx + j) % n]``, the ``k`` blocks are concatenated and the first
+    ``n`` terms averaged. ``delta`` is the sample mean ``sum(y) / n``; the
+    resample means are sorted and, with ``q = (1 - confidence) / 2`` and
+    ``r = (n ** k - 1) * q``, ``lower`` and ``upper`` linearly interpolate
+    between positions ``floor(r)`` and ``ceil(r)``, taking the value at that
+    position when ``r`` is integral.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, block, confidence, groups`` and each group object
+    uses the key order ``key, n, delta, lower, upper`` with ``key`` the cell
+    id. An empty ``details`` (or one without any cell spanning at least two
+    buckets) yields empty ``groups``. Every numeric result is rendered with
+    exactly six decimals, negative zero normalized to ``0.000000``.
+    ``details`` not being a list raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    block = _validate_block(block)
+    confidence_value = _validate_finite_number(confidence, "confidence")
+    if confidence_value <= 0 or confidence_value >= 1:
+        raise ValueError("confidence must be greater than 0 and less than 1")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # cell_id -> bucket start -> list of row delta Decimal values
+        cells: dict[str, dict[int, list[Decimal]]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                cells.setdefault(cell_id, {}).setdefault(bucket, []).append(delta)
+
+        items = []
+        for cell_id in sorted(cells):
+            buckets = cells[cell_id]
+            n = len(buckets)
+            if n < 2:
+                continue
+            if n > _BLOCK_BOOTSTRAP_MAX_N:
+                raise ValueError(
+                    f"cell {cell_id!r} spans {n} buckets; block bootstrap "
+                    f"report requires at most {_BLOCK_BOOTSTRAP_MAX_N} "
+                    "buckets per cell"
+                )
+            y = []
+            for bucket in sorted(buckets):
+                rows = buckets[bucket]
+                bucket_total = Decimal(0)
+                for delta in rows:
+                    bucket_total += delta
+                y.append(bucket_total / len(rows))
+            mu, lower, upper = _block_bootstrap_interval(
+                y, n, block, confidence_value
+            )
+            items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"delta":' + _format6(mu)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"block":' + str(block)
+            + ',"confidence":' + _format6(confidence_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
 
 
 def _bootstrap_interval(
