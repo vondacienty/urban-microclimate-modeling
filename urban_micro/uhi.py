@@ -46,6 +46,7 @@ __all__ = [
     "effect_matrix_wilcoxon_report",
     "effect_matrix_spatial_lag_report",
     "effect_matrix_spatiotemporal_report",
+    "effect_matrix_temporal_lag_report",
     "ventilation_report",
     "vent_effect_report",
     "effect_matrix_ventilation_effect_report",
@@ -5159,6 +5160,170 @@ def effect_matrix_spatiotemporal_report(
             + ',"lag":' + str(lag)
             + ',"z":' + _format6(z_value)
             + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+_TEMPORAL_LAG_MAX_N = 8
+
+
+def effect_matrix_temporal_lag_report(
+    rows: list,
+    *,
+    minutes: int = 60,
+    lag: int = 1,
+) -> str:
+    """Pair per-cell bucket means across a temporal lag and emit a JSON report.
+
+    ``rows`` is a list of ``(timestamp, cell_id, value)`` three-tuples:
+    ``timestamp`` must be a non-boolean non-negative integer, ``cell_id`` a
+    non-empty string and ``value`` a finite non-boolean int/float;
+    ``(timestamp, cell_id)`` pairs must be unique. ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440; ``lag`` must be a
+    positive non-boolean integer.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)`` and the values within
+    each ``(B, c)`` pair are averaged. For each cell ``c``, every bucket
+    ``B`` with a mean at both ``B`` and ``B - lag * minutes * 60``
+    contributes one pairing with ``x`` the current mean and ``y`` the lagged
+    mean. A cell with fewer than 2 pairings is omitted; a cell with more
+    than 8 pairings raises ``ValueError``.
+
+    With ``n`` the number of pairings, ``Sxx = sum((x - mean(x)) ** 2)``,
+    ``Syy = sum((y - mean(y)) ** 2)`` and
+    ``Sxy = sum((x - mean(x)) * (y - mean(y)))``. When ``Sxx`` or ``Syy``
+    is 0, ``slope = corr = 0`` and ``p = 1``; otherwise
+    ``slope = Sxy / Sxx``, ``corr = Sxy / sqrt(Sxx * Syy)`` and ``p`` is the
+    exact permutation p-value: all ``n!`` permutations of ``y`` are
+    enumerated and ``p`` is the proportion with ``|Sxy_perm| >= |Sxy|``,
+    compared on the unquantized values via exact rational arithmetic so
+    theoretically-equal statistics are never split by rounding.
+
+    Numbers enter as ``Decimal(str(x))`` and bucket accumulation happens
+    under a precision-1000, ROUND_HALF_EVEN local context; the per-bucket
+    means are then lifted to exact fractions for the statistics and their
+    permutation test. Returns a compact UTF-8 JSON string with no spaces and
+    no trailing newline; the top-level key order is ``minutes, lag, groups``
+    and each group object uses the key order ``key, n, slope, corr, p``
+    with ``key`` the cell id and groups in ascending cell id order.
+    ``slope``, ``corr`` and ``p`` are rendered with exactly six decimals,
+    negative zero normalized to ``0.000000``; ``n`` is an integer and cell
+    ids are JSON-escaped with Unicode preserved. An empty ``rows`` yields
+    ``{"minutes":60,"lag":1,"groups":[]}``. ``rows`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    minutes = _validate_minutes(minutes)
+    if isinstance(lag, bool) or not isinstance(lag, int):
+        raise ValueError("lag must be an integer")
+    if lag < 1:
+        raise ValueError("lag must be a positive integer")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) != 3:
+            raise ValueError(
+                "each row must be a (timestamp, cell_id, value) three-tuple"
+            )
+        timestamp, cell_id, value = row
+        _validate_timestamp(timestamp)
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError("cell_id must be a non-empty string")
+        validated_value = _validate_finite_number(value, "value")
+        key = (timestamp, cell_id)
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append((timestamp, cell_id, validated_value))
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # cell_id -> bucket start -> [value sum, row count]
+        cells: dict[str, dict[int, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for timestamp, cell_id, value in parsed:
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = cells.setdefault(cell_id, {}).setdefault(
+                    bucket, [Decimal(0), 0]
+                )
+                acc[0] += value
+                acc[1] += 1
+
+        offset_buckets = lag * minutes * 60
+        groups = []
+        for cell_id in sorted(cells):
+            means = {
+                bucket: Fraction(total) / count
+                for bucket, (total, count) in cells[cell_id].items()
+            }
+            pairs = [
+                (means[bucket], means[bucket - offset_buckets])
+                for bucket in sorted(means)
+                if bucket - offset_buckets in means
+            ]
+            n = len(pairs)
+            if n < 2:
+                continue
+            if n > _TEMPORAL_LAG_MAX_N:
+                raise ValueError(
+                    f"cell {cell_id!r} has {n} pairings; temporal lag report "
+                    f"requires at most {_TEMPORAL_LAG_MAX_N} pairings per cell"
+                )
+
+            x = [pair[0] for pair in pairs]
+            y = [pair[1] for pair in pairs]
+            mean_x = sum(x, Fraction(0)) / n
+            mean_y = sum(y, Fraction(0)) / n
+            dx = [value - mean_x for value in x]
+            dy = [value - mean_y for value in y]
+            sxx = sum((deviation * deviation for deviation in dx), Fraction(0))
+            syy = sum((deviation * deviation for deviation in dy), Fraction(0))
+            sxy = sum(
+                (dx[index] * dy[index] for index in range(n)), Fraction(0)
+            )
+
+            if sxx == 0 or syy == 0:
+                slope = Decimal(0)
+                corr = Decimal(0)
+                p_value = Decimal(1)
+            else:
+                slope = _fraction_to_decimal(sxy / sxx)
+                corr = _fraction_to_decimal(sxy) / (
+                    _fraction_to_decimal(sxx) * _fraction_to_decimal(syy)
+                ).sqrt()
+                # Permuting y permutes the dy deviations; since the dx
+                # deviations sum to zero, Sxy_perm = sum(dx_i * dy_perm[i])
+                # and exact Fraction comparison decides ties without any
+                # division rounding.
+                hits = 0
+                factorial = math.factorial(n)
+                for perm in permutations(dy):
+                    perm_sxy = sum(
+                        (dx[index] * perm[index] for index in range(n)),
+                        Fraction(0),
+                    )
+                    if abs(perm_sxy) >= abs(sxy):
+                        hits += 1
+                p_value = _fraction_to_decimal(Fraction(hits, factorial))
+
+            groups.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"slope":' + _format6(slope)
+                + ',"corr":' + _format6(corr)
+                + ',"p":' + _format6(p_value)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"lag":' + str(lag)
+            + ',"groups":[' + ",".join(groups) + ']}'
         )
 
 
