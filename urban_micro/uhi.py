@@ -40,6 +40,7 @@ __all__ = [
     "effect_matrix_moran_report",
     "effect_matrix_local_moran_report",
     "effect_matrix_hotspot_report",
+    "effect_matrix_wilcoxon_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -4355,5 +4356,228 @@ def effect_matrix_theilsen_report(
 
         return (
             '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_WILCOXON_MAX_M = 16
+
+
+def _average_ranks(values: list[Fraction]) -> list[Fraction]:
+    """Ranks (1-based) of ``values`` in ascending order, ties sharing the
+    average of the ranks they span."""
+    order = sorted(range(len(values)), key=lambda index: values[index])
+    ranks = [Fraction(0)] * len(values)
+    low = 0
+    while low < len(order):
+        high = low
+        while high + 1 < len(order) and values[order[high + 1]] == values[order[low]]:
+            high += 1
+        average = Fraction(low + 1 + high + 1, 2)
+        for position in range(low, high + 1):
+            ranks[order[position]] = average
+        low = high + 1
+    return ranks
+
+
+def effect_matrix_wilcoxon_report(
+    before: list,
+    after: list,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Pair two scenario-detail tables into a Wilcoxon signed-rank FDR report.
+
+    ``before`` and ``after`` are lists of ``scenario`` eight-tuples
+    ``(timestamp, cell_id, base, post, delta, cg, cr, cm)``: ``timestamp``
+    must be a non-boolean non-negative integer, ``cell_id`` a non-empty
+    string and the other six fields finite non-boolean int/float values; the
+    ``(timestamp, cell_id)`` pairs within each table must be unique, and the
+    two tables must share exactly the same set of pairs. Each row's delta is
+    its fifth field. An empty pair yields
+    ``{"minutes":60,"alpha":0.050000,"groups":[]}``.
+
+    ``minutes`` must be a non-boolean integer in ``1..1440`` that divides
+    1440; ``alpha`` is a non-boolean finite number with ``0 < alpha <= 1``.
+
+    Rows are paired on ``(timestamp, cell_id)`` and bucketed by Unix epoch
+    with key ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are
+    emitted in ascending order and, within each bucket, cells in ascending
+    string order. With ``n`` the number of pairs in a bucket/cell cell, each
+    pair contributes the change ``x = after.delta - before.delta`` and
+    ``change`` is ``sum(x) / n``. The Wilcoxon signed-rank test is applied
+    to the ``m`` nonzero changes (a cell with ``m > 16`` raises
+    ``ValueError``): the nonzero ``|x|`` are ranked ascending with ties
+    sharing average ranks, ``w`` is the sum of the ranks of the positive
+    changes and ``p`` is the exact two-sided p-value from enumerating all
+    ``2 ** m`` sign vectors ``s_i`` in ``{-1, 1}``: with ``W'`` the rank sum
+    of the positively signed entries,
+    ``p = min(1, 2 * min(Pr(W' <= w), Pr(W' >= w)))``; ``p`` is 1 when
+    ``m`` is 0.
+
+    With ``N`` the number of bucket/cell cells, all cells are ranked
+    ascending by ``(p, bucket, cell)`` and each rank ``j`` (1-based) gets
+    the Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    bucket/cell; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context; ranks, ``w`` and the
+    sign-enumeration tail counts are exact rational arithmetic. Returns a
+    compact UTF-8 JSON string with no spaces and no trailing newline; the
+    top-level key order is ``minutes, alpha, groups``, each group object
+    uses the key order ``key, cells`` and each cell object the key order
+    ``key, n, m, change, w, p, q, reject`` with ``key`` the cell id.
+    ``alpha`` and every numeric result are rendered with exactly six
+    decimals, negative zero normalized to ``0.000000``; bucket keys, cell
+    sizes and ``m`` are integers and cell ids are JSON-escaped with Unicode
+    preserved. ``before`` or ``after`` not being a list raises ``TypeError``;
+    every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(before, list):
+        raise TypeError("before must be a list")
+    if not isinstance(after, list):
+        raise TypeError("after must be a list")
+    minutes = _validate_minutes(minutes)
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    before_rows = _validate_detail_rows(before)
+    after_rows = _validate_detail_rows(after)
+
+    before_map = {(row[0], row[1]): row[4] for row in before_rows}
+    after_map = {(row[0], row[1]): row[4] for row in after_rows}
+    before_keys = set(before_map)
+    after_keys = set(after_map)
+    if before_keys != after_keys:
+        missing = sorted(before_keys - after_keys, key=lambda key: (key[0], key[1]))
+        extra = sorted(after_keys - before_keys, key=lambda key: (key[0], key[1]))
+        if missing:
+            raise ValueError(f"key missing from after: {missing[0]!r}")
+        raise ValueError(f"key missing from before: {extra[0]!r}")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (bucket start, cell_id) -> list of paired changes
+        cells: dict[tuple[int, str], list[Decimal]] = {}
+        if before_map:
+            bucket_seconds = minutes * 60
+            for (timestamp, cell_id), before_delta in before_map.items():
+                after_delta = after_map[(timestamp, cell_id)]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                cells.setdefault((bucket, cell_id), []).append(
+                    after_delta - before_delta
+                )
+
+        # One record per bucket/cell in ascending (bucket, cell) output
+        # order: ``[bucket, cell_id, n, m, change, w, p, q]`` with q filled
+        # in below.
+        records: list[list] = []
+        for bucket, cell_id in sorted(cells):
+            changes = cells[(bucket, cell_id)]
+            n = len(changes)
+            nonzero = [change for change in changes if change != 0]
+            m = len(nonzero)
+            if m > _WILCOXON_MAX_M:
+                raise ValueError(
+                    f"cell ({bucket}, {cell_id!r}) has {m} nonzero changes; "
+                    f"Wilcoxon report requires at most {_WILCOXON_MAX_M} "
+                    "nonzero changes per bucket/cell"
+                )
+            total = Decimal(0)
+            for change in changes:
+                total += change
+            change_mean = total / n
+
+            if m == 0:
+                w_value = Fraction(0)
+                p_fraction = Fraction(1)
+            else:
+                ranks = _average_ranks([Fraction(abs(x)) for x in nonzero])
+                w_value = sum(
+                    (rank for rank, x in zip(ranks, nonzero) if x > 0),
+                    Fraction(0),
+                )
+                lower = 0
+                upper = 0
+                for mask in range(1 << m):
+                    signed_sum = Fraction(0)
+                    for index, rank in enumerate(ranks):
+                        if (mask >> index) & 1:
+                            signed_sum += rank
+                    if signed_sum <= w_value:
+                        lower += 1
+                    if signed_sum >= w_value:
+                        upper += 1
+                p_fraction = min(
+                    Fraction(1),
+                    2 * min(lower, upper) / Fraction(1 << m),
+                )
+            records.append(
+                [
+                    bucket,
+                    cell_id,
+                    n,
+                    m,
+                    change_mean,
+                    _fraction_to_decimal(w_value),
+                    _fraction_to_decimal(p_fraction),
+                    None,
+                ]
+            )
+
+        # Benjamini-Hochberg q-values across ALL bucket/cell cells: rank
+        # ascending by (p, bucket, cell), then accumulate the running minimum
+        # of N * p_l / l from the top rank down, mapping q back to each cell.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (records[idx][6], records[idx][0], records[idx][1]),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate = Decimal(count) * records[idx][6] / rank
+            if candidate < running:
+                running = candidate
+            records[idx][7] = running
+
+        groups = []
+        cell_items = []
+        current_bucket = None
+        for bucket, cell_id, n, m, change_mean, w_value, p_value, q_value in records:
+            if current_bucket is not None and bucket != current_bucket:
+                groups.append(
+                    '{"key":' + str(current_bucket)
+                    + ',"cells":[' + ",".join(cell_items) + ']}'
+                )
+                cell_items = []
+            current_bucket = bucket
+            reject = q_value <= alpha_value
+            cell_items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"m":' + str(m)
+                + ',"change":' + _format6(change_mean)
+                + ',"w":' + _format6(w_value)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if reject else "false")
+                + '}'
+            )
+        if current_bucket is not None:
+            groups.append(
+                '{"key":' + str(current_bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
