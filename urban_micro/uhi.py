@@ -42,6 +42,7 @@ __all__ = [
     "effect_matrix_local_moran_report",
     "effect_matrix_hotspot_report",
     "effect_matrix_wilcoxon_report",
+    "ventilation_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -4802,5 +4803,119 @@ def effect_matrix_wilcoxon_report(
         return (
             '{"minutes":' + str(minutes)
             + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_VENTILATION_KEYS = frozenset(
+    {"timestamp", "cell_id", "wind_u", "wind_v", "height", "density"}
+)
+
+
+def _validate_ventilation_row(
+    row: object,
+) -> tuple[int, str, Decimal, Decimal, Decimal, Decimal]:
+    """Validate one ventilation record and return
+    ``(timestamp, cell_id, wind_u, wind_v, height, density)``."""
+    if not isinstance(row, Mapping):
+        raise ValueError("each record must be a mapping")
+    if set(row.keys()) != _VENTILATION_KEYS:
+        raise ValueError(
+            "each record must contain exactly the keys 'timestamp', 'cell_id', "
+            "'wind_u', 'wind_v', 'height' and 'density'"
+        )
+    timestamp = _validate_timestamp(row["timestamp"])
+    cell_id = row["cell_id"]
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+    wind_u = _validate_finite_number(row["wind_u"], "wind_u")
+    wind_v = _validate_finite_number(row["wind_v"], "wind_v")
+    height = _validate_finite_number(row["height"], "height")
+    if height < 0:
+        raise ValueError("height must be non-negative")
+    density = _validate_finite_number(row["density"], "density")
+    if density < 0 or density > 1:
+        raise ValueError("density must be in [0, 1]")
+    return timestamp, cell_id, wind_u, wind_v, height, density
+
+
+def ventilation_report(records: list, *, minutes: int = 60) -> str:
+    """Aggregate wind records per time bucket and cell into a JSON report.
+
+    ``records`` is a list of mappings with exactly the keys ``timestamp``,
+    ``cell_id``, ``wind_u``, ``wind_v``, ``height`` and ``density``:
+    ``timestamp`` is a non-boolean non-negative integer, ``cell_id`` a
+    non-empty string, and the four numeric fields are finite non-boolean
+    int/float values with ``height >= 0`` and ``density`` in ``[0, 1]``.
+    ``minutes`` must be a non-boolean integer in ``1..1440`` that divides
+    1440. An empty ``records`` yields ``{"minutes":minutes,"groups":[]}``.
+
+    Each record is bucketed to
+    ``B = floor(timestamp / (minutes * 60)) * (minutes * 60)``; groups are
+    emitted in ascending ``B`` order and cells in ascending ``cell_id``
+    order. For every ``(B, c)`` pair the means ``u``, ``v``, ``h`` and
+    ``d`` of the four numeric fields are computed from ``Decimal(str(x))``
+    values under a precision-1000, ROUND_HALF_EVEN local context, and
+    ``speed = sqrt(u**2 + v**2)`` and
+    ``ventilation = speed * (1 - d) / (1 + h / 10)`` are derived from the
+    unquantized means.
+
+    Returns a compact UTF-8 JSON string with no spaces and no trailing
+    newline; the top-level key order is ``minutes, groups``, each group
+    object uses ``key, cells`` and each cell object uses ``key, n,
+    wind_u, wind_v, speed, height, density, ventilation``. Bucket keys and
+    ``n`` are integers, cell ids keep their Unicode characters, and every
+    other number is rendered with exactly six decimals, negative zero
+    normalized to ``0.000000``. ``records`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(records, list):
+        raise TypeError("records must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = [_validate_ventilation_row(row) for row in records]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        buckets: dict[int, dict[str, list[tuple[Decimal, Decimal, Decimal, Decimal]]]] = {}
+        for timestamp, cell_id, wind_u, wind_v, height, density in parsed:
+            bucket = (timestamp // (minutes * 60)) * (minutes * 60)
+            buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(
+                (wind_u, wind_v, height, density)
+            )
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                rows = buckets[bucket][cell_id]
+                n = len(rows)
+                count = Decimal(n)
+                u_mean = sum((row[0] for row in rows), Decimal(0)) / count
+                v_mean = sum((row[1] for row in rows), Decimal(0)) / count
+                h_mean = sum((row[2] for row in rows), Decimal(0)) / count
+                d_mean = sum((row[3] for row in rows), Decimal(0)) / count
+                speed = (u_mean * u_mean + v_mean * v_mean).sqrt()
+                ventilation = speed * (1 - d_mean) / (1 + h_mean / 10)
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"wind_u":' + _format6(u_mean)
+                    + ',"wind_v":' + _format6(v_mean)
+                    + ',"speed":' + _format6(speed)
+                    + ',"height":' + _format6(h_mean)
+                    + ',"density":' + _format6(d_mean)
+                    + ',"ventilation":' + _format6(ventilation)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
