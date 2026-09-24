@@ -49,6 +49,7 @@ __all__ = [
     "ventilation_report",
     "vent_effect_report",
     "effect_matrix_ventilation_effect_report",
+    "effect_matrix_cluster_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -5953,4 +5954,211 @@ def effect_matrix_ventilation_effect_report(
         return (
             '{"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+_CLUSTER_MAX_K = 12
+
+
+def effect_matrix_cluster_report(
+    details: list,
+    neighbors: list,
+    *,
+    minutes: int = 60,
+    threshold: float = 0.0,
+) -> str:
+    """Cluster active bucket/cell mean deltas into edge-connected components.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``neighbors`` is a list of ``(a, b)`` two-tuples
+    describing an undirected adjacency: ``a`` and ``b`` must be distinct
+    non-empty cell id strings occurring in ``details``; self-loops and
+    repeated edges (in either orientation) are illegal. ``minutes`` must be
+    a non-boolean integer in ``1..1440`` that divides 1440; ``threshold``
+    is a non-boolean finite number greater than or equal to 0.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within each
+    bucket/cell pair are averaged. A bucket/cell pair is active when its
+    mean delta satisfies ``|mean| >= threshold``; only active cells are
+    kept. Per bucket, the active cells are split into connected components
+    of the neighbor graph (an active cell without an active neighbor forms
+    its own cluster). Groups are emitted in ascending bucket order, clusters
+    in ascending first-cell order and each cluster's cells in ascending
+    order; buckets without active cells are omitted.
+
+    With ``k`` the number of cells in a cluster (``k > 12`` raises
+    ``ValueError``), ``mean`` is the mean of the cluster's cell means,
+    ``peak`` is the cell mean with the largest absolute value (ties broken
+    by the smaller cell id) and ``kind`` is ``"hot"``, ``"cold"`` or
+    ``"mixed"`` when ``mean`` is positive, negative or zero. ``p`` is the
+    exact sign-flip share: all ``2 ** k`` sign vectors ``s_i`` in
+    ``{-1, 1}`` are enumerated and ``p`` is the proportion with
+    ``|sum(s_i * d_i) / k| >= |mean|``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, threshold, groups``, each group object uses the key
+    order ``key, clusters`` and each cluster object uses the key order
+    ``key, cells, n, mean, peak, p, kind``. Group keys are integer bucket
+    starts, cluster keys are the first cell id string, ``cells`` is a list
+    of cell id strings and ``n`` is an integer. ``threshold``, ``mean``,
+    ``peak`` and ``p`` are rendered with exactly six decimals, negative zero
+    normalized to ``0.000000``. An empty ``details`` yields
+    ``{"minutes":60,"threshold":0.000000,"groups":[]}``. ``details`` or
+    ``neighbors`` not being a list raises ``TypeError``; every other
+    contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(neighbors, list):
+        raise TypeError("neighbors must be a list")
+    minutes = _validate_minutes(minutes)
+    threshold_value = _validate_finite_number(threshold, "threshold")
+    if threshold_value < 0:
+        raise ValueError("threshold must be non-negative")
+
+    parsed = _validate_detail_rows(details)
+
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    edges: set[tuple[str, str]] = set()
+    for item in neighbors:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each neighbor must be an (a, b) two-tuple")
+        endpoint_a, endpoint_b = item
+        for endpoint in (endpoint_a, endpoint_b):
+            if not isinstance(endpoint, str) or not endpoint:
+                raise ValueError(
+                    "neighbor endpoints must be non-empty cell id strings"
+                )
+            if endpoint not in cell_ids:
+                raise ValueError(f"unknown cell id in neighbor: {endpoint!r}")
+        if endpoint_a == endpoint_b:
+            raise ValueError("neighbor self-loops are not allowed")
+        edge = (
+            (endpoint_a, endpoint_b)
+            if endpoint_a < endpoint_b
+            else (endpoint_b, endpoint_a)
+        )
+        if edge in edges:
+            raise ValueError(f"duplicate neighbor edge: {edge!r}")
+        edges.add(edge)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> [delta sum, row count]
+        buckets: dict[int, dict[str, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = buckets.setdefault(bucket, {}).setdefault(
+                    cell_id, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        groups = []
+        for bucket in sorted(buckets):
+            # cell_id -> mean delta, active cells only
+            active: dict[str, Decimal] = {}
+            for cell_id, (total, count) in buckets[bucket].items():
+                cell_mean = total / count
+                if abs(cell_mean) >= threshold_value:
+                    active[cell_id] = cell_mean
+            if not active:
+                continue
+
+            adjacency: dict[str, list[str]] = {cell_id: [] for cell_id in active}
+            for endpoint_a, endpoint_b in edges:
+                if endpoint_a in active and endpoint_b in active:
+                    adjacency[endpoint_a].append(endpoint_b)
+                    adjacency[endpoint_b].append(endpoint_a)
+
+            clusters = []
+            unseen = set(active)
+            while unseen:
+                seed = min(unseen)
+                unseen.discard(seed)
+                component = [seed]
+                cursor = 0
+                while cursor < len(component):
+                    for adjacent in adjacency[component[cursor]]:
+                        if adjacent in unseen:
+                            unseen.discard(adjacent)
+                            component.append(adjacent)
+                    cursor += 1
+                clusters.append(sorted(component))
+
+            cluster_items = []
+            for cells in clusters:
+                k = len(cells)
+                if k > _CLUSTER_MAX_K:
+                    raise ValueError(
+                        f"cluster {cells[0]!r} has {k} cells; cluster report "
+                        f"requires at most {_CLUSTER_MAX_K} cells per cluster"
+                    )
+                means = [active[cell_id] for cell_id in cells]
+                total = Decimal(0)
+                for cell_mean in means:
+                    total += cell_mean
+                cluster_mean = total / k
+
+                # cells ascend, so a strict comparison keeps the smallest
+                # cell id among equally large absolute means.
+                peak = means[0]
+                for cell_mean in means:
+                    if abs(cell_mean) > abs(peak):
+                        peak = cell_mean
+
+                if cluster_mean > 0:
+                    kind = "hot"
+                elif cluster_mean < 0:
+                    kind = "cold"
+                else:
+                    kind = "mixed"
+
+                # |sum(s_i * d_i) / k| >= |mean| is equivalent (k > 0) to
+                # |sum(s_i * d_i)| >= |sum(d_i)|; compare the raw sums so
+                # exact ties are decided without any division rounding.
+                hits = 0
+                for mask in range(1 << k):
+                    signed_sum = Decimal(0)
+                    for index, cell_mean in enumerate(means):
+                        if (mask >> index) & 1:
+                            signed_sum -= cell_mean
+                        else:
+                            signed_sum += cell_mean
+                    if abs(signed_sum) >= abs(total):
+                        hits += 1
+                p = Decimal(hits) / Decimal(1 << k)
+
+                cluster_items.append(
+                    '{"key":' + json.dumps(cells[0], ensure_ascii=False)
+                    + ',"cells":'
+                    + json.dumps(cells, ensure_ascii=False, separators=(",", ":"))
+                    + ',"n":' + str(k)
+                    + ',"mean":' + _format6(cluster_mean)
+                    + ',"peak":' + _format6(peak)
+                    + ',"p":' + _format6(p)
+                    + ',"kind":' + json.dumps(kind)
+                    + '}'
+                )
+
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"clusters":[' + ",".join(cluster_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"threshold":' + _format6(threshold_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
         )
