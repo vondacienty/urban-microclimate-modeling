@@ -6162,3 +6162,165 @@ def effect_matrix_cluster_report(
             + ',"threshold":' + _format6(threshold_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
+
+
+_TEMPORAL_LAG_MAX_N = 8
+
+
+def effect_matrix_temporal_lag_report(
+    rows: list,
+    *,
+    minutes: int = 60,
+    lag: int = 1,
+) -> str:
+    """Pair per-bucket means with their temporal lags and emit a JSON report.
+
+    ``rows`` is a list of ``(timestamp, cell_id, value)`` three-tuples:
+    ``timestamp`` must be a non-boolean non-negative integer, ``cell_id`` a
+    non-empty string and ``value`` a finite non-boolean int/float;
+    ``(timestamp, cell_id)`` pairs must be unique. ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440 and ``lag`` a
+    positive non-boolean integer.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and the values within each
+    bucket/cell pair are averaged. For each cell, every bucket ``B`` holding
+    a mean is paired with the mean of bucket ``B - lag * minutes * 60`` when
+    that bucket also holds a mean for the cell; a cell with fewer than 2
+    pairs is omitted and a cell with more than 8 pairs raises ``ValueError``.
+    With ``x`` the current-bucket means, ``y`` the lagged means and ``n`` the
+    pair count, let ``Sxx = sum((x_i - mean(x)) ** 2)``,
+    ``Syy = sum((y_i - mean(y)) ** 2)`` and
+    ``Sxy = sum((x_i - mean(x)) * (y_i - mean(y)))``. When ``Sxx`` or ``Syy``
+    is zero the cell gets ``slope = corr = 0`` and ``p = 1``; otherwise
+    ``slope = Sxy / Sxx``, ``corr = Sxy / sqrt(Sxx * Syy)`` and ``p`` is the
+    exact permutation p-value: all ``n!`` permutations of ``y`` are
+    enumerated (duplicate values not deduplicated) and ``p`` is the
+    proportion with ``|Sxy_perm| >= |Sxy|``, compared on the unquantized
+    values via exact rational arithmetic so theoretically-equal statistics
+    are never split by rounding.
+
+    Numbers enter as ``Decimal(str(x))`` and bucket accumulation happens
+    under a precision-1000, ROUND_HALF_EVEN local context; the per-bucket
+    means are then lifted to exact fractions for the statistics and their
+    permutation test. Returns a compact UTF-8 JSON string with no spaces and
+    no trailing newline; the top-level key order is ``minutes, lag, groups``
+    and each group object uses the key order ``key, n, slope, corr, p``
+    (groups in ascending cell id order). ``key`` is the cell id, ``n`` an
+    integer and ``slope``, ``corr`` and ``p`` are rendered with exactly six
+    decimals, negative zero normalized to ``0.000000``; cell ids are
+    JSON-escaped with Unicode preserved. An empty ``rows`` yields
+    ``{"minutes":60,"lag":1,"groups":[]}``. ``rows`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    minutes = _validate_minutes(minutes)
+    if isinstance(lag, bool) or not isinstance(lag, int):
+        raise ValueError("lag must be an integer")
+    if lag < 1:
+        raise ValueError("lag must be a positive integer")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) != 3:
+            raise ValueError(
+                "each row must be a (timestamp, cell_id, value) three-tuple"
+            )
+        timestamp, cell_id, value = row
+        _validate_timestamp(timestamp)
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError("cell_id must be a non-empty string")
+        validated = _validate_finite_number(value, "value")
+        key = (timestamp, cell_id)
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append((timestamp, cell_id, validated))
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # cell_id -> bucket start -> [value sum, row count]
+        cells: dict[str, dict[int, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for timestamp, cell_id, value in parsed:
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = cells.setdefault(cell_id, {}).setdefault(
+                    bucket, [Decimal(0), 0]
+                )
+                acc[0] += value
+                acc[1] += 1
+
+        shift = lag * minutes * 60
+        groups = []
+        for cell_id in sorted(cells):
+            means = {
+                bucket: Fraction(total) / count
+                for bucket, (total, count) in cells[cell_id].items()
+            }
+            pairs = [
+                (means[bucket], means[bucket - shift])
+                for bucket in sorted(means)
+                if bucket - shift in means
+            ]
+            n = len(pairs)
+            if n > _TEMPORAL_LAG_MAX_N:
+                raise ValueError(
+                    f"cell {cell_id!r} has {n} pairs; temporal lag report "
+                    f"requires at most {_TEMPORAL_LAG_MAX_N} pairs per cell"
+                )
+            if n < 2:
+                continue
+
+            xs = [pair[0] for pair in pairs]
+            ys = [pair[1] for pair in pairs]
+            mean_x = sum(xs, Fraction(0)) / n
+            mean_y = sum(ys, Fraction(0)) / n
+            x_dev = [value - mean_x for value in xs]
+            y_dev = [value - mean_y for value in ys]
+            sxx = sum((dev * dev for dev in x_dev), Fraction(0))
+            syy = sum((dev * dev for dev in y_dev), Fraction(0))
+            sxy = sum(
+                (x_dev[index] * y_dev[index] for index in range(n)),
+                Fraction(0),
+            )
+
+            if sxx == 0 or syy == 0:
+                slope = Decimal(0)
+                corr = Decimal(0)
+                p = Fraction(1)
+            else:
+                slope = _fraction_to_decimal(sxy / sxx)
+                sxy_decimal = _fraction_to_decimal(sxy)
+                corr = sxy_decimal / (
+                    _fraction_to_decimal(sxx) * _fraction_to_decimal(syy)
+                ).sqrt()
+                hits = 0
+                factorial = math.factorial(n)
+                for perm in permutations(y_dev):
+                    perm_sxy = sum(
+                        (x_dev[index] * perm[index] for index in range(n)),
+                        Fraction(0),
+                    )
+                    if abs(perm_sxy) >= abs(sxy):
+                        hits += 1
+                p = Fraction(hits, factorial)
+
+            groups.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"slope":' + _format6(slope)
+                + ',"corr":' + _format6(corr)
+                + ',"p":' + _format6(_fraction_to_decimal(p))
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"lag":' + str(lag)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
