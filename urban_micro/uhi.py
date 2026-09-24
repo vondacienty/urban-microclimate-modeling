@@ -748,7 +748,10 @@ def fit_uhi_model(
 def _validate_finite_number(value: object, name: str) -> Decimal:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite int or float")
-    if not math.isfinite(value):
+    # Every int is finite; math.isfinite() on an int converts it through a
+    # C double and raises OverflowError once it exceeds float range, so guard
+    # the check to floats.
+    if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
     return Decimal(str(value))
 
