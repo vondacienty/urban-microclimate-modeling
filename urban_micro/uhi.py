@@ -40,6 +40,7 @@ __all__ = [
     "effect_matrix_autocorr_report",
     "effect_matrix_moran_report",
     "effect_matrix_local_moran_report",
+    "effect_matrix_geary_report",
     "effect_matrix_hotspot_report",
     "effect_matrix_wilcoxon_report",
     "ventilation_report",
@@ -3943,6 +3944,174 @@ def effect_matrix_moran_report(
                 + ',"n":' + str(n)
                 + ',"moran":' + _format6(moran)
                 + ',"p":' + _format6(p)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_GEARY_MAX_N = 8
+
+
+def effect_matrix_geary_report(
+    details: list,
+    neighbors: list,
+    *,
+    minutes: int = 60,
+) -> str:
+    """Aggregate scenario deltas per bucket and emit a Geary's C JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``neighbors`` is a list of ``(a, b)`` two-tuples
+    describing an undirected adjacency: ``a`` and ``b`` must be distinct
+    non-empty cell id strings occurring in ``details``; self-loops and
+    repeated edges (in either orientation) are illegal. ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within each
+    bucket/cell pair are averaged. Each bucket holds the vector ``d`` of its
+    per-cell mean deltas in ascending cell id order; a bucket with more than
+    8 cells raises ``ValueError``. With ``n`` the size of ``d``,
+    ``x_i = d_i - mean(d)``, ``S = sum(x_i ** 2)`` and ``e`` the number of
+    neighbor edges whose endpoints both occur in the bucket, Geary's C is 1
+    and ``p`` is 1 when ``e`` is 0 or ``S`` is 0; otherwise
+    ``C = (n - 1) * sum_edges((x_a - x_b) ** 2) / (2 * e * S)`` and ``p`` is
+    the exact permutation p-value: all ``n!`` permutations of ``d`` are
+    enumerated in lexicographic order (duplicate values not deduplicated), C
+    is recomputed for each and ``p`` is the proportion with
+    ``|C_perm - 1| >= |C - 1|``, compared on the unquantized values via exact
+    rational arithmetic so theoretically-equal distances are never split by
+    rounding.
+
+    Numbers enter as ``Decimal(str(x))`` and bucket accumulation happens
+    under a precision-1000, ROUND_HALF_EVEN local context; the per-bucket
+    means are then lifted to exact fractions for the statistic and its
+    permutation test. Returns a compact UTF-8 JSON string with no spaces and
+    no trailing newline; the top-level key order is ``minutes, groups`` and
+    each group object uses the key order ``key, n, geary, p``, with groups in
+    ascending bucket order. ``geary`` and ``p`` are rendered with exactly six
+    decimals, negative zero normalized to ``0.000000``; bucket keys and ``n``
+    are integers. An empty ``details`` yields
+    ``{"minutes":60,"groups":[]}``. ``details`` or ``neighbors`` not being a
+    list raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(neighbors, list):
+        raise TypeError("neighbors must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = _validate_detail_rows(details)
+
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    edges: set[tuple[str, str]] = set()
+    for item in neighbors:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each neighbor must be an (a, b) two-tuple")
+        endpoint_a, endpoint_b = item
+        for endpoint in (endpoint_a, endpoint_b):
+            if not isinstance(endpoint, str) or not endpoint:
+                raise ValueError(
+                    "neighbor endpoints must be non-empty cell id strings"
+                )
+            if endpoint not in cell_ids:
+                raise ValueError(f"unknown cell id in neighbor: {endpoint!r}")
+        if endpoint_a == endpoint_b:
+            raise ValueError("neighbor self-loops are not allowed")
+        edge = (
+            (endpoint_a, endpoint_b)
+            if endpoint_a < endpoint_b
+            else (endpoint_b, endpoint_a)
+        )
+        if edge in edges:
+            raise ValueError(f"duplicate neighbor edge: {edge!r}")
+        edges.add(edge)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> [delta sum, row count]
+        buckets: dict[int, dict[str, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = buckets.setdefault(bucket, {}).setdefault(
+                    cell_id, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        groups = []
+        for bucket in sorted(buckets):
+            cells = sorted(buckets[bucket])
+            n = len(cells)
+            if n > _GEARY_MAX_N:
+                raise ValueError(
+                    f"bucket {bucket} has {n} cells; Geary report requires "
+                    f"at most {_GEARY_MAX_N} cells per bucket"
+                )
+            # Lift the precision-1000 means to exact fractions so that
+            # equidistant permutation statistics are never split by rounding.
+            d = []
+            for cell_id in cells:
+                total, count = buckets[bucket][cell_id]
+                d.append(Fraction(total) / count)
+            position = {cell_id: index for index, cell_id in enumerate(cells)}
+            bucket_edges = [
+                (position[a], position[b])
+                for a, b in sorted(edges)
+                if a in position and b in position
+            ]
+            e = len(bucket_edges)
+
+            mean_d = sum(d, Fraction(0)) / n
+            deviations = [value - mean_d for value in d]
+            sxx = sum((value * value for value in deviations), Fraction(0))
+
+            if e == 0 or sxx == 0:
+                geary_fraction = Fraction(1)
+                p_fraction = Fraction(1)
+            else:
+                edge_sum = sum(
+                    (
+                        (deviations[a] - deviations[b])
+                        * (deviations[a] - deviations[b])
+                        for a, b in bucket_edges
+                    ),
+                    Fraction(0),
+                )
+                geary_fraction = Fraction(n - 1) * edge_sum / (2 * e * sxx)
+                distance = abs(geary_fraction - 1)
+                hits = 0
+                for perm in permutations(d):
+                    perm_edge_sum = sum(
+                        (
+                            (perm[a] - perm[b]) * (perm[a] - perm[b])
+                            for a, b in bucket_edges
+                        ),
+                        Fraction(0),
+                    )
+                    perm_geary = Fraction(n - 1) * perm_edge_sum / (2 * e * sxx)
+                    if abs(perm_geary - 1) >= distance:
+                        hits += 1
+                p_fraction = Fraction(hits, math.factorial(n))
+
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"n":' + str(n)
+                + ',"geary":' + _format6(_fraction_to_decimal(geary_fraction))
+                + ',"p":' + _format6(_fraction_to_decimal(p_fraction))
                 + '}'
             )
 
