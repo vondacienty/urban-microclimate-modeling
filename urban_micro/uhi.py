@@ -45,6 +45,7 @@ __all__ = [
     "effect_matrix_wilcoxon_report",
     "effect_matrix_spatial_lag_report",
     "ventilation_report",
+    "vent_effect_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -5303,4 +5304,163 @@ def ventilation_report(records: list, *, minutes: int = 60) -> str:
         return (
             '{"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_VENT_EFFECT_MAX_N = 8
+
+
+def _validate_airflow_row(row: object) -> tuple[int, str, Decimal]:
+    """Validate one ``(timestamp, cell_id, v)`` airflow three-tuple."""
+    if not isinstance(row, tuple) or len(row) != 3:
+        raise ValueError("each airflow row must be a (timestamp, cell_id, v) three-tuple")
+    timestamp, cell_id, value = row
+    _validate_timestamp(timestamp)
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+    velocity = _validate_finite_number(value, "v")
+    return timestamp, cell_id, velocity
+
+
+def vent_effect_report(details: list, airflow: list, *, minutes: int = 60) -> str:
+    """Regress bucketed scenario deltas on bucketed airflow per cell.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``airflow`` is a list of
+    ``(timestamp, cell_id, v)`` three-tuples following the same timestamp and
+    cell id contract, with ``v`` a finite non-boolean int/float. ``minutes``
+    must be a non-boolean integer in ``1..1440`` that divides 1440.
+
+    Rows are bucketed with ``B = floor(timestamp / (60 * minutes))``; within
+    each ``(B, cell_id)`` the deltas are averaged and the airflow values are
+    averaged separately, then only buckets present in both sources are kept.
+    Cells are emitted in ascending string order; a cell with fewer than two
+    shared buckets is omitted and one with more than eight raises
+    ``ValueError``. For each kept cell an ordinary least-squares line is
+    fitted to the points ``(x, y) = (v, delta)``: with ``x_bar``/``y_bar``
+    the means, ``Sxx = sum((x - x_bar) ** 2)`` and
+    ``Sxy = sum((x - x_bar) * (y - y_bar))``, ``slope`` is 0 when ``Sxx`` is
+    0 and ``Sxy / Sxx`` otherwise. ``p`` is the permutation proportion of
+    the ``n!`` y permutations for which ``|slope'| >= |slope|`` (1 when
+    ``Sxx`` is 0).
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups`` and each group object uses the key order
+    ``key, n, slope, p`` with ``key`` the cell id. An empty result yields
+    ``{"minutes":60,"groups":[]}``. ``slope`` and ``p`` are rendered with
+    exactly six decimals, negative zero normalized to ``0.000000``, and
+    ``n`` as an integer. ``details`` or ``airflow`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(airflow, list):
+        raise TypeError("airflow must be a list")
+    minutes = _validate_minutes(minutes)
+
+    detail_rows = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        detail_rows.append(validated)
+
+    airflow_rows = [_validate_airflow_row(row) for row in airflow]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # cell_id -> bucket index -> [sum, count]
+        delta_cells: dict[str, dict[int, list]] = {}
+        airflow_cells: dict[str, dict[int, list]] = {}
+        for validated in detail_rows:
+            timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+            bucket_index = timestamp // bucket_seconds
+            acc = delta_cells.setdefault(cell_id, {}).setdefault(
+                bucket_index, [Decimal(0), 0]
+            )
+            acc[0] += delta
+            acc[1] += 1
+        for timestamp, cell_id, value in airflow_rows:
+            bucket_index = timestamp // bucket_seconds
+            acc = airflow_cells.setdefault(cell_id, {}).setdefault(
+                bucket_index, [Decimal(0), 0]
+            )
+            acc[0] += value
+            acc[1] += 1
+
+        items = []
+        for cell_id in sorted(set(delta_cells) & set(airflow_cells)):
+            delta_buckets = delta_cells[cell_id]
+            airflow_buckets = airflow_cells[cell_id]
+            shared = sorted(set(delta_buckets) & set(airflow_buckets))
+            n = len(shared)
+            if n < 2:
+                continue
+            if n > _VENT_EFFECT_MAX_N:
+                raise ValueError(
+                    f"cell {cell_id!r} has {n} shared buckets; vent effect "
+                    f"report requires at most {_VENT_EFFECT_MAX_N} buckets per cell"
+                )
+            xs = []
+            ys = []
+            for bucket_index in shared:
+                delta_total, delta_count = delta_buckets[bucket_index]
+                v_total, v_count = airflow_buckets[bucket_index]
+                xs.append(v_total / v_count)
+                ys.append(delta_total / delta_count)
+
+            x_total = Decimal(0)
+            y_total = Decimal(0)
+            for x, y in zip(xs, ys):
+                x_total += x
+                y_total += y
+            x_bar = x_total / n
+            y_bar = y_total / n
+            sxx = Decimal(0)
+            sxy = Decimal(0)
+            for x, y in zip(xs, ys):
+                dx = x - x_bar
+                sxx += dx * dx
+                sxy += dx * (y - y_bar)
+
+            if sxx == 0:
+                slope = Decimal(0)
+                p_value = Decimal(1)
+            else:
+                slope = sxy / sxx
+                # |Sxy'/Sxx| >= |Sxy/Sxx| with Sxx > 0 is equivalent to
+                # |Sxy'| >= |Sxy|; compare the raw numerators exactly.
+                deviations_x = [x - x_bar for x in xs]
+                centered_y = [y - y_bar for y in ys]
+                hits = 0
+                for perm in permutations(range(n)):
+                    permuted_sxy = Decimal(0)
+                    for index, j in enumerate(perm):
+                        permuted_sxy += deviations_x[index] * centered_y[j]
+                    if abs(permuted_sxy) >= abs(sxy):
+                        hits += 1
+                p_value = Decimal(hits) / Decimal(math.factorial(n))
+
+            items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"slope":' + _format6(slope)
+                + ',"p":' + _format6(p_value)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(items) + ']}'
         )

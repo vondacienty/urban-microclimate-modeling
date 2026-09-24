@@ -36,6 +36,7 @@ from .uhi import (
     grid_features,
     scenario,
     ventilation_report,
+    vent_effect_report,
 )
 
 __version__ = "0.1.0"
@@ -77,4 +78,5 @@ __all__ = [
     "grid_features",
     "scenario",
     "ventilation_report",
+    "vent_effect_report",
 ]
