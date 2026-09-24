@@ -45,6 +45,7 @@ __all__ = [
     "effect_matrix_wilcoxon_report",
     "effect_matrix_spatial_lag_report",
     "ventilation_report",
+    "vent_effect_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -5303,4 +5304,162 @@ def ventilation_report(records: list, *, minutes: int = 60) -> str:
         return (
             '{"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def _validate_airflow_row(row: object) -> tuple[int, str, Decimal]:
+    """Validate one ``(t, c, v)`` airflow three-tuple."""
+    if not isinstance(row, tuple) or len(row) != 3:
+        raise ValueError(
+            "each airflow row must be a (timestamp, cell_id, v) three-tuple"
+        )
+    timestamp, cell_id, value = row
+    _validate_timestamp(timestamp)
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+    value_d = _validate_finite_number(value, "v")
+    return timestamp, cell_id, value_d
+
+
+_VENT_EFFECT_MAX_N = 8
+
+
+def vent_effect_report(details: list, airflow: list, *, minutes: int = 60) -> str:
+    """Regress scenario deltas on airflow per cell and emit a compact JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)`` with finite non-boolean numeric fields
+    and unique ``(timestamp, cell_id)`` pairs. ``airflow`` is a list of
+    ``(timestamp, cell_id, v)`` three-tuples where ``timestamp`` is a
+    non-boolean non-negative integer, ``cell_id`` a non-empty string and
+    ``v`` a finite non-boolean int/float. ``minutes`` must be a non-boolean
+    integer in ``1..1440`` that divides 1440.
+
+    Both inputs are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``. Within each
+    ``(bucket, cell_id)`` pair the ``delta`` values of ``details`` and the
+    ``v`` values of ``airflow`` are averaged separately, and only pairs
+    present in both inputs are kept. For each cell id ``c`` (emitted in
+    ascending order) the kept pairs give points ``(x, y)`` with ``x`` the
+    mean airflow and ``y`` the mean delta; cells with fewer than 2 points
+    are omitted and a cell with more than 8 points raises ``ValueError``.
+
+    With ``x_bar``/``y_bar`` the point means, ``Sxx = sum((x - x_bar) ** 2)``
+    and ``Sxy = sum((x - x_bar) * (y - y_bar))``: when ``Sxx`` is 0 the
+    ``slope`` is 0 and ``p`` is 1; otherwise ``slope = Sxy / Sxx`` and ``p``
+    is the exact permutation p-value — the proportion of the ``n!``
+    positional permutations of the ``y`` values whose permuted slope
+    ``slope'`` satisfies ``|slope'| >= |slope|``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups`` and each group object uses the key order
+    ``key, n, slope, p`` with ``key`` the cell id and ``n`` the number of
+    points. ``n`` is an integer and every other numeric result is rendered
+    with exactly six decimals, negative zero normalized to ``0.000000``.
+    An empty result yields ``{"minutes":60,"groups":[]}``. ``details`` or
+    ``airflow`` not being a list raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(airflow, list):
+        raise TypeError("airflow must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed_details = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed_details.append(validated)
+
+    parsed_airflow = [_validate_airflow_row(row) for row in airflow]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # (bucket, cell_id) -> [sum, count]
+        delta_acc: dict[tuple[int, str], list] = {}
+        for validated in parsed_details:
+            timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            acc = delta_acc.setdefault((bucket, cell_id), [Decimal(0), 0])
+            acc[0] += delta
+            acc[1] += 1
+
+        airflow_acc: dict[tuple[int, str], list] = {}
+        for timestamp, cell_id, value in parsed_airflow:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            acc = airflow_acc.setdefault((bucket, cell_id), [Decimal(0), 0])
+            acc[0] += value
+            acc[1] += 1
+
+        # cell_id -> list of (mean airflow, mean delta) over shared buckets
+        cells: dict[str, list[tuple[Decimal, Decimal]]] = {}
+        for key, (delta_total, delta_count) in delta_acc.items():
+            airflow_entry = airflow_acc.get(key)
+            if airflow_entry is None:
+                continue
+            airflow_total, airflow_count = airflow_entry
+            cells.setdefault(key[1], []).append(
+                (airflow_total / airflow_count, delta_total / delta_count)
+            )
+
+        items = []
+        for cell_id in sorted(cells):
+            points = cells[cell_id]
+            n = len(points)
+            if n < 2:
+                continue
+            if n > _VENT_EFFECT_MAX_N:
+                raise ValueError(
+                    f"cell {cell_id!r} has {n} points; vent effect report "
+                    f"requires at most {_VENT_EFFECT_MAX_N} points per cell"
+                )
+            x_total = Decimal(0)
+            y_total = Decimal(0)
+            for x, y in points:
+                x_total += x
+                y_total += y
+            x_bar = x_total / n
+            y_bar = y_total / n
+            sxx = Decimal(0)
+            sxy = Decimal(0)
+            for x, y in points:
+                dx = x - x_bar
+                sxx += dx * dx
+                sxy += dx * (y - y_bar)
+            if sxx == 0:
+                slope = Decimal(0)
+                p = Decimal(1)
+            else:
+                slope = sxy / sxx
+                ys = [y for _, y in points]
+                hits = 0
+                for permuted in permutations(ys):
+                    permuted_sxy = Decimal(0)
+                    for (x, _), y in zip(points, permuted):
+                        permuted_sxy += (x - x_bar) * (y - y_bar)
+                    if abs(permuted_sxy) >= abs(sxy):
+                        hits += 1
+                p = Decimal(hits) / Decimal(math.factorial(n))
+
+            items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"slope":' + _format6(slope)
+                + ',"p":' + _format6(p)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(items) + ']}'
         )

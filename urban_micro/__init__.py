@@ -35,6 +35,7 @@ from .uhi import (
     fit_uhi_model,
     grid_features,
     scenario,
+    vent_effect_report,
     ventilation_report,
 )
 
@@ -76,5 +77,6 @@ __all__ = [
     "fit_uhi_model",
     "grid_features",
     "scenario",
+    "vent_effect_report",
     "ventilation_report",
 ]
