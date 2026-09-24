@@ -40,6 +40,7 @@ __all__ = [
     "effect_matrix_autocorr_report",
     "effect_matrix_moran_report",
     "effect_matrix_local_moran_report",
+    "effect_matrix_spatial_lag_report",
     "effect_matrix_geary_report",
     "effect_matrix_hotspot_report",
     "effect_matrix_wilcoxon_report",
@@ -4606,6 +4607,192 @@ def effect_matrix_hotspot_report(
         return (
             '{"minutes":' + str(minutes)
             + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_SPATIAL_LAG_MAX_N = 8
+
+
+def effect_matrix_spatial_lag_report(
+    details: list,
+    neighbors: list,
+    *,
+    minutes: int = 60,
+) -> str:
+    """Aggregate scenario deltas per bucket and emit a spatial-lag JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``neighbors`` is a list of ``(a, b)`` two-tuples
+    describing an undirected adjacency: ``a`` and ``b`` must be distinct
+    non-empty cell id strings occurring in ``details``; self-loops and
+    repeated edges (in either orientation) are illegal. ``minutes`` must be
+    a non-boolean integer in ``1..1440`` that divides 1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within each
+    bucket/cell pair are averaged with ``Decimal(str(x))``. Each bucket holds
+    the vector ``d`` of its per-cell mean deltas in ascending cell id order;
+    a bucket with more than 8 cells raises ``ValueError``. With
+    ``x_i = d_i - mean(d)``, the spatial lag of cell ``c`` is
+    ``lag_c = mean(x_j)`` over the neighbors of ``c`` inside the bucket and
+    ``local_c = x_c * lag_c``. When ``c`` has no neighbor inside the bucket
+    or all values in ``d`` are equal, ``lag`` and ``local`` are 0 and ``p``
+    is 1; otherwise ``p`` is the exact permutation p-value: all ``n!``
+    permutations of ``d`` are enumerated in lexicographic order (duplicate
+    values not deduplicated), ``local`` is recomputed for each and ``p`` is
+    the proportion with ``|local_perm| >= |local|``, compared on the
+    unquantized values via exact rational arithmetic.
+
+    Numbers enter as ``Decimal(str(x))`` and bucket accumulation happens
+    under a precision-1000, ROUND_HALF_EVEN local context; the per-bucket
+    means are then lifted to exact fractions for the statistics and their
+    permutation test. Returns a compact UTF-8 JSON string with no spaces and
+    no trailing newline; the top-level key order is ``minutes, groups``,
+    each group object uses the key order ``key, cells`` (groups in ascending
+    bucket order) and each cell object the key order ``key, lag, local, p``
+    with cells in ascending cell id order. ``lag``, ``local`` and ``p`` are
+    rendered with exactly six decimals, negative zero normalized to
+    ``0.000000``; bucket keys are integers and cell ids JSON-escaped with
+    Unicode preserved. An empty ``details`` yields
+    ``{"minutes":60,"groups":[]}``. ``details`` or ``neighbors`` not being a
+    list raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(neighbors, list):
+        raise TypeError("neighbors must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = _validate_detail_rows(details)
+
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    edges: set[tuple[str, str]] = set()
+    for item in neighbors:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each neighbor must be an (a, b) two-tuple")
+        endpoint_a, endpoint_b = item
+        for endpoint in (endpoint_a, endpoint_b):
+            if not isinstance(endpoint, str) or not endpoint:
+                raise ValueError(
+                    "neighbor endpoints must be non-empty cell id strings"
+                )
+            if endpoint not in cell_ids:
+                raise ValueError(f"unknown cell id in neighbor: {endpoint!r}")
+        if endpoint_a == endpoint_b:
+            raise ValueError("neighbor self-loops are not allowed")
+        edge = (
+            (endpoint_a, endpoint_b)
+            if endpoint_a < endpoint_b
+            else (endpoint_b, endpoint_a)
+        )
+        if edge in edges:
+            raise ValueError(f"duplicate neighbor edge: {edge!r}")
+        edges.add(edge)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> [delta sum, row count]
+        buckets: dict[int, dict[str, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = buckets.setdefault(bucket, {}).setdefault(
+                    cell_id, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        groups = []
+        for bucket in sorted(buckets):
+            cells = sorted(buckets[bucket])
+            n = len(cells)
+            if n > _SPATIAL_LAG_MAX_N:
+                raise ValueError(
+                    f"bucket {bucket} has {n} cells; spatial lag report "
+                    f"requires at most {_SPATIAL_LAG_MAX_N} cells per bucket"
+                )
+            d = []
+            for cell_id in cells:
+                total, count = buckets[bucket][cell_id]
+                d.append(Fraction(total) / count)
+            position = {cell_id: index for index, cell_id in enumerate(cells)}
+            adjacency: list[list[int]] = [[] for _ in range(n)]
+            for a, b in sorted(edges):
+                if a in position and b in position:
+                    i, j = position[a], position[b]
+                    adjacency[i].append(j)
+                    adjacency[j].append(i)
+            for neighbors_of in adjacency:
+                neighbors_of.sort()
+
+            mean_d = sum(d, Fraction(0)) / n
+            deviations = [value - mean_d for value in d]
+            constant = all(deviation == 0 for deviation in deviations)
+
+            lag_values = [Fraction(0)] * n
+            local_values = [Fraction(0)] * n
+            p_values = [Fraction(1)] * n
+            if not constant:
+                neighbor_sums = [
+                    sum((deviations[j] for j in neighbors_of), Fraction(0))
+                    for neighbors_of in adjacency
+                ]
+                degrees = [len(neighbors_of) for neighbors_of in adjacency]
+                for index in range(n):
+                    if degrees[index] > 0:
+                        lag_values[index] = neighbor_sums[index] / degrees[index]
+                        local_values[index] = deviations[index] * lag_values[index]
+                active = [degree > 0 for degree in degrees]
+                if any(active):
+                    # lag_c = S_c / deg_c with deg_c fixed per cell, so
+                    # |local_perm| >= |local| is equivalently decided by the
+                    # exact rational product x_c * S_c.
+                    observed_scores = [
+                        deviations[index] * neighbor_sums[index]
+                        for index in range(n)
+                    ]
+                    hits = [0] * n
+                    factorial = math.factorial(n)
+                    for perm in permutations(deviations):
+                        for index in range(n):
+                            if not active[index]:
+                                continue
+                            perm_sum = sum(
+                                (perm[j] for j in adjacency[index]), Fraction(0)
+                            )
+                            perm_score = perm[index] * perm_sum
+                            if abs(perm_score) >= abs(observed_scores[index]):
+                                hits[index] += 1
+                    for index in range(n):
+                        if active[index]:
+                            p_values[index] = Fraction(hits[index], factorial)
+
+            cell_items = []
+            for index, cell_id in enumerate(cells):
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"lag":' + _format6(_fraction_to_decimal(lag_values[index]))
+                    + ',"local":' + _format6(_fraction_to_decimal(local_values[index]))
+                    + ',"p":' + _format6(_fraction_to_decimal(p_values[index]))
+                    + '}'
+                )
+
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
 
