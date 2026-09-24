@@ -40,6 +40,7 @@ __all__ = [
     "effect_matrix_moran_report",
     "effect_matrix_local_moran_report",
     "effect_matrix_hotspot_report",
+    "effect_matrix_wilcoxon_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -4355,5 +4356,222 @@ def effect_matrix_theilsen_report(
 
         return (
             '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_WILCOXON_MAX_M = 16
+
+
+def effect_matrix_wilcoxon_report(
+    before: list,
+    after: list,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Pair two scenario-detail tables into a Wilcoxon signed-rank FDR report.
+
+    ``before`` and ``after`` are lists of ``scenario`` eight-tuples
+    ``(timestamp, cell_id, base, post, delta, cg, cr, cm)``: ``timestamp``
+    must be a non-boolean non-negative integer, ``cell_id`` a non-empty
+    string and the other six fields finite non-boolean int/float values; the
+    ``(timestamp, cell_id)`` pairs within each table must be unique, and the
+    two tables must share exactly the same set of pairs. Each row's delta is
+    its fifth field. An empty pair yields
+    ``{"minutes":60,"alpha":0.050000,"groups":[]}``.
+
+    ``minutes`` must be a non-boolean integer in ``1..1440`` that divides
+    1440; ``alpha`` is a non-boolean finite number with ``0 < alpha <= 1``.
+
+    Rows are paired on ``(timestamp, cell_id)`` and bucketed by Unix epoch
+    with key ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are
+    emitted in ascending order and, within each bucket, cells in ascending
+    string order. With ``x = after.delta - before.delta`` for each pair and
+    ``n`` the number of pairs in a bucket/cell cell, ``change`` is
+    ``sum(x) / n``. With ``m`` the number of non-zero ``x`` (a cell with
+    ``m > 16`` raises ``ValueError``), the non-zero ``|x|`` are ranked
+    ascending with average ranks for ties and ``w`` is the sum of the ranks
+    of the positive ``x``. ``p`` is the exact two-sided Wilcoxon signed-rank
+    p-value: all ``2 ** m`` sign assignments are enumerated and, with ``W'``
+    the positive rank sum of each assignment,
+    ``p = min(1, 2 * min(Pr(W' <= w), Pr(W' >= w)))``; ``p`` is 1 when
+    ``m`` is 0.
+
+    With ``N`` the number of bucket/cell cells, all cells are ranked
+    ascending by ``(p, bucket, cell)`` and each rank ``j`` (1-based) gets the
+    Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    bucket/cell; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context; ranks and ``w`` are
+    computed exactly as ``Fraction`` values. Returns a compact UTF-8 JSON
+    string with no spaces and no trailing newline; the top-level key order
+    is ``minutes, alpha, groups``, each group object uses the key order
+    ``key, cells`` and each cell object the key order
+    ``key, n, m, change, w, p, q, reject`` with ``key`` the cell id.
+    ``alpha`` and every numeric result are rendered with exactly six
+    decimals, negative zero normalized to ``0.000000``; bucket keys, pair
+    counts and non-zero counts are integers and cell ids are JSON-escaped
+    with Unicode preserved. ``before`` or ``after`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(before, list):
+        raise TypeError("before must be a list")
+    if not isinstance(after, list):
+        raise TypeError("after must be a list")
+    minutes = _validate_minutes(minutes)
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    before_rows = _validate_detail_rows(before)
+    after_rows = _validate_detail_rows(after)
+
+    before_map = {(row[0], row[1]): row[4] for row in before_rows}
+    after_map = {(row[0], row[1]): row[4] for row in after_rows}
+    before_keys = set(before_map)
+    after_keys = set(after_map)
+    if before_keys != after_keys:
+        missing = sorted(before_keys - after_keys, key=lambda key: (key[0], key[1]))
+        extra = sorted(after_keys - before_keys, key=lambda key: (key[0], key[1]))
+        if missing:
+            raise ValueError(f"key missing from after: {missing[0]!r}")
+        raise ValueError(f"key missing from before: {extra[0]!r}")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (bucket start, cell_id) -> list of paired changes x
+        cells: dict[tuple[int, str], list[Decimal]] = {}
+        if before_map:
+            bucket_seconds = minutes * 60
+            for (timestamp, cell_id), before_delta in before_map.items():
+                after_delta = after_map[(timestamp, cell_id)]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                cells.setdefault((bucket, cell_id), []).append(
+                    after_delta - before_delta
+                )
+
+        # One record per bucket/cell in ascending (bucket, cell) output order:
+        # ``[bucket, cell_id, n, m, change, w, p, q]`` with q filled in below.
+        records: list[list] = []
+        for bucket, cell_id in sorted(cells):
+            changes = cells[(bucket, cell_id)]
+            n = len(changes)
+            non_zero = [change for change in changes if change != 0]
+            m = len(non_zero)
+            if m > _WILCOXON_MAX_M:
+                raise ValueError(
+                    f"cell {cell_id!r} in bucket {bucket} has {m} non-zero "
+                    f"paired changes; wilcoxon report requires at most "
+                    f"{_WILCOXON_MAX_M} per cell"
+                )
+            total = Decimal(0)
+            for change in changes:
+                total += change
+            change_mean = total / n
+
+            if m == 0:
+                w_value = Fraction(0)
+                p_value = Decimal(1)
+            else:
+                # Average ranks of the non-zero |x|, ascending, as exact
+                # fractions; ``w`` is the positive rank sum.
+                order = sorted(range(m), key=lambda idx: abs(non_zero[idx]))
+                ranks = [Fraction(0)] * m
+                low = 0
+                while low < m:
+                    high = low
+                    while (
+                        high + 1 < m
+                        and abs(non_zero[order[high + 1]])
+                        == abs(non_zero[order[low]])
+                    ):
+                        high += 1
+                    average = Fraction(low + 1 + high + 1, 2)
+                    for tied in range(low, high + 1):
+                        ranks[order[tied]] = average
+                    low = high + 1
+                w_value = Fraction(0)
+                for idx in range(m):
+                    if non_zero[idx] > 0:
+                        w_value += ranks[idx]
+
+                # Exact two-sided p-value: enumerate all 2 ** m sign
+                # assignments and tally the positive rank sums on either
+                # side of ``w``.
+                assignments = 1 << m
+                count_le = 0
+                count_ge = 0
+                for mask in range(assignments):
+                    signed_sum = Fraction(0)
+                    for idx in range(m):
+                        if (mask >> idx) & 1:
+                            signed_sum += ranks[idx]
+                    if signed_sum <= w_value:
+                        count_le += 1
+                    if signed_sum >= w_value:
+                        count_ge += 1
+                p_value = min(
+                    Decimal(1),
+                    2 * Decimal(min(count_le, count_ge)) / Decimal(assignments),
+                )
+            records.append(
+                [bucket, cell_id, n, m, change_mean, w_value, p_value, None]
+            )
+
+        # Benjamini-Hochberg q-values across ALL bucket/cell cells: rank
+        # ascending by (p, bucket, cell), then accumulate the running minimum
+        # of N * p_l / l from the top rank down, mapping q back to each cell.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (records[idx][6], records[idx][0], records[idx][1]),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate = Decimal(count) * records[idx][6] / rank
+            if candidate < running:
+                running = candidate
+            records[idx][7] = running
+
+        groups = []
+        cell_items = []
+        current_bucket = None
+        for bucket, cell_id, n, m, change_mean, w_value, p_value, q_value in records:
+            if current_bucket is not None and bucket != current_bucket:
+                groups.append(
+                    '{"key":' + str(current_bucket)
+                    + ',"cells":[' + ",".join(cell_items) + ']}'
+                )
+                cell_items = []
+            current_bucket = bucket
+            reject = q_value <= alpha_value
+            w_decimal = Decimal(w_value.numerator) / Decimal(w_value.denominator)
+            cell_items.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"m":' + str(m)
+                + ',"change":' + _format6(change_mean)
+                + ',"w":' + _format6(w_decimal)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if reject else "false")
+                + '}'
+            )
+        if current_bucket is not None:
+            groups.append(
+                '{"key":' + str(current_bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
