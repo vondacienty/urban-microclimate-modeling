@@ -31,6 +31,7 @@ __all__ = [
     "effect_matrix_fdr_report",
     "effect_matrix_compare_report",
     "effect_matrix_bootstrap_report",
+    "effect_matrix_block_bootstrap_report",
     "effect_matrix_jackknife_report",
     "effect_matrix_permutation_report",
     "effect_matrix_robust_report",
@@ -2618,6 +2619,228 @@ def effect_matrix_bootstrap_report(
 
         return (
             '{"minutes":' + str(minutes)
+            + ',"confidence":' + _format6(confidence_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_BLOCK_BOOTSTRAP_MAX_N = 8
+
+
+def _block_bootstrap_interval(
+    values: list[Decimal], n: int, block: int, confidence_value: Decimal
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Return ``(delta, lower, upper)`` for one circular block-bootstrap cell.
+
+    ``delta`` is the sample mean ``sum(values) / n``. A resample draws
+    ``k = ceil(n / block)`` block-start indices; each start ``i`` contributes
+    the ``block`` cyclically consecutive items ``y[i], y[(i + 1) % n], ...``,
+    the concatenated draws are truncated to the first ``n`` items and
+    averaged. ``lower``/``upper`` are the interpolated quantiles of the
+    sorted multiset of the ``n ** k`` resample means at
+    ``q = (1 - confidence) / 2`` and ``1 - q``. The sorted multiset is built
+    from the draw-count compositions of the ``k - 1`` full blocks times the
+    ``n`` choices for the truncated last block instead of materializing all
+    ``n ** k`` means, giving an identical result.
+    """
+    total = Decimal(0)
+    for value in values:
+        total += value
+    mu = total / n
+
+    k = -(-n // block)
+    last_length = n - (k - 1) * block
+
+    # full_sums[i] sums the block cyclically consecutive items starting at
+    # index i; last_sums[i] sums only the first last_length of them (the
+    # last drawn block is truncated so the resample holds exactly n items).
+    full_sums = []
+    last_sums = []
+    for i in range(n):
+        full = Decimal(0)
+        last = Decimal(0)
+        for j in range(block):
+            value = values[(i + j) % n]
+            full += value
+            if j < last_length:
+                last += value
+        full_sums.append(full)
+        last_sums.append(last)
+
+    # A resample (idx_0, ..., idx_{k-1}) sums full_sums[idx_j] over the
+    # first k-1 draws plus last_sums[idx_{k-1}]. The sorted multiset of the
+    # n**k resample sums only depends on how many times each start appears
+    # among the first k-1 draws and on the last draw: a composition
+    # (c_0, ..., c_{n-1}) with sum k-1 together with last index L
+    # contributes sum(c_j * full_sums[j]) + last_sums[L] with multiplicity
+    # (k-1)! / prod(c_j!).
+    weighted_sums: list[tuple[Decimal, int]] = []
+    counts = [0] * n
+    factorial = math.factorial(k - 1)
+
+    def enumerate_compositions(index: int, remaining: int) -> None:
+        if index == n - 1:
+            counts[index] = remaining
+            weighted_sum = Decimal(0)
+            multiplicity = factorial
+            for j, count_j in enumerate(counts):
+                if count_j:
+                    weighted_sum += count_j * full_sums[j]
+                    multiplicity //= math.factorial(count_j)
+            for last_index in range(n):
+                weighted_sums.append(
+                    (weighted_sum + last_sums[last_index], multiplicity)
+                )
+            return
+        for count_j in range(remaining + 1):
+            counts[index] = count_j
+            enumerate_compositions(index + 1, remaining - count_j)
+
+    enumerate_compositions(0, k - 1)
+    weighted_sums.sort(key=lambda item: item[0])
+
+    # Merge equal sums into (sorted sum numerator, cumulative count);
+    # merged_sums[k] repeats merged_cumulative[k] - merged_cumulative[k-1]
+    # times in the sorted n**k-length sequence of resample means.
+    merged_sums: list[Decimal] = []
+    merged_cumulative: list[int] = []
+    running = 0
+    for weighted_sum, multiplicity in weighted_sums:
+        running += multiplicity
+        if merged_sums and merged_sums[-1] == weighted_sum:
+            merged_cumulative[-1] = running
+        else:
+            merged_sums.append(weighted_sum)
+            merged_cumulative.append(running)
+
+    def value_at(position: int) -> Decimal:
+        merged_index = bisect_left(merged_cumulative, position + 1)
+        return merged_sums[merged_index] / n
+
+    resample_count = n**k
+    q_value = (Decimal(1) - confidence_value) / 2
+    r_value = (Decimal(resample_count) - 1) * q_value
+    floor_index = int(r_value.to_integral_value(rounding=ROUND_FLOOR))
+    lower = value_at(floor_index)
+    upper = value_at(resample_count - 1 - floor_index)
+    weight = r_value - Decimal(floor_index)
+    if weight != 0:
+        # r is non-integral: interpolate against ceil(r) using the unrounded
+        # fractional part of r; the symmetric upper bound interpolates with
+        # the same weight at N-1-floor(r).
+        lower = lower + weight * (value_at(floor_index + 1) - lower)
+        upper = upper + weight * (
+            value_at(resample_count - 2 - floor_index) - upper
+        )
+    return mu, lower, upper
+
+
+def effect_matrix_block_bootstrap_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    block: int = 2,
+    confidence: float = 0.95,
+) -> str:
+    """Aggregate scenario deltas into a per-cell block-bootstrap JSON report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``block`` must be a non-boolean integer
+    in ``1..8``; ``confidence`` is a non-boolean finite number with
+    ``0 < confidence < 1``.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within
+    each bucket/cell pair are averaged, giving each cell a series ``y`` of
+    ``n`` bucket means in ascending bucket order. Cells with ``n < 2`` are
+    omitted; a cell with ``n > 8`` raises ``ValueError``. With
+    ``k = ceil(n / block)``, every index tuple in ``{0, ..., n-1} ** k``
+    (lexicographic order) draws ``k`` blocks: from start ``i`` the ``block``
+    cyclically consecutive items ``y[i], y[(i + 1) % n], ...`` are taken,
+    the concatenated draws are truncated to the first ``n`` items and
+    averaged. ``delta`` is ``sum(y) / n`` and ``lower``/``upper`` are the
+    quantiles of the sorted ``N = n ** k`` resample means: with
+    ``q = (1 - confidence) / 2`` and ``r = (N - 1) * q``, the bounds are
+    taken directly at integer ``r`` (positions ``r`` and ``N - 1 - r``) and
+    otherwise linearly interpolated between ``floor(r)`` and ``ceil(r)``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, block, confidence, groups`` and each group object
+    uses the key order ``key, n, delta, lower, upper`` with ``key`` the
+    cell id and ``n`` the number of occupied buckets, groups in ascending
+    cell id order. An empty ``details`` yields
+    ``{"minutes":60,"block":2,"confidence":0.950000,"groups":[]}``.
+    ``confidence`` and every numeric result are rendered with exactly six
+    decimals, negative zero normalized to ``0.000000``. ``details`` not
+    being a list raises ``TypeError``; every other contract violation
+    raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    if isinstance(block, bool) or not isinstance(block, int):
+        raise ValueError("block must be an integer")
+    if not 1 <= block <= 8:
+        raise ValueError("block must be an integer in 1..8")
+    confidence_value = _validate_finite_number(confidence, "confidence")
+    if confidence_value <= 0 or confidence_value >= 1:
+        raise ValueError("confidence must be greater than 0 and less than 1")
+
+    parsed = _validate_detail_rows(details)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # cell_id -> bucket start -> [delta sum, row count]
+        cells: dict[str, dict[int, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = cells.setdefault(cell_id, {}).setdefault(
+                    bucket, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        groups = []
+        for cell_id in sorted(cells):
+            buckets = cells[cell_id]
+            n = len(buckets)
+            if n < 2:
+                continue
+            if n > _BLOCK_BOOTSTRAP_MAX_N:
+                raise ValueError(
+                    f"cell {cell_id!r} has {n} buckets; block bootstrap report "
+                    f"requires at most {_BLOCK_BOOTSTRAP_MAX_N} buckets per cell"
+                )
+            values = [
+                bucket_total / bucket_count
+                for _, (bucket_total, bucket_count) in sorted(buckets.items())
+            ]
+            mu, lower, upper = _block_bootstrap_interval(
+                values, n, block, confidence_value
+            )
+            groups.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"delta":' + _format6(mu)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"block":' + str(block)
             + ',"confidence":' + _format6(confidence_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
