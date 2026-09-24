@@ -5817,6 +5817,117 @@ def ventilation_report(records: list, *, minutes: int = 60) -> str:
         )
 
 
+def _validate_energy_record(
+    record: object,
+) -> tuple[int, str, Decimal, Decimal, Decimal, Decimal]:
+    if not isinstance(record, tuple) or len(record) != 6:
+        raise ValueError(
+            "each record must be a (timestamp, cell_id, net_rad, sensible, "
+            "latent, storage) six-tuple"
+        )
+    timestamp, cell_id, net_rad, sensible, latent, storage = record
+    _validate_timestamp(timestamp)
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+    net_rad_d = _validate_finite_number(net_rad, "net_rad")
+    sensible_d = _validate_finite_number(sensible, "sensible")
+    latent_d = _validate_finite_number(latent, "latent")
+    storage_d = _validate_finite_number(storage, "storage")
+    return timestamp, cell_id, net_rad_d, sensible_d, latent_d, storage_d
+
+
+def energy_balance_report(records: list, *, minutes: int = 60) -> str:
+    """Aggregate surface energy balance records into a time-bucket x cell report.
+
+    ``records`` is a list of ``(timestamp, cell_id, net_rad, sensible,
+    latent, storage)`` six-tuples: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other four
+    fields finite non-boolean int/float values; each ``(timestamp, cell_id)``
+    pair must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted in
+    ascending order and, within each bucket, cells in ascending string order.
+    Each cell object carries the group size ``n``, the within-group
+    arithmetic means ``net_rad``, ``sensible``, ``latent`` and ``storage``,
+    and ``residual = net_rad - sensible - latent - storage``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups``, each group object uses the key order
+    ``key, cells`` and each cell object uses the key order
+    ``key, n, net_rad, sensible, latent, storage, residual`` with ``key``
+    the cell id. An empty ``records`` yields ``{"minutes":60,"groups":[]}``.
+    Bucket keys and ``n`` are integers and every other numeric result is
+    rendered with exactly six decimals, negative zero normalized to
+    ``0.000000``. ``records`` not being a list raises ``TypeError``; every
+    other contract violation raises ``ValueError``.
+    """
+    if not isinstance(records, list):
+        raise TypeError("records must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = [_validate_energy_record(record) for record in records]
+    seen: set[tuple[int, str]] = set()
+    for timestamp, cell_id, *_ in parsed:
+        pair = (timestamp, cell_id)
+        if pair in seen:
+            raise ValueError(
+                "each (timestamp, cell_id) pair must be unique"
+            )
+        seen.add(pair)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # bucket start -> cell_id -> list of (net_rad, sensible, latent, storage)
+        buckets: dict[int, dict[str, list[tuple[Decimal, ...]]]] = {}
+        for timestamp, cell_id, net_rad, sensible, latent, storage in parsed:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(
+                (net_rad, sensible, latent, storage)
+            )
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                rows = buckets[bucket][cell_id]
+                n = len(rows)
+                sums = [Decimal(0), Decimal(0), Decimal(0), Decimal(0)]
+                for values in rows:
+                    for index in range(4):
+                        sums[index] += values[index]
+                net_rad = sums[0] / n
+                sensible = sums[1] / n
+                latent = sums[2] / n
+                storage = sums[3] / n
+                residual = net_rad - sensible - latent - storage
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"net_rad":' + _format6(net_rad)
+                    + ',"sensible":' + _format6(sensible)
+                    + ',"latent":' + _format6(latent)
+                    + ',"storage":' + _format6(storage)
+                    + ',"residual":' + _format6(residual)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
 def _validate_airflow_row(row: object) -> tuple[int, str, Decimal]:
     """Validate one ``(t, c, v)`` airflow three-tuple."""
     if not isinstance(row, tuple) or len(row) != 3:
