@@ -34,6 +34,7 @@ __all__ = [
     "effect_matrix_block_bootstrap_report",
     "effect_matrix_jackknife_report",
     "effect_matrix_permutation_report",
+    "effect_matrix_trimmed_report",
     "effect_matrix_robust_report",
     "effect_matrix_theilsen_report",
     "effect_matrix_contribution_report",
@@ -3105,6 +3106,147 @@ def effect_matrix_permutation_report(
 
         return (
             '{"minutes":' + str(minutes)
+            + ',"z":' + _format6(z_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def effect_matrix_trimmed_report(
+    details: list,
+    *,
+    minutes: int = 60,
+    trim: float = 0.1,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario deltas into a time-bucket x cell trimmed-mean report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440; ``trim`` is a non-boolean finite number
+    with ``0 <= trim < 0.5``; ``z`` is a non-boolean finite number greater
+    than or equal to 0.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted in
+    ascending order and, within each bucket, cells in ascending string order.
+    Within each bucket/cell the ``n`` deltas are sorted ascending and, with
+    ``k = floor(trim * n)``, the trimmed sample is ``d[k : n - k]`` of size
+    ``m = n - 2 * k``; ``m < 2`` raises ``ValueError``. ``trimmed`` is the
+    trimmed mean ``mu = sum(d[k : n - k]) / m``; ``p`` is the exact two-sided
+    sign-flip permutation p-value of the trimmed sample: all ``2 ** m`` sign
+    vectors ``s_i`` in ``{-1, 1}`` are enumerated and
+    ``p = 2 ** -m * #{|sum(s_i * d_i) / m| >= |mu|}``. The standard error is
+    ``se = sqrt(sum((d_i - mu) ** 2) / (m * (m - 1)))`` over the trimmed
+    sample and ``lower``/``upper`` are ``mu - z * se`` / ``mu + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, trim, z, groups``, each group object uses the key
+    order ``key, cells`` and each cell object the key order
+    ``key, n, trimmed, p, se, lower, upper`` with ``key`` the cell id and
+    ``n`` the untrimmed cell size. An empty ``details`` yields
+    ``{"minutes":60,"trim":0.100000,"z":1.960000,"groups":[]}``. ``trim``,
+    ``z`` and every numeric result are rendered with exactly six decimals,
+    negative zero normalized to ``0.000000``; cell ids are JSON-escaped with
+    Unicode preserved. ``details`` not being a list raises ``TypeError``;
+    every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    minutes = _validate_minutes(minutes)
+    trim_value = _validate_finite_number(trim, "trim")
+    if trim_value < 0 or trim_value >= Decimal("0.5"):
+        raise ValueError("trim must satisfy 0 <= trim < 0.5")
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in details:
+        validated = _validate_detail_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> list of delta Decimal values
+        buckets: dict[int, dict[str, list[Decimal]]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(delta)
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                deltas = sorted(buckets[bucket][cell_id])
+                n = len(deltas)
+                k = int(trim_value * n)
+                trimmed = deltas[k : n - k]
+                m = len(trimmed)
+                if m < 2:
+                    raise ValueError(
+                        f"bucket {bucket} cell {cell_id!r} keeps {m} of {n} rows "
+                        f"after trimming; trimmed report requires at least 2"
+                    )
+                total = Decimal(0)
+                for delta in trimmed:
+                    total += delta
+                mu = total / m
+
+                # |sum(s_i * d_i) / m| >= |mu| is equivalent (m > 0) to
+                # |sum(s_i * d_i)| >= |sum(d_i)|; compare the raw sums so
+                # exact ties are decided without any division rounding.
+                hits = 0
+                for mask in range(1 << m):
+                    signed_sum = Decimal(0)
+                    for index, delta in enumerate(trimmed):
+                        if (mask >> index) & 1:
+                            signed_sum -= delta
+                        else:
+                            signed_sum += delta
+                    if abs(signed_sum) >= abs(total):
+                        hits += 1
+                p_value = Decimal(hits) / Decimal(1 << m)
+
+                squared = Decimal(0)
+                for delta in trimmed:
+                    deviation = delta - mu
+                    squared += deviation * deviation
+                se = (squared / (m * (m - 1))).sqrt()
+                lower = mu - z_value * se
+                upper = mu + z_value * se
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"trimmed":' + _format6(mu)
+                    + ',"p":' + _format6(p_value)
+                    + ',"se":' + _format6(se)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"trim":' + _format6(trim_value)
             + ',"z":' + _format6(z_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
