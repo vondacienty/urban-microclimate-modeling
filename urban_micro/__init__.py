@@ -25,6 +25,7 @@ from .uhi import (
     effect_matrix_robust_report,
     effect_matrix_significance_report,
     effect_matrix_spatial_lag_report,
+    effect_matrix_spatiotemporal_report,
     effect_matrix_theilsen_report,
     effect_matrix_wilcoxon_report,
     effect_permutation_report,

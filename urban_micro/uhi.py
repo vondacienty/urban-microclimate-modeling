@@ -44,6 +44,7 @@ __all__ = [
     "effect_matrix_hotspot_report",
     "effect_matrix_wilcoxon_report",
     "effect_matrix_spatial_lag_report",
+    "effect_matrix_spatiotemporal_report",
     "ventilation_report",
     "vent_effect_report",
 ]
@@ -4816,6 +4817,202 @@ def effect_matrix_spatial_lag_report(
 
         return (
             '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_SPATIOTEMPORAL_MAX_N = 16
+
+
+def effect_matrix_spatiotemporal_report(
+    details: list,
+    neighbors: list,
+    *,
+    minutes: int = 60,
+    lag: int = 1,
+    z: float = 1.96,
+) -> str:
+    """Aggregate scenario deltas across lagged buckets along neighbor edges.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``neighbors`` is a list of ``(a, b)`` two-tuples
+    describing an undirected adjacency: ``a`` and ``b`` must be distinct
+    non-empty cell id strings occurring in ``details``; self-loops and
+    repeated edges (in either orientation) are illegal. ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440; ``lag`` must be a
+    positive non-boolean integer; ``z`` is a non-boolean finite number
+    greater than or equal to 0.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within each
+    bucket/cell pair are averaged, so every occupied ``(bucket, cell)`` pair
+    holds one mean delta ``d_{B, c}``. For each occupied bucket ``B`` the
+    neighbor edges are visited in lexicographic order ``(a, b)`` with
+    ``a < b``; an edge contributes a sample only when both endpoints have a
+    value at ``B`` and at the predecessor bucket
+    ``B - lag * minutes * 60``. The sample value is
+    ``x = (d_{B, a} - d_{B-lag, a}) - (d_{B, b} - d_{B-lag, b})``. Buckets
+    without any contributing edge are omitted; a bucket with more than 16
+    contributing edges raises ``ValueError``.
+
+    With the samples ``x`` and their count ``n``, ``mean = sum(x) / n`` and
+    ``se`` is 0 when ``n <= 1`` and
+    ``sqrt(sum((x - mean) ** 2) / (n * (n - 1)))`` otherwise. ``p`` is the
+    exact two-sided sign-flip p-value: all ``2 ** n`` sign vectors
+    ``s_i`` in ``{-1, 1}`` are enumerated and
+    ``p = 2 ** -n * #{|sum(s_i * x_i) / n| >= |mean|}``; the comparison is
+    decided on the unquantized values. ``lower``/``upper`` are
+    ``mean - z * se`` / ``mean + z * se``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, lag, z, groups`` and each group object uses the key
+    order ``key, n, mean, p, se, lower, upper`` with groups in ascending
+    bucket order. Bucket keys and ``n`` are integers; ``z`` and every
+    numeric result are rendered with exactly six decimals, negative zero
+    normalized to ``0.000000``. An empty ``details`` yields
+    ``{"minutes":60,"lag":1,"z":1.960000,"groups":[]}``. ``details`` or
+    ``neighbors`` not being a list raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(neighbors, list):
+        raise TypeError("neighbors must be a list")
+    minutes = _validate_minutes(minutes)
+    if isinstance(lag, bool) or not isinstance(lag, int):
+        raise ValueError("lag must be an integer")
+    if lag < 1:
+        raise ValueError("lag must be a positive integer")
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be non-negative")
+
+    parsed = _validate_detail_rows(details)
+
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    edges: set[tuple[str, str]] = set()
+    for item in neighbors:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each neighbor must be an (a, b) two-tuple")
+        endpoint_a, endpoint_b = item
+        for endpoint in (endpoint_a, endpoint_b):
+            if not isinstance(endpoint, str) or not endpoint:
+                raise ValueError(
+                    "neighbor endpoints must be non-empty cell id strings"
+                )
+            if endpoint not in cell_ids:
+                raise ValueError(f"unknown cell id in neighbor: {endpoint!r}")
+        if endpoint_a == endpoint_b:
+            raise ValueError("neighbor self-loops are not allowed")
+        edge = (
+            (endpoint_a, endpoint_b)
+            if endpoint_a < endpoint_b
+            else (endpoint_b, endpoint_a)
+        )
+        if edge in edges:
+            raise ValueError(f"duplicate neighbor edge: {edge!r}")
+        edges.add(edge)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (bucket start, cell_id) -> [delta sum, row count]
+        cells: dict[tuple[int, str], list] = {}
+        occupied_buckets: set[int] = set()
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                occupied_buckets.add(bucket)
+                acc = cells.setdefault((bucket, cell_id), [Decimal(0), 0])
+                acc[0] += delta
+                acc[1] += 1
+
+        means = {
+            key: total / count for key, (total, count) in cells.items()
+        }
+
+        step = lag * minutes * 60
+        # bucket -> list of sample x values, one per contributing edge
+        samples: dict[int, list[Decimal]] = {}
+        for bucket in occupied_buckets:
+            prev_bucket = bucket - step
+            bucket_samples: list[Decimal] = []
+            for a, b in sorted(edges):
+                if (
+                    (bucket, a) in means
+                    and (bucket, b) in means
+                    and (prev_bucket, a) in means
+                    and (prev_bucket, b) in means
+                ):
+                    delta_a = means[(bucket, a)] - means[(prev_bucket, a)]
+                    delta_b = means[(bucket, b)] - means[(prev_bucket, b)]
+                    bucket_samples.append(delta_a - delta_b)
+            if bucket_samples:
+                samples[bucket] = bucket_samples
+
+        groups = []
+        for bucket in sorted(samples):
+            values = samples[bucket]
+            n = len(values)
+            if n > _SPATIOTEMPORAL_MAX_N:
+                raise ValueError(
+                    f"bucket {bucket} has {n} contributing edges; spatiotemporal "
+                    f"report requires at most {_SPATIOTEMPORAL_MAX_N}"
+                )
+            total = Decimal(0)
+            for value in values:
+                total += value
+            mean = total / n
+
+            if n > 1:
+                squared = Decimal(0)
+                for value in values:
+                    deviation = value - mean
+                    squared += deviation * deviation
+                se = (squared / (n * (n - 1))).sqrt()
+            else:
+                se = Decimal(0)
+
+            # |sum(s_i * x_i) / n| >= |mean| is equivalent (n > 0) to
+            # |sum(s_i * x_i)| >= |sum(x_i)|; compare the raw sums so exact
+            # ties are decided without any division rounding.
+            hits = 0
+            for mask in range(1 << n):
+                signed_sum = Decimal(0)
+                for index, value in enumerate(values):
+                    if (mask >> index) & 1:
+                        signed_sum -= value
+                    else:
+                        signed_sum += value
+                if abs(signed_sum) >= abs(total):
+                    hits += 1
+            p_value = Decimal(hits) / Decimal(1 << n)
+
+            lower = mean - z_value * se
+            upper = mean + z_value * se
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"n":' + str(n)
+                + ',"mean":' + _format6(mean)
+                + ',"p":' + _format6(p_value)
+                + ',"se":' + _format6(se)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"lag":' + str(lag)
+            + ',"z":' + _format6(z_value)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
 
