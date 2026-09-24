@@ -1005,6 +1005,20 @@ def _format6(value: Decimal) -> str:
     return f"{quantized:.6f}"
 
 
+def _format6_exact(value: Decimal) -> str:
+    """Like :func:`_format6` but with a quantize context wide enough to hold
+    the full integer part, so finite values with arbitrarily many integer
+    digits render instead of raising ``InvalidOperation``."""
+    needed = value.adjusted() + 8 if not value.is_zero() else 8
+    with localcontext() as ctx:
+        ctx.prec = needed
+        ctx.rounding = ROUND_HALF_EVEN
+        quantized = value.quantize(_QUANT6, rounding=ROUND_HALF_EVEN)
+    if quantized == 0:
+        quantized = abs(quantized)
+    return f"{quantized:.6f}"
+
+
 def _effect_groups(
     details: list, by: str, minutes: int, z: float
 ) -> tuple[int, Decimal, list[tuple]]:
@@ -6527,9 +6541,9 @@ def effect_matrix_exposure_report(
                 cell_items.append(
                     '{"key":' + json.dumps(cell_id, ensure_ascii=False)
                     + ',"n":' + str(n)
-                    + ',"delta":"' + _format6(delta_mean) + '"'
-                    + ',"population":"' + _format6(pop_value) + '"'
-                    + ',"exposure":"' + _format6(exposure) + '"'
+                    + ',"delta":"' + _format6_exact(delta_mean) + '"'
+                    + ',"population":"' + _format6_exact(pop_value) + '"'
+                    + ',"exposure":"' + _format6_exact(exposure) + '"'
                     + '}'
                 )
             groups.append(
