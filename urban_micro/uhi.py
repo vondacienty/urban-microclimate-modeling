@@ -998,11 +998,19 @@ def attribute_effects(
 
 def _format6(value: Decimal) -> str:
     """Quantize to 6 decimals (ROUND_HALF_EVEN) and render with exactly six
-    fractional digits, normalizing negative zero to ``0.000000``."""
-    quantized = value.quantize(_QUANT6, rounding=ROUND_HALF_EVEN)
-    if quantized == 0:
-        quantized = abs(quantized)
-    return f"{quantized:.6f}"
+    fractional digits, normalizing negative zero to ``0.000000``.
+
+    Quantization runs under a context wide enough to hold the value's integer
+    digits (plus one for a rounding carry and six fractional ones), so finite
+    arbitrarily large integers never trigger ``InvalidOperation``."""
+    integer_digits = max(0, value.adjusted() + 1)
+    with localcontext() as ctx:
+        ctx.prec = max(_MODEL_PRECISION, integer_digits + 7)
+        ctx.rounding = ROUND_HALF_EVEN
+        quantized = value.quantize(_QUANT6, rounding=ROUND_HALF_EVEN)
+        if quantized == 0:
+            quantized = abs(quantized)
+        return f"{quantized:.6f}"
 
 
 def _effect_groups(
@@ -6499,28 +6507,44 @@ def effect_matrix_exposure_report(
         populations[cell_id] = pop_value
 
     with localcontext() as ctx:
-        ctx.prec = _MODEL_PRECISION
         ctx.rounding = ROUND_HALF_EVEN
 
         bucket_seconds = minutes * 60
-        # bucket start -> cell_id -> [delta sum, row count]
+        # bucket start -> cell_id -> [deltas..., ]: raw Decimals are stored
+        # unrounded; the arithmetic context is widened below so finite
+        # arbitrarily large integers keep every digit (the fixed precision
+        # of 1000 would otherwise truncate their low integer digits).
         buckets: dict[int, dict[str, list]] = {}
         for validated in parsed:
             timestamp, cell_id, delta = validated[0], validated[1], validated[4]
             if cell_id not in populations:
                 raise ValueError(f"missing population for cell id: {cell_id!r}")
             bucket = (timestamp // bucket_seconds) * bucket_seconds
-            acc = buckets.setdefault(bucket, {}).setdefault(
-                cell_id, [Decimal(0), 0]
+            buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(delta)
+
+        if parsed:
+            # Width in integer places, also correct for values stored in
+            # scientific notation such as Decimal("1E+308").
+            inputs = [validated[4] for validated in parsed]
+            inputs.extend(populations.values())
+            integer_places = max(
+                (max(0, value.adjusted() + 1) for value in inputs), default=0
             )
-            acc[0] += delta
-            acc[1] += 1
+            # A sum adds at most ceil(log10(n)) integer places and a product
+            # at most the two operands' worth; the guard keeps non-terminating
+            # divisions correctly rounded at six fractional places.
+            row_digits = len(str(len(parsed)))
+            ctx.prec = max(
+                _MODEL_PRECISION, integer_places * 2 + row_digits + 64
+            )
 
         groups = []
         for bucket in sorted(buckets):
             cell_items = []
             for cell_id in sorted(buckets[bucket]):
-                delta_total, n = buckets[bucket][cell_id]
+                deltas = buckets[bucket][cell_id]
+                n = len(deltas)
+                delta_total = sum(deltas, Decimal(0))
                 delta_mean = delta_total / n
                 pop_value = populations[cell_id]
                 exposure = delta_mean * pop_value
