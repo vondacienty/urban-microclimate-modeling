@@ -6446,3 +6446,98 @@ def energy_balance_report(records: list, *, minutes: int = 60) -> str:
             '{"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
+
+
+def effect_matrix_exposure_report(
+    details: list, population: dict, *, minutes: int = 60
+) -> str:
+    """Aggregate scenario deltas into a population-weighted exposure report.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``population`` is a mapping of non-empty cell id
+    strings to finite non-boolean int/float values greater than or equal to
+    0; every cell id occurring in ``details`` must be present. ``minutes``
+    must be a non-boolean integer in ``1..1440`` that divides 1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within
+    each ``(B, c)`` pair are averaged. Each cell also reports ``n`` the
+    number of detail rows in the pair, ``population`` the mapped value and
+    ``exposure = delta * population``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups``, each group object uses the key order
+    ``key, cells`` (groups in ascending bucket order) and each cell object
+    uses the key order ``key, n, delta, population, exposure`` with cells in
+    ascending cell id order. Bucket keys and ``n`` are integers and every
+    other numeric result is rendered with exactly six decimals, negative
+    zero normalized to ``0.000000``. An empty ``details`` yields
+    ``{"minutes":60,"groups":[]}``. ``details`` not being a list or
+    ``population`` not being a dict raises ``TypeError``; every other
+    contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(population, dict):
+        raise TypeError("population must be a dict")
+    minutes = _validate_minutes(minutes)
+
+    parsed = _validate_detail_rows(details)
+
+    populations: dict[str, Decimal] = {}
+    for cell_id, value in population.items():
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError("population keys must be non-empty cell id strings")
+        pop_value = _validate_finite_number(value, "population value")
+        if pop_value < 0:
+            raise ValueError("population values must be non-negative")
+        populations[cell_id] = pop_value
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # bucket start -> cell_id -> [delta sum, row count]
+        buckets: dict[int, dict[str, list]] = {}
+        for validated in parsed:
+            timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+            if cell_id not in populations:
+                raise ValueError(f"missing population for cell id: {cell_id!r}")
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            acc = buckets.setdefault(bucket, {}).setdefault(
+                cell_id, [Decimal(0), 0]
+            )
+            acc[0] += delta
+            acc[1] += 1
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                delta_total, n = buckets[bucket][cell_id]
+                delta_mean = delta_total / n
+                pop_value = populations[cell_id]
+                exposure = delta_mean * pop_value
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"delta":"' + _format6(delta_mean) + '"'
+                    + ',"population":"' + _format6(pop_value) + '"'
+                    + ',"exposure":"' + _format6(exposure) + '"'
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
