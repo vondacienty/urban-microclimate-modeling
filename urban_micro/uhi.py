@@ -6459,7 +6459,29 @@ def window_shift(
     minutes, lag_list, alpha_value, parsed, xmap = _lags_group_x_values(
         details, neighbors, lags, labels, minutes, alpha
     )
+    return _window_shift_report(
+        parsed, xmap, windows, minutes, lag_list, alpha_value, "window shift"
+    )
 
+
+def _window_shift_report(
+    parsed: list,
+    xmap: dict,
+    windows: dict,
+    minutes: int,
+    lag_list: list,
+    alpha_value: Decimal,
+    comparison_name: str,
+) -> str:
+    """Shared body of :func:`window_shift` and :func:`scenario_shift`.
+
+    ``parsed`` holds the validated detail rows used to derive the full
+    bucket set and ``xmap`` maps ``label -> lag -> bucket start`` to the
+    per-bucket value lists (for :func:`scenario_shift` the after-minus-
+    before ``e`` values). ``windows`` follows the :func:`window_compare`
+    contract and ``comparison_name`` is the phrase used in the
+    combined-size error message.
+    """
     if not isinstance(windows, dict):
         raise TypeError("windows must be a dict")
 
@@ -6523,7 +6545,7 @@ def window_shift(
                             raise ValueError(
                                 f"label {label!r} windows {window_a!r}/"
                                 f"{window_b!r} lag {lag} have {n_a}+{n_b} "
-                                f"values; window shift requires at most "
+                                f"values; {comparison_name} requires at most "
                                 f"{_SPATIOTEMPORAL_MAX_N} combined values per "
                                 f"comparison"
                             )
@@ -6640,6 +6662,112 @@ def window_shift(
             + ',"groups":[' + ",".join(groups) + ']}'
             + "\n"
         )
+
+
+def scenario_shift(
+    before: list,
+    after: list,
+    neighbors: list,
+    lags: list,
+    labels: dict,
+    windows: dict,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Compare after-minus-before neighbor-delta shifts between windows.
+
+    ``before`` and ``after`` are two scenario-detail tables, each following
+    the ``details`` contract of :func:`window_shift`, and both must share
+    exactly the same set of ``(timestamp, cell_id)`` pairs; a non-list
+    table raises ``TypeError`` and a key-set mismatch raises ``ValueError``.
+    ``neighbors``, ``lags``, ``labels``, ``windows``, ``minutes`` and
+    ``alpha`` follow exactly the same validation, bucketing, same-label
+    edge pairing, edge order and exception rules as :func:`window_shift`.
+
+    For each table the same ``x = Delta_a - Delta_b`` values as in
+    :func:`window_shift` are computed per ``(label, lag, B)`` triple and
+    paired element-wise (the identical key sets guarantee identical
+    pairings); the shift sample is ``e = x_after - x_before``. For each
+    label and lag, the ``e`` values are concatenated over each window's
+    buckets in ascending ``B`` order, themselves taken in ascending
+    same-label edge order. Two distinct windows with names ``a < b`` are
+    compared only when both concatenated samples are non-empty; with
+    ``n_a``/``n_b`` the two sample sizes, a comparison with
+    ``n_a + n_b > 16`` raises ``ValueError``. The statistic is
+    ``diff = mean(a) - mean(b)`` and ``p`` is the exact two-sided
+    permutation p-value: the pooled sample is enumerated over all
+    ``C(n_a + n_b, n_a)`` equal-size position assignments and
+    ``p = #{|diff'| >= |diff|} / C(n_a + n_b, n_a)``.
+
+    With ``N`` the total number of ``(label, a, b, lag)`` comparisons, all
+    comparisons are ranked ascending by ``(p, label, a, b, lag)`` and each
+    rank ``j`` (1-based) gets the Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    comparison; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``minutes, alpha, groups``, each group object
+    uses the key order ``key, comparisons`` (with ``key`` the label), each
+    comparison object the key order ``a, b, lags`` and each lag object the
+    key order ``lag, n_a, n_b, diff, p, q, reject``. Groups, comparisons
+    and lag objects are in ascending label, ``(a, b)`` and lag order
+    respectively; labels without any comparison are omitted and no
+    comparisons at all yields ``groups`` empty. Window names and labels
+    render as JSON strings, lags and sample sizes as integers, ``reject``
+    as a boolean and ``alpha``, ``diff``, ``p`` and ``q`` with exactly six
+    decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(before, list):
+        raise TypeError("before must be a list")
+    if not isinstance(after, list):
+        raise TypeError("after must be a list")
+    minutes, lag_list, alpha_value, parsed_before, xmap_before = (
+        _lags_group_x_values(before, neighbors, lags, labels, minutes, alpha)
+    )
+    _, _, _, parsed_after, xmap_after = _lags_group_x_values(
+        after, neighbors, lags, labels, minutes, alpha
+    )
+    keys_before = {(row[0], row[1]) for row in parsed_before}
+    keys_after = {(row[0], row[1]) for row in parsed_after}
+    if keys_before != keys_after:
+        raise ValueError(
+            "before and after must share the same (timestamp, cell_id) pairs"
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # Identical (timestamp, cell_id) key sets make the two xmaps
+        # structurally identical, so the per-(label, lag, B) value lists
+        # pair up element-wise in the same ascending edge order.
+        emap: dict[str, dict[int, dict[int, list[Decimal]]]] = {}
+        for label in sorted(xmap_before):
+            lag_map: dict[int, dict[int, list[Decimal]]] = {}
+            for lag in lag_list:
+                before_buckets = xmap_before[label].get(lag, {})
+                after_buckets = xmap_after[label].get(lag, {})
+                bucket_map: dict[int, list[Decimal]] = {}
+                for bucket in sorted(before_buckets):
+                    before_values = before_buckets[bucket]
+                    after_values = after_buckets[bucket]
+                    bucket_map[bucket] = [
+                        after_value - before_value
+                        for after_value, before_value in zip(
+                            after_values, before_values
+                        )
+                    ]
+                lag_map[lag] = bucket_map
+            emap[label] = lag_map
+
+    return _window_shift_report(
+        parsed_before, emap, windows, minutes, lag_list, alpha_value,
+        "scenario shift",
+    )
 
 
 _TEMPORAL_LAG_MAX_N = 8
