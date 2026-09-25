@@ -38,6 +38,7 @@ __all__ = [
     "effect_matrix_lags_group_compare_report",
     "window_compare",
     "window_shift",
+    "scenario_shift",
     "effect_matrix_permutation_report",
     "effect_matrix_trimmed_report",
     "effect_matrix_robust_report",
@@ -5661,30 +5662,30 @@ def effect_matrix_lags_fdr_report(
 
 
 def _lags_group_x_values(
-    details: list,
     neighbors: list,
     lags: list,
     labels: dict,
     minutes: int,
     alpha: float,
-) -> tuple[int, list[int], Decimal, list, dict]:
+    parsed: list,
+    cell_ids: set[str],
+) -> tuple[int, list[int], Decimal, dict]:
     """Validate the shared lags/group inputs and compute same-label x values.
 
     This is the common core of :func:`effect_matrix_lags_group_fdr_report`
-    and :func:`effect_matrix_lags_group_compare_report`. Returns
-    ``(minutes, lags, alpha, parsed, xmap)`` where ``lags`` is the sorted
-    list of distinct lags, ``alpha`` the validated alpha as a ``Decimal``,
-    ``parsed`` the validated detail rows and ``xmap`` maps
-    ``label -> lag -> bucket start -> [x, ...]`` holding only non-empty
-    same-label edge pairings (``x = Delta_a - Delta_b`` as in
+    and :func:`effect_matrix_lags_group_compare_report`, with the detail
+    rows already validated (``parsed`` rows and their ``cell_ids`` supplied
+    by the caller). Returns ``(minutes, lags, alpha, xmap)`` where ``lags``
+    is the sorted list of distinct lags, ``alpha`` the validated alpha as a
+    ``Decimal`` and ``xmap`` maps ``label -> lag -> bucket start -> [x, ...]``
+    holding only non-empty same-label edge pairings
+    (``x = Delta_a - Delta_b`` as in
     :func:`effect_matrix_lags_fdr_report`, edges in lexicographic order).
     All Decimal work runs under a precision-1000, ROUND_HALF_EVEN local
-    context. ``details``, ``neighbors`` or ``lags`` not being a list, or
-    ``labels`` not being a dict, raises ``TypeError``; every other contract
-    violation raises ``ValueError``.
+    context. ``neighbors`` or ``lags`` not being a list, or ``labels`` not
+    being a dict, raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
     """
-    if not isinstance(details, list):
-        raise TypeError("details must be a list")
     if not isinstance(neighbors, list):
         raise TypeError("neighbors must be a list")
     if not isinstance(lags, list):
@@ -5703,11 +5704,8 @@ def _lags_group_x_values(
     if alpha_value <= 0 or alpha_value > 1:
         raise ValueError("alpha must be greater than 0 and at most 1")
 
-    parsed = _validate_detail_rows(details)
-
     if not isinstance(labels, dict):
         raise TypeError("labels must be a dict")
-    cell_ids = {cell_id for _, cell_id, *_ in parsed}
     if set(labels) != cell_ids:
         raise ValueError("labels keys must be exactly the details cell ids")
     for cell_id, label in labels.items():
@@ -5798,7 +5796,7 @@ def _lags_group_x_values(
                 lag_map[lag] = bucket_map
             xmap[label] = lag_map
 
-    return minutes, sorted(seen_lags), alpha_value, parsed, xmap
+    return minutes, sorted(seen_lags), alpha_value, xmap
 
 
 def effect_matrix_lags_group_fdr_report(
@@ -5847,8 +5845,12 @@ def effect_matrix_lags_group_fdr_report(
     ``{"minutes":60,"alpha":0.050000,"groups":[]}`` (plus the trailing
     newline).
     """
-    minutes, lag_list, alpha_value, parsed, xmap = _lags_group_x_values(
-        details, neighbors, lags, labels, minutes, alpha
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    parsed = _validate_detail_rows(details)
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    minutes, lag_list, alpha_value, xmap = _lags_group_x_values(
+        neighbors, lags, labels, minutes, alpha, parsed, cell_ids
     )
 
     with localcontext() as ctx:
@@ -6016,8 +6018,12 @@ def effect_matrix_lags_group_compare_report(
     any comparison yields ``{"minutes":60,"alpha":0.050000,"groups":[]}``
     (plus the trailing newline).
     """
-    minutes, lag_list, alpha_value, parsed, xmap = _lags_group_x_values(
-        details, neighbors, lags, labels, minutes, alpha
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    parsed = _validate_detail_rows(details)
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    minutes, lag_list, alpha_value, xmap = _lags_group_x_values(
+        neighbors, lags, labels, minutes, alpha, parsed, cell_ids
     )
 
     with localcontext() as ctx:
@@ -6216,8 +6222,12 @@ def window_compare(
     ``q`` with exactly six decimals, negative zero normalized to
     ``0.000000``.
     """
-    minutes, lag_list, alpha_value, parsed, xmap = _lags_group_x_values(
-        details, neighbors, lags, labels, minutes, alpha
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    parsed = _validate_detail_rows(details)
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    minutes, lag_list, alpha_value, xmap = _lags_group_x_values(
+        neighbors, lags, labels, minutes, alpha, parsed, cell_ids
     )
 
     if not isinstance(windows, dict):
@@ -6456,8 +6466,12 @@ def window_shift(
     a boolean and ``alpha``, ``diff``, ``p`` and ``q`` with exactly six
     decimals, negative zero normalized to ``0.000000``.
     """
-    minutes, lag_list, alpha_value, parsed, xmap = _lags_group_x_values(
-        details, neighbors, lags, labels, minutes, alpha
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    parsed = _validate_detail_rows(details)
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    minutes, lag_list, alpha_value, xmap = _lags_group_x_values(
+        neighbors, lags, labels, minutes, alpha, parsed, cell_ids
     )
 
     if not isinstance(windows, dict):
@@ -6591,6 +6605,303 @@ def window_shift(
 
         groups = []
         if parsed:
+            for label in sorted(grouped):
+                comparison_items = []
+                for window_a, window_b in sorted(grouped[label]):
+                    lag_items = []
+                    for lag in lag_list:
+                        record = grouped[label][(window_a, window_b)].get(lag)
+                        if record is None:
+                            continue
+                        (
+                            _,
+                            _,
+                            _,
+                            record_lag,
+                            n_a,
+                            n_b,
+                            diff,
+                            p_value,
+                            q_value,
+                        ) = record
+                        reject = q_value <= alpha_value
+                        lag_items.append(
+                            '{"lag":' + str(record_lag)
+                            + ',"n_a":' + str(n_a)
+                            + ',"n_b":' + str(n_b)
+                            + ',"diff":' + _format6(diff)
+                            + ',"p":' + _format6(p_value)
+                            + ',"q":' + _format6(q_value)
+                            + ',"reject":' + ("true" if reject else "false")
+                            + '}'
+                        )
+                    if lag_items:
+                        comparison_items.append(
+                            '{"a":' + json.dumps(window_a, ensure_ascii=False)
+                            + ',"b":' + json.dumps(window_b, ensure_ascii=False)
+                            + ',"lags":[' + ",".join(lag_items) + ']}'
+                        )
+                if comparison_items:
+                    groups.append(
+                        '{"key":' + json.dumps(label, ensure_ascii=False)
+                        + ',"comparisons":['
+                        + ",".join(comparison_items) + ']}'
+                    )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+            + "\n"
+        )
+
+
+def scenario_shift(
+    before: list,
+    after: list,
+    neighbors: list,
+    lags: list,
+    labels: dict,
+    windows: dict,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Compare windowed same-label neighbor-delta samples between two scenarios.
+
+    ``before`` and ``after`` are two scenario-detail tables following exactly
+    the same list-of-eight-tuples contract as ``details`` in
+    :func:`window_shift` (and :func:`effect_matrix_compare_report`): the
+    ``(timestamp, cell_id)`` pairs within each table must be unique and the
+    two tables must share exactly the same set of pairs; a non-list table
+    raises ``TypeError`` and any row, uniqueness or key-set mismatch raises
+    ``ValueError``.
+
+    ``neighbors``, ``lags``, ``labels``, ``windows``, ``minutes`` and
+    ``alpha`` follow exactly the same validation, bucketing, same-label edge
+    pairing, window concatenation and ordering rules as in
+    :func:`window_shift`; in particular ``windows`` keys must be exactly the
+    bucket starts derived from the (common) timestamps under ``minutes``.
+
+    For every shared ``(t, c)`` pair the per-row scenario shift is
+    ``e(t, c) = delta_after(t, c) - delta_before(t, c)``. For each lag and
+    same-label edge ``(a, b)`` with both cells present in buckets ``B`` and
+    ``B - lag * minutes * 60``, define
+    ``x = (dB, a - dB-lag, a) - (dB, b - dB-lag, b)`` on each table and take
+    ``e = x_after - x_before`` (equivalently the same expression built from
+    the per-row ``e`` values); these are gathered by label, window and lag
+    exactly as in :func:`window_shift`. Two distinct windows ``a < b`` are
+    compared for the same label only when both concatenated samples are
+    non-empty; ``n_a + n_b > 16`` raises ``ValueError``. The statistic is
+    ``diff = mean(a) - mean(b)`` and ``p`` is the exact two-sided permutation
+    p-value over all ``C(n_a + n_b, n_a)`` equal-size pooled position
+    assignments, ``p = #{|diff'| >= |diff|} / C(n_a + n_b, n_a)``.
+
+    With ``N`` the total number of ``(label, a, b, lag)`` comparisons, all
+    comparisons are ranked ascending by ``(p, label, a, b, lag)`` and each
+    rank ``j`` (1-based) gets the Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    comparison; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``minutes, alpha, groups``, each group object
+    uses the key order ``key, comparisons`` (with ``key`` the label), each
+    comparison object the key order ``a, b, lags`` and each lag object the
+    key order ``lag, n_a, n_b, diff, p, q, reject``. Groups, comparisons
+    and lag objects are in ascending label, ``(a, b)`` and lag order
+    respectively; labels without any comparison are omitted and no
+    comparisons at all yields ``groups`` empty. Window names and labels
+    render as JSON strings, lags and sample sizes as integers, ``reject`` as
+    a boolean and ``alpha``, ``diff``, ``p`` and ``q`` with exactly six
+    decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(before, list):
+        raise TypeError("before must be a list")
+    if not isinstance(after, list):
+        raise TypeError("after must be a list")
+
+    before_rows = _validate_detail_rows(before)
+    after_rows = _validate_detail_rows(after)
+
+    before_map = {(row[0], row[1]): row for row in before_rows}
+    after_map = {(row[0], row[1]): row for row in after_rows}
+    before_keys = set(before_map)
+    after_keys = set(after_map)
+    if before_keys != after_keys:
+        missing = sorted(
+            before_keys - after_keys, key=lambda key: (key[0], key[1])
+        )
+        extra = sorted(
+            after_keys - before_keys, key=lambda key: (key[0], key[1])
+        )
+        if missing:
+            raise ValueError(f"key missing from after: {missing[0]!r}")
+        raise ValueError(f"key missing from before: {extra[0]!r}")
+
+    cell_ids = {cell_id for _timestamp, cell_id in before_keys}
+
+    # Feed the shared window_shift machinery a synthetic scenario table
+    # whose delta field is the per-row scenario shift
+    # ``e = delta_after - delta_before``; every later step is linear, so the
+    # x values built from this table equal ``x_after - x_before``.
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+        shifted: list[tuple] = []
+        for key in sorted(before_keys):
+            before_row = before_map[key]
+            after_row = after_map[key]
+            shifted.append(
+                (
+                    before_row[0],
+                    before_row[1],
+                    before_row[2],
+                    before_row[3],
+                    after_row[4] - before_row[4],
+                    before_row[5],
+                    before_row[6],
+                    before_row[7],
+                )
+            )
+
+    minutes, lag_list, alpha_value, xmap = _lags_group_x_values(
+        neighbors, lags, labels, minutes, alpha, shifted, cell_ids
+    )
+
+    if not isinstance(windows, dict):
+        raise TypeError("windows must be a dict")
+
+    # The full bucket set is the set of bucket starts that the shared
+    # ``(timestamp, cell_id)`` pairs fall into under ``minutes``, whether or
+    # not any lag pairing exists there.
+    all_buckets: set[int] = set()
+    if shifted:
+        bucket_seconds = minutes * 60
+        for validated in shifted:
+            timestamp = validated[0]
+            all_buckets.add((timestamp // bucket_seconds) * bucket_seconds)
+    if set(windows) != all_buckets:
+        raise ValueError(
+            "windows keys must be exactly the details-derived bucket starts"
+        )
+    for bucket, name in windows.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("each window name must be a non-empty string")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # label -> window -> lag -> concatenated [e, ...] over the window's
+        # buckets in ascending B order (each bucket's values already in
+        # ascending edge order).
+        label_window_samples: dict[
+            str, dict[str, dict[int, list[Decimal]]]
+        ] = {}
+        for bucket in sorted(all_buckets):
+            name = windows[bucket]
+            for label in sorted(xmap):
+                window_map = label_window_samples.setdefault(label, {})
+                lag_map = window_map.setdefault(name, {})
+                for lag in lag_list:
+                    values = xmap[label].get(lag, {}).get(bucket)
+                    if values:
+                        lag_map.setdefault(lag, []).extend(values)
+
+        # One record per emitted (label, a, b, lag) comparison:
+        # ``[label, a, b, lag, n_a, n_b, diff, p, q]`` with q filled in
+        # below.
+        grouped: dict[str, dict[tuple[str, str], dict[int, list]]] = {}
+        records: list[list] = []
+        for label in sorted(label_window_samples):
+            pair_groups: dict[tuple[str, str], dict[int, list]] = {}
+            window_map = label_window_samples[label]
+            window_names = sorted(window_map)
+            for index_a, window_a in enumerate(window_names):
+                for window_b in window_names[index_a + 1:]:
+                    lag_groups: dict[int, list] = {}
+                    for lag in lag_list:
+                        sample_a = window_map[window_a].get(lag)
+                        sample_b = window_map[window_b].get(lag)
+                        if not sample_a or not sample_b:
+                            continue
+                        n_a = len(sample_a)
+                        n_b = len(sample_b)
+                        if n_a + n_b > _SPATIOTEMPORAL_MAX_N:
+                            raise ValueError(
+                                f"label {label!r} windows {window_a!r}/"
+                                f"{window_b!r} lag {lag} have {n_a}+{n_b} "
+                                f"values; scenario shift requires at most "
+                                f"{_SPATIOTEMPORAL_MAX_N} combined values per "
+                                f"comparison"
+                            )
+
+                        sum_a = Decimal(0)
+                        for value in sample_a:
+                            sum_a += value
+                        sum_b = Decimal(0)
+                        for value in sample_b:
+                            sum_b += value
+                        diff = sum_a / n_a - sum_b / n_b
+
+                        # |s_a'/n_a - s_b'/n_b| >= |diff| is equivalent
+                        # (n_a, n_b > 0) to
+                        # |s_a'*n_b - s_b'*n_a| >= |sum_a*n_b - sum_b*n_a|;
+                        # compare the scaled sums so exact ties are decided
+                        # without any division rounding.
+                        threshold = abs(sum_a * n_b - sum_b * n_a)
+                        pooled = sample_a + sample_b
+                        pooled_sum = sum_a + sum_b
+                        assignments = math.comb(n_a + n_b, n_a)
+                        hits = 0
+                        for combo in combinations(range(n_a + n_b), n_a):
+                            perm_a = Decimal(0)
+                            for position in combo:
+                                perm_a += pooled[position]
+                            perm_b = pooled_sum - perm_a
+                            if abs(perm_a * n_b - perm_b * n_a) >= threshold:
+                                hits += 1
+                        p_value = Decimal(hits) / Decimal(assignments)
+
+                        record = [
+                            label, window_a, window_b, lag,
+                            n_a, n_b, diff, p_value, None,
+                        ]
+                        lag_groups[lag] = record
+                        records.append(record)
+                    if lag_groups:
+                        pair_groups[(window_a, window_b)] = lag_groups
+            if pair_groups:
+                grouped[label] = pair_groups
+
+        # Benjamini-Hochberg q-values across ALL (label, a, b, lag)
+        # comparisons: rank ascending by (p, label, a, b, lag), then
+        # accumulate the running minimum of N * p_l / l from the top rank
+        # down, mapping q back.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (
+                records[idx][7],
+                records[idx][0],
+                records[idx][1],
+                records[idx][2],
+                records[idx][3],
+            ),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate = Decimal(count) * records[idx][7] / rank
+            if candidate < running:
+                running = candidate
+            records[idx][8] = running
+
+        groups = []
+        if shifted:
             for label in sorted(grouped):
                 comparison_items = []
                 for window_a, window_b in sorted(grouped[label]):
