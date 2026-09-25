@@ -6459,6 +6459,139 @@ def energy_balance_report(records: list, *, minutes: int = 60) -> str:
         )
 
 
+def energy_balance_scenario_report(
+    records: list, actions: list, *, minutes: int = 60
+) -> str:
+    """Aggregate energy-balance rows with per-cell actions into a time-bucket
+    x cell scenario report.
+
+    ``records`` follows the same ``(timestamp, cell_id, net_rad, sensible,
+    latent, storage)`` six-tuple contract as :func:`energy_balance_report`,
+    including unique ``(timestamp, cell_id)`` pairs. ``actions`` is a list of
+    strict ``(cell_id, d_net_rad, d_sensible, d_latent, d_storage)``
+    five-tuples: ``cell_id`` must occur in ``records``, each cell id may be
+    targeted by at most one action and the four increments must be finite
+    non-boolean int/float values. ``minutes`` must be a non-boolean integer in
+    ``1..1440`` that divides 1440.
+
+    Rows are bucketed as in :func:`energy_balance_report` and the four
+    quantities averaged within each ``(B, cell_id)`` pair. The base residual
+    is ``net_rad - sensible - latent - storage``; the action targeting the
+    cell (zero increments when absent) yields
+    ``post_residual = base_residual + d_net_rad - d_sensible - d_latent
+    - d_storage`` and ``delta_residual = post_residual - base_residual``.
+    ``n_actions`` is 1 for cells with an action and 0 otherwise.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups``, each group object uses the key order
+    ``key, cells`` (groups in ascending bucket order) and each cell object
+    uses the key order ``key, n, n_actions, base_residual, post_residual,
+    delta_residual`` with cells in ascending cell id order. Bucket keys,
+    ``n`` and ``n_actions`` are integers and the three residuals are rendered
+    as fixed six-decimal strings, negative zero normalized to ``0.000000``.
+    An empty ``records`` yields ``{"minutes":60,"groups":[]}``. ``records`` or
+    ``actions`` not being a list raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(records, list):
+        raise TypeError("records must be a list")
+    if not isinstance(actions, list):
+        raise TypeError("actions must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in records:
+        validated = _validate_energy_balance_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    cell_ids = {validated[1] for validated in parsed}
+
+    zero = Decimal(0)
+    action_map: dict[str, tuple[Decimal, Decimal, Decimal, Decimal]] = {}
+    for action in actions:
+        if not isinstance(action, tuple) or len(action) != 5:
+            raise ValueError(
+                "each action must be a (cell_id, d_net_rad, d_sensible,"
+                " d_latent, d_storage) five-tuple"
+            )
+        cell_id, d_net_rad, d_sensible, d_latent, d_storage = action
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError("action cell_id must be a non-empty string")
+        if cell_id not in cell_ids:
+            raise ValueError(
+                f"action cell {cell_id!r} is not present in records"
+            )
+        if cell_id in action_map:
+            raise ValueError(f"duplicate action for cell {cell_id!r}")
+        action_map[cell_id] = (
+            _validate_finite_number(d_net_rad, "d_net_rad"),
+            _validate_finite_number(d_sensible, "d_sensible"),
+            _validate_finite_number(d_latent, "d_latent"),
+            _validate_finite_number(d_storage, "d_storage"),
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # bucket start -> cell_id -> list of (net_rad, sensible, latent,
+        # storage)
+        buckets: dict[int, dict[str, list[tuple[Decimal, ...]]]] = {}
+        for timestamp, cell_id, net_rad, sensible, latent, storage in parsed:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(
+                (net_rad, sensible, latent, storage)
+            )
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                rows = buckets[bucket][cell_id]
+                n = len(rows)
+                sums = [Decimal(0), Decimal(0), Decimal(0), Decimal(0)]
+                for values in rows:
+                    for index in range(4):
+                        sums[index] += values[index]
+                net_rad = sums[0] / n
+                sensible = sums[1] / n
+                latent = sums[2] / n
+                storage = sums[3] / n
+                base = net_rad - sensible - latent - storage
+                d_net_rad, d_sensible, d_latent, d_storage = action_map.get(
+                    cell_id, (zero, zero, zero, zero)
+                )
+                n_actions = 1 if cell_id in action_map else 0
+                post = base + d_net_rad - d_sensible - d_latent - d_storage
+                delta = post - base
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"n_actions":' + str(n_actions)
+                    + ',"base_residual":"' + _format6(base) + '"'
+                    + ',"post_residual":"' + _format6(post) + '"'
+                    + ',"delta_residual":"' + _format6(delta) + '"'
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
 def effect_matrix_exposure_report(
     details: list, population: dict, *, minutes: int = 60
 ) -> str:
