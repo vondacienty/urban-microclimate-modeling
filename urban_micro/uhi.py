@@ -36,6 +36,7 @@ __all__ = [
     "effect_matrix_lags_fdr_report",
     "effect_matrix_lags_group_fdr_report",
     "effect_matrix_lags_group_compare_report",
+    "window_compare",
     "effect_matrix_permutation_report",
     "effect_matrix_trimmed_report",
     "effect_matrix_robust_report",
@@ -6146,6 +6147,250 @@ def effect_matrix_lags_group_compare_report(
                         '{"a":' + json.dumps(label_a, ensure_ascii=False)
                         + ',"b":' + json.dumps(label_b, ensure_ascii=False)
                         + ',"lags":[' + ",".join(lag_items) + ']}'
+                    )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+            + "\n"
+        )
+
+
+def window_compare(
+    details: list,
+    neighbors: list,
+    lags: list,
+    labels: dict,
+    windows: dict,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Compare same-label neighbor-delta groups pairwise within time windows.
+
+    This is the windowed counterpart of
+    :func:`effect_matrix_lags_group_compare_report`: ``details``,
+    ``neighbors``, ``lags``, ``labels``, ``minutes`` and ``alpha`` follow
+    exactly the same validation, bucketing and same-label edge pairing
+    rules, so each ``(label, lag, B)`` triple yields the same list of ``x``
+    values in lexicographic edge order. ``details``, ``neighbors`` or
+    ``lags`` not being a list, or ``labels`` or ``windows`` not being a
+    dict, raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+
+    ``windows`` must be a dict whose keys are exactly the bucket starts
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)`` derived from all
+    ``details`` rows and whose values are non-empty strings naming the
+    window each bucket belongs to; buckets sharing a window name form one
+    window. For every ``(window, label, lag)`` the sample is the
+    concatenation of the label's ``x`` values over the window's buckets in
+    ascending ``B`` order (edges ascending within each bucket).
+
+    Distinct labels are compared pairwise with ``a < b`` within each
+    window; a comparison is emitted for a ``(window, a, b, lag)`` only when
+    both samples are non-empty. With ``n_a``/``n_b`` the two sample sizes,
+    a comparison with ``n_a + n_b > 16`` raises ``ValueError``. The
+    statistic is ``diff = mean(a) - mean(b)`` and ``p`` is the exact
+    two-sided permutation p-value: the pooled sample is enumerated over
+    all ``C(n_a + n_b, n_a)`` position assignments and
+    ``p = #{|diff'| >= |diff|} / C(n_a + n_b, n_a)``.
+
+    With ``N`` the total number of ``(window, a, b, lag)`` comparisons, all
+    comparisons are ranked globally ascending by ``(p, window, a, b, lag)``
+    and each rank ``j`` (1-based) gets the Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    comparison; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``minutes, alpha, groups``, each group object
+    uses the key order ``key, comparisons`` (with ``key`` the window
+    name), each comparison object the key order ``a, b, lags`` and each lag
+    object the key order ``lag, n_a, n_b, diff, p, q, reject``. Groups,
+    comparisons and lag objects are in ascending window name, ``(a, b)``
+    and lag order respectively; windows and pairs without any comparison
+    are omitted. Window names and labels render as JSON strings, lags and
+    sample sizes as integers, ``reject`` as a boolean and ``alpha``,
+    ``diff``, ``p`` and ``q`` with exactly six decimals, negative zero
+    normalized to ``0.000000``. An empty ``details``, an empty ``lags`` or
+    the absence of any comparison yields
+    ``{"minutes":60,"alpha":0.050000,"groups":[]}`` (plus the trailing
+    newline).
+    """
+    if not isinstance(windows, dict):
+        raise TypeError("windows must be a dict")
+
+    minutes, lag_list, alpha_value, parsed, xmap = _lags_group_x_values(
+        details, neighbors, lags, labels, minutes, alpha
+    )
+
+    bucket_seconds = minutes * 60
+    bucket_set = {
+        (row[0] // bucket_seconds) * bucket_seconds for row in parsed
+    }
+    if set(windows) != bucket_set:
+        raise ValueError(
+            "windows keys must be exactly the minutes-derived bucket starts "
+            "occurring in details"
+        )
+    for window_name in windows.values():
+        if not isinstance(window_name, str) or not window_name:
+            raise ValueError("each window name must be a non-empty string")
+
+    # window name -> member bucket starts in ascending B order
+    window_buckets: dict[str, list[int]] = {}
+    for bucket in sorted(bucket_set):
+        window_buckets.setdefault(windows[bucket], []).append(bucket)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # One record per emitted (window, a, b, lag) comparison:
+        # ``[window, a, b, lag, n_a, n_b, diff, p, q]`` with q filled in
+        # below.
+        grouped: dict[str, dict[tuple[str, str], dict[int, list]]] = {}
+        records: list[list] = []
+        for window_name in sorted(window_buckets):
+            starts = window_buckets[window_name]
+
+            # label -> lag -> x values concatenated in ascending (B, edge)
+            # order, omitting empty samples.
+            samples: dict[str, dict[int, list[Decimal]]] = {}
+            for label in xmap:
+                per_lag: dict[int, list[Decimal]] = {}
+                for lag in lag_list:
+                    joined: list[Decimal] = []
+                    bucket_map = xmap[label].get(lag, {})
+                    for bucket in starts:
+                        paired = bucket_map.get(bucket)
+                        if paired:
+                            joined.extend(paired)
+                    if joined:
+                        per_lag[lag] = joined
+                if per_lag:
+                    samples[label] = per_lag
+
+            pair_groups: dict[tuple[str, str], dict[int, list]] = {}
+            active_labels = sorted(samples)
+            for index_a, label_a in enumerate(active_labels):
+                for label_b in active_labels[index_a + 1:]:
+                    per_lag_records: dict[int, list] = {}
+                    for lag in lag_list:
+                        sample_a = samples[label_a].get(lag)
+                        sample_b = samples[label_b].get(lag)
+                        if not sample_a or not sample_b:
+                            continue
+                        n_a = len(sample_a)
+                        n_b = len(sample_b)
+                        if n_a + n_b > _SPATIOTEMPORAL_MAX_N:
+                            raise ValueError(
+                                f"window {window_name!r} labels "
+                                f"{label_a!r}/{label_b!r} lag {lag} have "
+                                f"{n_a}+{n_b} values; window compare requires "
+                                f"at most {_SPATIOTEMPORAL_MAX_N} combined "
+                                f"values per comparison"
+                            )
+
+                        sum_a = Decimal(0)
+                        for value in sample_a:
+                            sum_a += value
+                        sum_b = Decimal(0)
+                        for value in sample_b:
+                            sum_b += value
+                        diff = sum_a / n_a - sum_b / n_b
+
+                        # |s_a'/n_a - s_b'/n_b| >= |diff| is equivalent
+                        # (n_a, n_b > 0) to
+                        # |s_a'*n_b - s_b'*n_a| >= |sum_a*n_b - sum_b*n_a|;
+                        # compare the scaled sums so exact ties are decided
+                        # without any division rounding.
+                        threshold = abs(sum_a * n_b - sum_b * n_a)
+                        pooled = sample_a + sample_b
+                        pooled_sum = sum_a + sum_b
+                        assignments = math.comb(n_a + n_b, n_a)
+                        hits = 0
+                        for combo in combinations(range(n_a + n_b), n_a):
+                            perm_a = Decimal(0)
+                            for position in combo:
+                                perm_a += pooled[position]
+                            perm_b = pooled_sum - perm_a
+                            if abs(perm_a * n_b - perm_b * n_a) >= threshold:
+                                hits += 1
+                        p_value = Decimal(hits) / Decimal(assignments)
+
+                        record = [
+                            window_name, label_a, label_b, lag,
+                            n_a, n_b, diff, p_value, None,
+                        ]
+                        per_lag_records[lag] = record
+                        records.append(record)
+                    if per_lag_records:
+                        pair_groups[(label_a, label_b)] = per_lag_records
+            if pair_groups:
+                grouped[window_name] = pair_groups
+
+        # Benjamini-Hochberg q-values across ALL (window, a, b, lag)
+        # comparisons: rank ascending by (p, window, a, b, lag), then
+        # accumulate the running minimum of N * p_l / l from the top rank
+        # down, mapping q back.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (
+                records[idx][7],
+                records[idx][0],
+                records[idx][1],
+                records[idx][2],
+                records[idx][3],
+            ),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate = Decimal(count) * records[idx][7] / rank
+            if candidate < running:
+                running = candidate
+            records[idx][8] = running
+
+        groups = []
+        if parsed:
+            for window_name in sorted(grouped):
+                comparisons = []
+                for label_a, label_b in sorted(grouped[window_name]):
+                    lag_items = []
+                    for lag in lag_list:
+                        record = grouped[window_name][(label_a, label_b)].get(
+                            lag
+                        )
+                        if record is None:
+                            continue
+                        n_a, n_b = record[4], record[5]
+                        diff, p_value, q_value = record[6], record[7], record[8]
+                        reject = q_value <= alpha_value
+                        lag_items.append(
+                            '{"lag":' + str(lag)
+                            + ',"n_a":' + str(n_a)
+                            + ',"n_b":' + str(n_b)
+                            + ',"diff":' + _format6(diff)
+                            + ',"p":' + _format6(p_value)
+                            + ',"q":' + _format6(q_value)
+                            + ',"reject":' + ("true" if reject else "false")
+                            + '}'
+                        )
+                    if lag_items:
+                        comparisons.append(
+                            '{"a":' + json.dumps(label_a, ensure_ascii=False)
+                            + ',"b":' + json.dumps(label_b, ensure_ascii=False)
+                            + ',"lags":[' + ",".join(lag_items) + ']}'
+                        )
+                if comparisons:
+                    groups.append(
+                        '{"key":' + json.dumps(window_name, ensure_ascii=False)
+                        + ',"comparisons":[' + ",".join(comparisons) + ']}'
                     )
 
         return (

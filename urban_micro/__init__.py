@@ -61,10 +61,12 @@ from .uhi import (
     surface_thermal_report,
     surface_thermal_scenario_report,
     surface_thermal_zone_scenario_report,
+    surface_thermal_zone_scenario_report,
     temperature_fusion_report,
     temperature_fusion_uhi_report,
     vent_effect_report,
     ventilation_report,
+    window_compare,
 )
 
 __version__ = "0.1.0"
@@ -135,4 +137,5 @@ __all__ = [
     "temperature_fusion_uhi_report",
     "vent_effect_report",
     "ventilation_report",
+    "window_compare",
 ]
