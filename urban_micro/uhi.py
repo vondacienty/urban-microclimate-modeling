@@ -51,6 +51,7 @@ __all__ = [
     "microclimate_coupling_report",
     "microclimate_coupling_uhi_report",
     "microclimate_coupling_trend_report",
+    "microclimate_coupling_trend_significance_report",
     "vent_effect_report",
     "effect_matrix_ventilation_effect_report",
     "effect_matrix_cluster_report",
@@ -6223,6 +6224,195 @@ def microclimate_coupling_trend_report(
         return (
             '{"minutes":' + str(minutes)
             + ',"min_points":' + str(min_points)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+_TREND_SIGNIFICANCE_MAX_POINTS = 8
+
+
+def microclimate_coupling_trend_significance_report(
+    rows: list,
+    zones: dict,
+    *,
+    minutes: int = 60,
+    min_points: int = 3,
+    z: float = 1.96,
+) -> str:
+    """Fit a UHI coupling trend and assess its significance via permutation.
+
+    ``rows`` is a list of mappings, each with exactly the keys ``timestamp``,
+    ``cell_id``, ``residual``, ``temp``, ``wind_u``, ``wind_v``, ``height``
+    and ``density``: ``timestamp`` must be a non-boolean non-negative
+    integer, ``cell_id`` a non-empty string and the other six fields finite
+    non-boolean int/float values with ``height >= 0`` and
+    ``0 <= density <= 1``. ``(timestamp, cell_id)`` pairs must be unique.
+    ``zones`` maps non-empty grid cell ID strings to ``'urban'`` or
+    ``'rural'``; its keys must be exactly the cell IDs occurring in ``rows``
+    and both classes must be non-empty. ``minutes`` must be a non-boolean
+    integer in ``1..1440`` that divides 1440, ``min_points`` a non-boolean
+    integer in ``3..8`` and ``z`` a finite non-boolean int/float greater
+    than or equal to 0.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)``. Within each
+    ``(B, c)`` pair the six fields are averaged (means ``r``, ``x``, ``u``,
+    ``v``, ``h`` and ``d`` below) and the cell coupling is
+    ``q = r * x * sqrt(u ** 2 + v ** 2) * (1 - d) / (1 + h / 10)``. Within
+    each bucket the cell couplings are averaged per zone; a bucket is
+    dropped when either zone has no contributing cell, and ``delta`` is the
+    urban mean minus the rural mean.
+
+    When fewer than ``min_points`` buckets remain, ``groups`` is empty; more
+    than 8 buckets raises ``ValueError``. Otherwise an ordinary least-squares
+    fit is computed on the ascending ``(B, delta)`` points: with
+    ``Sxx = sum((B - B_bar) ** 2)`` the slope is
+    ``slope = sum((B - B_bar) * (delta - delta_bar)) / Sxx`` and the standard
+    error is
+    ``se = sqrt(sum((delta - delta_bar - slope * (B - B_bar)) ** 2)
+    / ((n - 2) * Sxx))``. The p-value is the exact permutation p-value: over
+    all ``n!`` positional permutations of the ``delta`` values (duplicates
+    not removed), the proportion whose recomputed slope ``slope'`` satisfies
+    ``|slope'| >= |slope|``. The confidence interval is
+    ``slope +/- z * se``. ``groups`` carries a single object with ``key``
+    ``"uhi"``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, min_points, z, groups`` and the group object uses
+    the key order ``key, n, slope, se, p, lower, upper`` with ``n`` the
+    number of fitted buckets. ``n`` is an integer and ``z`` plus every
+    numeric result is a string with exactly six decimals, negative zero
+    normalized to ``"0.000000"``. ``rows`` not being a list or ``zones``
+    not being a dict raises ``TypeError``; every other contract violation
+    raises ``ValueError``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    zones = _validate_fusion_zones(zones)
+    minutes = _validate_minutes(minutes)
+    if isinstance(min_points, bool) or not isinstance(min_points, int):
+        raise ValueError("min_points must be an integer")
+    if not 3 <= min_points <= 8:
+        raise ValueError("min_points must be an integer in 3..8")
+    z_value = _validate_finite_number(z, "z")
+    if z_value < 0:
+        raise ValueError("z must be greater than or equal to 0")
+
+    parsed = [_validate_coupling_record(record) for record in rows]
+    seen = set()
+    cell_ids = set()
+    for timestamp, cell_id, *_ in parsed:
+        key = (timestamp, cell_id)
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        cell_ids.add(cell_id)
+
+    if set(zones) != cell_ids:
+        raise ValueError(
+            "zones keys must be exactly the cell IDs occurring in rows"
+        )
+    if set(zones.values()) != _ZONES:
+        raise ValueError(
+            "zones must contain at least one 'urban' and one 'rural' cell"
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # bucket start -> cell_id -> [sum_r, sum_x, sum_u, sum_v, sum_h, sum_d, n]
+        buckets: dict[int, dict[str, list]] = {}
+        for timestamp, cell_id, residual, temp, wind_u, wind_v, height, density in parsed:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            acc = buckets.setdefault(bucket, {}).setdefault(
+                cell_id, [Decimal(0)] * 6 + [0]
+            )
+            for index, value in enumerate(
+                (residual, temp, wind_u, wind_v, height, density)
+            ):
+                acc[index] += value
+            acc[6] += 1
+
+        # bucket start -> urban mean coupling minus rural mean coupling
+        points: list[tuple[int, Decimal]] = []
+        for bucket in sorted(buckets):
+            zone_sums: dict[str, list] = {}
+            for cell_id, acc in buckets[bucket].items():
+                n = acc[6]
+                r = acc[0] / n
+                x = acc[1] / n
+                u = acc[2] / n
+                v = acc[3] / n
+                h = acc[4] / n
+                d = acc[5] / n
+                speed = (u * u + v * v).sqrt()
+                q = r * x * speed * (1 - d) / (1 + h / 10)
+                zone_acc = zone_sums.setdefault(zones[cell_id], [Decimal(0), 0])
+                zone_acc[0] += q
+                zone_acc[1] += 1
+            urban = zone_sums.get("urban")
+            rural = zone_sums.get("rural")
+            if not urban or not rural:
+                continue
+            points.append(
+                (bucket, urban[0] / urban[1] - rural[0] / rural[1])
+            )
+
+        groups = []
+        if len(points) > _TREND_SIGNIFICANCE_MAX_POINTS:
+            raise ValueError(
+                f"{len(points)} buckets; trend significance report requires "
+                f"at most {_TREND_SIGNIFICANCE_MAX_POINTS} buckets"
+            )
+        if len(points) >= min_points:
+            n = len(points)
+            x_total = Decimal(0)
+            y_total = Decimal(0)
+            for bucket, delta in points:
+                x_total += bucket
+                y_total += delta
+            x_bar = x_total / n
+            y_bar = y_total / n
+            sxx = Decimal(0)
+            sxy = Decimal(0)
+            for bucket, delta in points:
+                dx = bucket - x_bar
+                sxx += dx * dx
+                sxy += dx * (delta - y_bar)
+            slope = sxy / sxx
+            residual_ss = Decimal(0)
+            for bucket, delta in points:
+                residual = (delta - y_bar) - slope * (bucket - x_bar)
+                residual_ss += residual * residual
+            se = (residual_ss / ((n - 2) * sxx)).sqrt()
+            deltas = [delta for _, delta in points]
+            hits = 0
+            for permuted in permutations(deltas):
+                permuted_sxy = Decimal(0)
+                for (bucket, _), delta in zip(points, permuted):
+                    permuted_sxy += (bucket - x_bar) * (delta - y_bar)
+                if abs(permuted_sxy) >= abs(sxy):
+                    hits += 1
+            p = Decimal(hits) / Decimal(math.factorial(n))
+            half_width = z_value * se
+            groups.append(
+                '{"key":"uhi","n":' + str(n)
+                + ',"slope":"' + _format6(slope) + '"'
+                + ',"se":"' + _format6(se) + '"'
+                + ',"p":"' + _format6(p) + '"'
+                + ',"lower":"' + _format6(slope - half_width) + '"'
+                + ',"upper":"' + _format6(slope + half_width) + '"'
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"min_points":' + str(min_points)
+            + ',"z":"' + _format6(z_value) + '"'
             + ',"groups":[' + ",".join(groups) + ']}'
         )
 
