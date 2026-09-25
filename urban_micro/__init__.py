@@ -66,6 +66,7 @@ from .uhi import (
     vent_effect_report,
     ventilation_report,
     window_compare,
+    window_shift,
 )
 
 __version__ = "0.1.0"
@@ -137,4 +138,5 @@ __all__ = [
     "vent_effect_report",
     "ventilation_report",
     "window_compare",
+    "window_shift",
 ]
