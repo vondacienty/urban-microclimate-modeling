@@ -6739,6 +6739,163 @@ def energy_temperature_report(
         )
 
 
+def energy_temperature_scenario_report(
+    energy: list, temp: list, actions: list, *, minutes: int = 60
+) -> str:
+    """Join energy residuals and temperatures with per-cell increments.
+
+    ``energy`` is a list of strict six-tuples ``(timestamp, cell_id,
+    net_rad, sensible, latent, storage)`` and ``temp`` a list of strict
+    three-tuples ``(timestamp, cell_id, value)``: ``timestamp`` must be a
+    non-boolean non-negative integer, ``cell_id`` a non-empty string and
+    the numeric fields finite non-boolean int/float values; ``(timestamp,
+    cell_id)`` pairs must be unique within each input. ``actions`` is a
+    list of strict ``(cell_id, dn, ds, dl, dst)`` five-tuples:
+    ``cell_id`` must occur in ``energy``, each ``cell_id`` may appear at
+    most once and the four increments are finite non-boolean int/float
+    values (any sign); a cell's increments apply to every one of its
+    buckets and cells without an action get zero increments. ``minutes``
+    must be a non-boolean integer in ``1..1440`` that divides 1440.
+
+    Both inputs are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)``. Within each
+    ``(B, cell_id)`` pair the per-row energy residuals
+    ``r = net_rad - sensible - latent - storage`` and the ``temp`` values
+    are averaged separately, and only pairs present in both inputs are
+    kept. Each kept pair carries ``n_energy``/``n_temp`` (the row
+    counts), ``base_residual`` the mean residual, ``post_residual =
+    base_residual + dn - ds - dl - dst`` using the cell's increments,
+    the mean ``temp``, ``base_coupling = base_residual * temp``,
+    ``post_coupling = post_residual * temp`` and
+    ``delta_coupling = post_coupling - base_coupling``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
+    UTF-8 JSON string with no spaces and no trailing newline; the
+    top-level key order is ``minutes, groups``, each group object uses
+    the key order ``key, cells`` and each cell object uses the key order
+    ``key, n_energy, n_temp, base_residual, post_residual, temp,
+    base_coupling, post_coupling, delta_coupling`` with ``key`` the cell
+    id. Groups are emitted in ascending bucket order and cells within
+    each group in ascending string order. Bucket keys, ``n_energy`` and
+    ``n_temp`` are integers and every other numeric result is rendered
+    with exactly six decimals, negative zero normalized to
+    ``"0.000000"``. An empty result yields
+    ``{"minutes":60,"groups":[]}``. ``energy``, ``temp`` or ``actions``
+    not being a list raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(energy, list):
+        raise TypeError("energy must be a list")
+    if not isinstance(temp, list):
+        raise TypeError("temp must be a list")
+    if not isinstance(actions, list):
+        raise TypeError("actions must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed_energy = []
+    seen: set[tuple[int, str]] = set()
+    for row in energy:
+        validated = _validate_energy_balance_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed_energy.append(validated)
+
+    parsed_temp = []
+    seen = set()
+    for row in temp:
+        validated = _validate_temp_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed_temp.append(validated)
+
+    action_map: dict[str, tuple[Decimal, Decimal, Decimal, Decimal]] = {}
+    known_cells = {cell_id for _, cell_id, *_ in parsed_energy}
+    for action in actions:
+        cell_id, dn, ds, dl, dst = _validate_energy_balance_action(
+            action, known_cells
+        )
+        if cell_id in action_map:
+            raise ValueError(f"duplicate action for cell id: {cell_id!r}")
+        action_map[cell_id] = (dn, ds, dl, dst)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zero = Decimal(0)
+        bucket_seconds = minutes * 60
+        # (bucket, cell_id) -> [residual sum, row count]
+        energy_acc: dict[tuple[int, str], list] = {}
+        for row in parsed_energy:
+            timestamp, cell_id = row[0], row[1]
+            net_rad, sensible, latent, storage = row[2], row[3], row[4], row[5]
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            acc = energy_acc.setdefault((bucket, cell_id), [zero, 0])
+            acc[0] += net_rad - sensible - latent - storage
+            acc[1] += 1
+
+        # (bucket, cell_id) -> [temp sum, row count]
+        temp_acc: dict[tuple[int, str], list] = {}
+        for timestamp, cell_id, value in parsed_temp:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            acc = temp_acc.setdefault((bucket, cell_id), [zero, 0])
+            acc[0] += value
+            acc[1] += 1
+
+        # bucket -> cell_id -> (n_energy, n_temp, base, post, temp)
+        buckets: dict[int, dict[str, tuple[int, int, Decimal, Decimal, Decimal]]] = {}
+        for key, (residual_total, energy_count) in energy_acc.items():
+            temp_entry = temp_acc.get(key)
+            if temp_entry is None:
+                continue
+            temp_total, temp_count = temp_entry
+            dn, ds, dl, dst = action_map.get(key[1], (zero, zero, zero, zero))
+            base_residual = residual_total / energy_count
+            post_residual = base_residual + dn - ds - dl - dst
+            buckets.setdefault(key[0], {})[key[1]] = (
+                energy_count,
+                temp_count,
+                base_residual,
+                post_residual,
+                temp_total / temp_count,
+            )
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                n_energy, n_temp, base, post, temp_mean = buckets[bucket][cell_id]
+                base_coupling = base * temp_mean
+                post_coupling = post * temp_mean
+                delta_coupling = post_coupling - base_coupling
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n_energy":' + str(n_energy)
+                    + ',"n_temp":' + str(n_temp)
+                    + ',"base_residual":"' + _format6(base) + '"'
+                    + ',"post_residual":"' + _format6(post) + '"'
+                    + ',"temp":"' + _format6(temp_mean) + '"'
+                    + ',"base_coupling":"' + _format6(base_coupling) + '"'
+                    + ',"post_coupling":"' + _format6(post_coupling) + '"'
+                    + ',"delta_coupling":"' + _format6(delta_coupling) + '"'
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
 def energy_temperature_uhi_report(
     energy: list, temp: list, zones: dict, *, minutes: int = 60
 ) -> str:
