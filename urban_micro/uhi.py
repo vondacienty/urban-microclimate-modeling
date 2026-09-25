@@ -54,6 +54,7 @@ __all__ = [
     "energy_balance_report",
     "temperature_fusion_report",
     "temperature_fusion_uhi_report",
+    "surface_morphology_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -7041,3 +7042,128 @@ def model_residual_report(
             + ',"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(items) + ']}'
         )
+
+
+_MORPHOLOGY_KINDS = ("building", "impervious", "green", "other")
+
+
+def surface_morphology_report(items: list) -> str:
+    """Summarize per-cell surface morphology as a compact JSON report.
+
+    ``items`` is a list of ``(cell_id, kind, height, area, grid_area)``
+    five-tuples following the ``grid_features`` item contract: ``cell_id``
+    a non-empty string, ``kind`` one of ``building``, ``impervious``,
+    ``green`` or ``other``, ``height``/``area`` non-negative finite
+    non-boolean numbers, ``grid_area`` positive, non-building heights 0 and
+    a consistent ``grid_area`` per cell (compared via ``Decimal(str(x))``).
+    Each cell must contain at least one building item and at least one
+    coverage (non-building) item; the total building area must not exceed
+    the grid area and the coverage areas must sum exactly to the grid area.
+
+    For every cell the report carries the area-weighted mean building
+    height ``mu = sum(h*a)/A_b`` (0 when the total building area ``A_b`` is
+    0), the area-weighted population standard deviation
+    ``sqrt(sum(a*(h-mu)**2)/A_b)`` (0 when ``A_b`` is 0), the four kind
+    area fractions ``A_k/g`` and the dominant kind (largest ``A_k``, ties
+    broken building > impervious > green > other).
+
+    All arithmetic uses ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN local context. Cells are emitted in ascending cell id
+    order. Returns a compact JSON string with no spaces and no trailing
+    newline; the top-level key is ``cells`` and each cell object uses the
+    key order ``key, h, sd, b, i, g, o, dom`` with ``key``/``dom`` strings
+    and the six numeric fields rendered as fixed six-decimal strings,
+    negative zero normalized to ``0.000000``. An empty ``items`` yields
+    ``{"cells":[]}``. ``items`` not being a list raises ``TypeError``;
+    every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    parsed = [_validate_grid_item(item) for item in items]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zero = Decimal(0)
+        cells: dict[str, dict] = {}
+        for cell_id, kind, height, area, grid_area in parsed:
+            entry = cells.get(cell_id)
+            if entry is None:
+                entry = {
+                    "g": grid_area,
+                    "buildings": [],
+                    "areas": dict.fromkeys(_MORPHOLOGY_KINDS, zero),
+                    "n_build": 0,
+                    "n_cov": 0,
+                }
+                cells[cell_id] = entry
+            elif entry["g"] != grid_area:
+                raise ValueError(
+                    f"grid_area for cell {cell_id!r} must be consistent across items"
+                )
+            entry["areas"][kind] += area
+            if kind == "building":
+                entry["n_build"] += 1
+                entry["buildings"].append((height, area))
+            else:
+                entry["n_cov"] += 1
+
+        rendered = []
+        for cell_id in sorted(cells):
+            entry = cells[cell_id]
+            if entry["n_build"] < 1:
+                raise ValueError(
+                    f"cell {cell_id!r} must contain at least one building item"
+                )
+            if entry["n_cov"] < 1:
+                raise ValueError(
+                    f"cell {cell_id!r} must contain at least one coverage item"
+                )
+            grid_area = entry["g"]
+            areas = entry["areas"]
+            building_area = areas["building"]
+            if building_area > grid_area:
+                raise ValueError(
+                    f"total building area for cell {cell_id!r} exceeds grid_area"
+                )
+            coverage_area = areas["impervious"] + areas["green"] + areas["other"]
+            if coverage_area != grid_area:
+                raise ValueError(
+                    f"coverage areas for cell {cell_id!r} must sum to grid_area"
+                )
+
+            if building_area == 0:
+                mu = zero
+                sd = zero
+            else:
+                weighted = zero
+                for height, area in entry["buildings"]:
+                    weighted += height * area
+                mu = weighted / building_area
+                squared = zero
+                for height, area in entry["buildings"]:
+                    deviation = height - mu
+                    squared += area * deviation * deviation
+                sd = (squared / building_area).sqrt()
+
+            dominant = "building"
+            dominant_area = building_area
+            for kind in ("impervious", "green", "other"):
+                if areas[kind] > dominant_area:
+                    dominant = kind
+                    dominant_area = areas[kind]
+
+            rendered.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"h":"' + _format6(mu) + '"'
+                + ',"sd":"' + _format6(sd) + '"'
+                + ',"b":"' + _format6(building_area / grid_area) + '"'
+                + ',"i":"' + _format6(areas["impervious"] / grid_area) + '"'
+                + ',"g":"' + _format6(areas["green"] / grid_area) + '"'
+                + ',"o":"' + _format6(areas["other"] / grid_area) + '"'
+                + ',"dom":' + json.dumps(dominant)
+                + '}'
+            )
+
+        return '{"cells":[' + ",".join(rendered) + ']}'
