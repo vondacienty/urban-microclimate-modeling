@@ -6758,3 +6758,126 @@ def temperature_fusion_report(
             '{"minutes":' + str(minutes)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
+
+
+def model_residual_report(
+    model: tuple,
+    rows: list,
+    *,
+    by: str = "time",
+    minutes: int = 60,
+) -> str:
+    """Group fitted-model residuals and report bias, MAE and RMSE per group.
+
+    ``model`` is a ``fit_uhi_model`` return value
+    ``(n, b0, bh, bb, bi, bg, r2)``: ``n`` must be a non-boolean positive
+    integer and the other six fields finite non-boolean int/float values.
+    ``rows`` follows the ``fit_uhi_model`` contract: a list of nine-tuples
+    ``(timestamp, cell_id, station_c, satellite_c, d, h, b, i, g)`` with
+    unique ``(timestamp, cell_id)`` pairs; an empty list yields empty
+    ``groups``. ``by`` is ``"time"`` (rows are bucketed by Unix epoch,
+    floored to ``minutes``-sized buckets) or ``"cell"`` (rows are grouped
+    by cell id); ``minutes`` must be a non-boolean integer in ``1..1440``
+    that divides 1440.
+
+    For each row the prediction is ``p = b0 + bh*h + bb*b + bi*i + bg*g``
+    and the residual ``e = d - p``. Groups are emitted in ascending key
+    order (bucket-start seconds
+    ``floor(t / (minutes * 60)) * (minutes * 60)`` for ``time``, cell id
+    strings for ``cell``); each group reports ``n`` the group size,
+    ``bias = mean(e)``, ``mae = mean(|e|)`` and
+    ``rmse = sqrt(mean(e ** 2))``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``by, minutes, groups`` and each group object uses the key
+    order ``key, n, bias, mae, rmse``. Bucket keys and ``n`` are integers
+    and every other numeric result is a fixed six-decimal JSON string,
+    negative zero normalized to ``"0.000000"``. ``model`` not being a
+    tuple or ``rows`` not being a list raises ``TypeError``; every other
+    contract violation raises ``ValueError``.
+    """
+    if not isinstance(model, tuple):
+        raise TypeError("model must be a tuple")
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    if by not in ("time", "cell"):
+        raise ValueError("by must be 'time' or 'cell'")
+    minutes = _validate_minutes(minutes)
+
+    if len(model) != 7:
+        raise ValueError(
+            "model must be a fit_uhi_model (n, b0, bh, bb, bi, bg, r2) seven-tuple"
+        )
+    model_n, b0_v, bh_v, bb_v, bi_v, bg_v, r2_v = model
+    if isinstance(model_n, bool) or not isinstance(model_n, int) or model_n < 1:
+        raise ValueError("model n must be a positive integer")
+    b0 = _validate_finite_number(b0_v, "b0")
+    bh = _validate_finite_number(bh_v, "bh")
+    bb = _validate_finite_number(bb_v, "bb")
+    bi = _validate_finite_number(bi_v, "bi")
+    bg = _validate_finite_number(bg_v, "bg")
+    _validate_finite_number(r2_v, "r2")
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        timestamp, cell_id, height, build, imp, green, diff = _validate_feature_row(
+            row
+        )
+        key = (timestamp, cell_id)
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append((timestamp, cell_id, height, build, imp, green, diff))
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        groups: dict[object, list[Decimal]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for timestamp, cell_id, height, build, imp, green, diff in parsed:
+                residual = diff - (
+                    b0 + bh * height + bb * build + bi * imp + bg * green
+                )
+                if by == "time":
+                    group_key = (timestamp // bucket_seconds) * bucket_seconds
+                else:
+                    group_key = cell_id
+                groups.setdefault(group_key, []).append(residual)
+
+        items = []
+        for group_key in sorted(groups):
+            residuals = groups[group_key]
+            n = len(residuals)
+            residual_sum = Decimal(0)
+            absolute_sum = Decimal(0)
+            squared_sum = Decimal(0)
+            for residual in residuals:
+                residual_sum += residual
+                absolute_sum += abs(residual)
+                squared_sum += residual * residual
+            bias = residual_sum / n
+            mae = absolute_sum / n
+            rmse = (squared_sum / n).sqrt()
+            if by == "time":
+                key_json = str(group_key)
+            else:
+                key_json = json.dumps(group_key, ensure_ascii=False)
+            items.append(
+                '{"key":' + key_json
+                + ',"n":' + str(n)
+                + ',"bias":"' + _format6(bias) + '"'
+                + ',"mae":"' + _format6(mae) + '"'
+                + ',"rmse":"' + _format6(rmse) + '"'
+                + '}'
+            )
+
+        return (
+            '{"by":' + json.dumps(by)
+            + ',"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
