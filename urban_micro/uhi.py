@@ -52,6 +52,7 @@ __all__ = [
     "effect_matrix_ventilation_effect_report",
     "effect_matrix_cluster_report",
     "energy_balance_report",
+    "energy_balance_scenario_report",
     "temperature_fusion_report",
     "temperature_fusion_uhi_report",
     "surface_morphology_report",
@@ -6446,6 +6447,143 @@ def energy_balance_report(records: list, *, minutes: int = 60) -> str:
                     + ',"latent":' + _format6(latent)
                     + ',"storage":' + _format6(storage)
                     + ',"residual":' + _format6(residual)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def _validate_energy_balance_action(
+    action: object, known_cells: set
+) -> tuple[str, Decimal, Decimal, Decimal, Decimal]:
+    """Validate one ``(cell_id, dn, ds, dl, dst)`` action five-tuple."""
+    if not isinstance(action, tuple) or len(action) != 5:
+        raise ValueError(
+            "each action must be a (cell_id, dn, ds, dl, dst) five-tuple"
+        )
+    cell_id, dn, ds, dl, dst = action
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("action cell_id must be a non-empty string")
+    if cell_id not in known_cells:
+        raise ValueError(f"action cell {cell_id!r} is not present in records")
+    dn = _validate_finite_number(dn, "dn")
+    ds = _validate_finite_number(ds, "ds")
+    dl = _validate_finite_number(dl, "dl")
+    dst = _validate_finite_number(dst, "dst")
+    return cell_id, dn, ds, dl, dst
+
+
+def energy_balance_scenario_report(
+    records: list, actions: list, *, minutes: int = 60
+) -> str:
+    """Aggregate energy-balance rows with per-cell increments into buckets.
+
+    ``records`` is a list of six-tuples ``(timestamp, cell_id, net_rad,
+    sensible, latent, storage)`` with the same contract as
+    :func:`energy_balance_report`: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string, the other four
+    fields finite non-boolean int/float values and ``(timestamp,
+    cell_id)`` pairs unique. ``actions`` is a list of strict
+    ``(cell_id, dn, ds, dl, dst)`` five-tuples: ``cell_id`` must occur in
+    ``records``, each ``cell_id`` may appear at most once and the four
+    increments are finite non-boolean int/float values (any sign); a
+    cell's increments apply to every one of its rows and cells without an
+    action get zero increments. ``minutes`` must be a non-boolean integer
+    in ``1..1440`` that divides 1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)``. For every
+    occupied ``(B, cell_id)`` pair the four quantities and the increments
+    are averaged as ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN local context, and the pair carries ``n`` the number
+    of rows, ``n_actions`` (1 when the cell has an action, otherwise 0),
+    ``base_residual = mean(n - s - l - st)``,
+    ``post_residual = base_residual + dn - ds - dl - dst`` using the
+    averaged increments and ``delta_residual = post_residual -
+    base_residual``.
+
+    Returns a compact UTF-8 JSON string with no spaces and no trailing
+    newline; the top-level key order is ``minutes, groups``, each group
+    object uses the key order ``key, cells`` and each cell object uses the
+    key order ``key, n, n_actions, base_residual, post_residual,
+    delta_residual`` with ``key`` the cell id. Buckets and cells are
+    emitted in ascending order. Bucket keys, ``n`` and ``n_actions`` are
+    integers and the three residuals are rendered with exactly six
+    decimals, negative zero normalized to ``0.000000``. Empty ``records``
+    (and ``actions``) yields ``{"minutes":60,"groups":[]}``. ``records``
+    or ``actions`` not being a list raises ``TypeError``; every other
+    contract violation raises ``ValueError``.
+    """
+    if not isinstance(records, list):
+        raise TypeError("records must be a list")
+    if not isinstance(actions, list):
+        raise TypeError("actions must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = []
+    seen: set[tuple[int, str]] = set()
+    for row in records:
+        validated = _validate_energy_balance_row(row)
+        key = (validated[0], validated[1])
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        parsed.append(validated)
+
+    action_map: dict[str, tuple[Decimal, Decimal, Decimal, Decimal]] = {}
+    known_cells = {cell_id for _, cell_id, *_ in parsed}
+    for action in actions:
+        cell_id, dn, ds, dl, dst = _validate_energy_balance_action(
+            action, known_cells
+        )
+        if cell_id in action_map:
+            raise ValueError(f"duplicate action for cell id: {cell_id!r}")
+        action_map[cell_id] = (dn, ds, dl, dst)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zero = Decimal(0)
+        bucket_seconds = minutes * 60
+        # bucket start -> cell_id -> list of (net_rad, sensible, latent, storage)
+        buckets: dict[int, dict[str, list[tuple[Decimal, ...]]]] = {}
+        for timestamp, cell_id, net_rad, sensible, latent, storage in parsed:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(
+                (net_rad, sensible, latent, storage)
+            )
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                rows = buckets[bucket][cell_id]
+                n = len(rows)
+                sums = [zero, zero, zero, zero]
+                for values in rows:
+                    for index in range(4):
+                        sums[index] += values[index]
+                means = [total / n for total in sums]
+                dn, ds, dl, dst = action_map.get(cell_id, (zero, zero, zero, zero))
+                base_residual = means[0] - means[1] - means[2] - means[3]
+                post_residual = base_residual + dn - ds - dl - dst
+                delta_residual = post_residual - base_residual
+                n_actions = 1 if cell_id in action_map else 0
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"n_actions":' + str(n_actions)
+                    + ',"base_residual":"' + _format6(base_residual) + '"'
+                    + ',"post_residual":"' + _format6(post_residual) + '"'
+                    + ',"delta_residual":"' + _format6(delta_residual) + '"'
                     + '}'
                 )
             groups.append(
