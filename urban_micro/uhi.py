@@ -52,6 +52,7 @@ __all__ = [
     "effect_matrix_ventilation_effect_report",
     "effect_matrix_cluster_report",
     "energy_balance_report",
+    "temperature_fusion_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -6560,6 +6561,198 @@ def effect_matrix_exposure_report(
                 '{"key":' + str(bucket)
                 + ',"cells":[' + ",".join(cell_items) + ']}'
             )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def _validate_fusion_cells(cells: object) -> dict:
+    if not isinstance(cells, dict):
+        raise TypeError(
+            "cells must be a dict mapping station IDs to grid cell IDs"
+        )
+    for station_id, cell_id in cells.items():
+        if not isinstance(station_id, str) or not station_id:
+            raise ValueError(
+                f"cells keys must be non-empty station ID strings, "
+                f"got {station_id!r}"
+            )
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError(
+                f"station {station_id!r} must map to a non-empty grid cell ID "
+                f"string, got {cell_id!r}"
+            )
+    return cells
+
+
+def _validate_fusion_station_record(
+    record: object, cells: dict
+) -> tuple[str, int, Decimal]:
+    if not isinstance(record, Mapping):
+        raise ValueError("each station record must be a mapping")
+    if set(record.keys()) != _RECORD_KEYS:
+        raise ValueError(
+            "each station record must contain exactly the keys "
+            "'station_id', 'timestamp' and 'temp_c'"
+        )
+
+    station_id = record["station_id"]
+    if not isinstance(station_id, str) or not station_id:
+        raise ValueError(
+            f"station_id must be a non-empty string, got {station_id!r}"
+        )
+    if station_id not in cells:
+        raise ValueError(f"unknown station_id: {station_id!r}")
+
+    timestamp = _validate_timestamp(record["timestamp"])
+    temp = _validate_temperature(record["temp_c"], "temp_c")
+    return station_id, timestamp, temp
+
+
+def _validate_fusion_satellite_record(record: object) -> tuple[str, int, Decimal]:
+    if not isinstance(record, Mapping):
+        raise ValueError("each satellite record must be a mapping")
+    if set(record.keys()) != _SATELLITE_KEYS:
+        raise ValueError(
+            "each satellite record must contain exactly the keys "
+            "'cell_id', 'timestamp' and 'lst_c'"
+        )
+
+    cell_id = record["cell_id"]
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError(
+            f"cell_id must be a non-empty string, got {cell_id!r}"
+        )
+
+    timestamp = _validate_timestamp(record["timestamp"])
+    temp = _validate_temperature(record["lst_c"], "lst_c")
+    return cell_id, timestamp, temp
+
+
+def temperature_fusion_report(
+    station: list,
+    satellite: list,
+    cells: dict,
+    *,
+    minutes: int = 60,
+    min_count: int = 1,
+) -> str:
+    """Fuse station and satellite temperatures into a bias/RMSE report.
+
+    ``station`` records must be mappings with exactly the keys
+    ``station_id`` (a non-empty string), ``timestamp`` (a non-boolean
+    non-negative integer) and ``temp_c`` (a finite non-boolean
+    int/float); ``satellite`` records must be mappings with exactly the
+    keys ``cell_id`` (a non-empty string), ``timestamp`` and ``lst_c``
+    under the same rules. ``cells`` maps non-empty station ID strings to
+    non-empty grid cell ID strings and must contain every station ID
+    occurring in ``station``. ``minutes`` must be a non-boolean integer
+    in ``1..1440`` that divides 1440 and ``min_count`` a non-boolean
+    positive integer.
+
+    Both sources are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)``. Within each
+    ``(B, c)`` pair station temperatures are averaged per station first
+    and satellite temperatures are averaged per cell; a pair is kept
+    only when both sources are present and at least ``min_count``
+    distinct stations contribute, otherwise it is dropped. For each
+    kept pair and each contributing station ``d`` is the station mean
+    minus the satellite mean; the cell reports ``n_station`` (the
+    number of contributing stations), ``n_satellite`` (the number of
+    satellite records), ``bias = mean(d)`` and
+    ``rmse = sqrt(mean(d ** 2))``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
+    UTF-8 JSON string with no spaces and no trailing newline; the
+    top-level key order is ``minutes, groups``, each group object uses
+    the key order ``key, cells`` (groups in ascending bucket order) and
+    each cell object uses the key order ``key, n_station, n_satellite,
+    bias, rmse`` with cells in ascending cell id order. Bucket keys and
+    the two counts are integers; ``bias`` and ``rmse`` are strings with
+    exactly six decimals, negative zero normalized to ``"0.000000"``.
+    An empty result yields ``{"minutes":60,"groups":[]}``. ``station``
+    or ``satellite`` not being a list or ``cells`` not being a dict
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(station, list):
+        raise TypeError("station must be a list")
+    if not isinstance(satellite, list):
+        raise TypeError("satellite must be a list")
+    cells = _validate_fusion_cells(cells)
+    minutes = _validate_minutes(minutes)
+    min_count = _validate_min_count(min_count)
+
+    station_rows = [_validate_fusion_station_record(record, cells) for record in station]
+    satellite_rows = [_validate_fusion_satellite_record(record) for record in satellite]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # bucket -> cell_id -> station_id -> [sum, count]
+        station_buckets: dict[int, dict[str, dict[str, list]]] = {}
+        for station_id, timestamp, temp in station_rows:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            cell_id = cells[station_id]
+            station_acc = (
+                station_buckets.setdefault(bucket, {})
+                .setdefault(cell_id, {})
+                .setdefault(station_id, [Decimal(0), 0])
+            )
+            station_acc[0] += temp
+            station_acc[1] += 1
+
+        # bucket -> cell_id -> [sum, count]
+        satellite_buckets: dict[int, dict[str, list]] = {}
+        for cell_id, timestamp, temp in satellite_rows:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            cell_acc = satellite_buckets.setdefault(bucket, {}).setdefault(
+                cell_id, [Decimal(0), 0]
+            )
+            cell_acc[0] += temp
+            cell_acc[1] += 1
+
+        groups = []
+        for bucket in sorted(station_buckets):
+            sat_cells = satellite_buckets.get(bucket)
+            if not sat_cells:
+                continue
+            cell_items = []
+            for cell_id in sorted(station_buckets[bucket]):
+                if cell_id not in sat_cells:
+                    continue
+                per_station = station_buckets[bucket][cell_id]
+                n_station = len(per_station)
+                if n_station < min_count:
+                    continue
+                sat_total, sat_count = sat_cells[cell_id]
+                lst_mean = sat_total / sat_count
+                d_sum = Decimal(0)
+                d_squared = Decimal(0)
+                for total, count in per_station.values():
+                    d = total / count - lst_mean
+                    d_sum += d
+                    d_squared += d * d
+                bias = d_sum / n_station
+                rmse = (d_squared / n_station).sqrt()
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n_station":' + str(n_station)
+                    + ',"n_satellite":' + str(sat_count)
+                    + ',"bias":"' + _format6(bias) + '"'
+                    + ',"rmse":"' + _format6(rmse) + '"'
+                    + '}'
+                )
+            if cell_items:
+                groups.append(
+                    '{"key":' + str(bucket)
+                    + ',"cells":[' + ",".join(cell_items) + ']}'
+                )
 
         return (
             '{"minutes":' + str(minutes)
