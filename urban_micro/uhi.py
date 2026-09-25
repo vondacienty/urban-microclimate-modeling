@@ -7167,3 +7167,210 @@ def surface_morphology_report(items: list) -> str:
             )
 
         return '{"cells":[' + ",".join(rendered) + ']}'
+
+
+_THERMAL_KINDS = frozenset({"building", "roof", "impervious", "green", "other"})
+_THERMAL_COVERAGE_KINDS = ("roof", "impervious", "green", "other")
+
+
+def _validate_thermal_number(
+    value: object, name: str, *, minimum: Decimal, maximum: Decimal,
+    exclusive_min: bool,
+) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite int or float")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    decimal_value = Decimal(str(value))
+    if exclusive_min:
+        if decimal_value <= minimum:
+            raise ValueError(f"{name} must be greater than {minimum}")
+    elif decimal_value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    if decimal_value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}")
+    return decimal_value
+
+
+def _validate_thermal_item(
+    item: object,
+) -> tuple[str, str, Decimal, Decimal, Decimal, Decimal, Decimal]:
+    if not isinstance(item, tuple) or len(item) != 7:
+        raise ValueError(
+            "each item must be a (cell_id, kind, height, area, grid_area,"
+            " albedo, emissivity) tuple"
+        )
+    cell_id, kind, height, area, grid_area, albedo, emissivity = item
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+    _check_hashable(kind, "kind")
+    if kind not in _THERMAL_KINDS:
+        raise ValueError(
+            "kind must be one of 'building', 'roof', 'impervious', 'green'"
+            " or 'other'"
+        )
+    zero = Decimal(0)
+    one = Decimal(1)
+    height_d = _validate_thermal_number(
+        height, "height", minimum=zero, maximum=Decimal("Infinity"),
+        exclusive_min=False,
+    )
+    area_d = _validate_thermal_number(
+        area, "area", minimum=zero, maximum=Decimal("Infinity"),
+        exclusive_min=False,
+    )
+    grid_area_d = _validate_thermal_number(
+        grid_area, "grid_area", minimum=zero, maximum=Decimal("Infinity"),
+        exclusive_min=True,
+    )
+    albedo_d = _validate_thermal_number(
+        albedo, "albedo", minimum=zero, maximum=one, exclusive_min=False,
+    )
+    emissivity_d = _validate_thermal_number(
+        emissivity, "emissivity", minimum=zero, maximum=one, exclusive_min=True,
+    )
+    if kind != "building" and height_d != 0:
+        raise ValueError("height of non-building items must be 0")
+    return cell_id, kind, height_d, area_d, grid_area_d, albedo_d, emissivity_d
+
+
+def surface_thermal_report(items: list) -> str:
+    """Summarize per-cell surface thermal properties as a compact JSON report.
+
+    ``items`` is a list of ``(cell_id, kind, height, area, grid_area,
+    albedo, emissivity)`` seven-tuples: ``cell_id`` a non-empty string,
+    ``kind`` one of ``building``, ``roof``, ``impervious``, ``green`` or
+    ``other``, ``height``/``area`` non-negative finite non-boolean numbers,
+    ``grid_area`` positive, ``albedo`` in ``[0, 1]``, ``emissivity`` in
+    ``(0, 1]``, non-building heights 0 and a consistent ``grid_area`` per
+    cell (compared via ``Decimal(str(x))``). Each cell must contain at
+    least one building item and at least one coverage (non-building) item;
+    the total building area must not exceed the grid area and the four
+    coverage kind areas must sum exactly to the grid area.
+
+    For every cell the report carries the area-weighted mean building
+    height ``mu = sum(h*a)/sum(a)`` (0 when the total building area is 0),
+    the area-weighted population standard deviation
+    ``sqrt(sum(a*(h-mu)**2)/sum(a))`` (0 when the total building area is
+    0), the four coverage kind area fractions ``sum(a)/grid_area`` (roof,
+    impervious, green, other), the coverage area-weighted mean albedo
+    ``sum(a*A)/grid_area``, the coverage area-weighted mean emissivity
+    ``sum(a*E)/grid_area``, the thermal load
+    ``sum(a*(1-A)*E)/grid_area`` and the dominant coverage kind (largest
+    area, ties broken roof > impervious > green > other).
+
+    All arithmetic uses ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN local context. Cells are emitted in ascending cell id
+    order. Returns a compact JSON string with no spaces and no trailing
+    newline; the top-level key is ``cells`` and each cell object uses the
+    key order ``key, h, sd, r, i, g, o, A, E, load, dom`` with
+    ``key``/``dom`` strings and the nine numeric fields rendered as fixed
+    six-decimal strings, negative zero normalized to ``0.000000``. An
+    empty ``items`` yields ``{"cells":[]}``. ``items`` not being a list
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    parsed = [_validate_thermal_item(item) for item in items]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zero = Decimal(0)
+        one = Decimal(1)
+        cells: dict[str, dict] = {}
+        for cell_id, kind, height, area, grid_area, albedo, emissivity in parsed:
+            entry = cells.get(cell_id)
+            if entry is None:
+                entry = {
+                    "g": grid_area,
+                    "buildings": [],
+                    "areas": dict.fromkeys(_THERMAL_COVERAGE_KINDS, zero),
+                    "albedo": zero,
+                    "emissivity": zero,
+                    "load": zero,
+                    "n_build": 0,
+                    "n_cov": 0,
+                    "building_area": zero,
+                }
+                cells[cell_id] = entry
+            elif entry["g"] != grid_area:
+                raise ValueError(
+                    f"grid_area for cell {cell_id!r} must be consistent across items"
+                )
+            if kind == "building":
+                entry["n_build"] += 1
+                entry["building_area"] += area
+                entry["buildings"].append((height, area))
+            else:
+                entry["n_cov"] += 1
+                entry["areas"][kind] += area
+                entry["albedo"] += area * albedo
+                entry["emissivity"] += area * emissivity
+                entry["load"] += area * (one - albedo) * emissivity
+
+        rendered = []
+        for cell_id in sorted(cells):
+            entry = cells[cell_id]
+            if entry["n_build"] < 1:
+                raise ValueError(
+                    f"cell {cell_id!r} must contain at least one building item"
+                )
+            if entry["n_cov"] < 1:
+                raise ValueError(
+                    f"cell {cell_id!r} must contain at least one coverage item"
+                )
+            grid_area = entry["g"]
+            building_area = entry["building_area"]
+            if building_area > grid_area:
+                raise ValueError(
+                    f"total building area for cell {cell_id!r} exceeds grid_area"
+                )
+            areas = entry["areas"]
+            coverage_area = zero
+            for kind in _THERMAL_COVERAGE_KINDS:
+                coverage_area += areas[kind]
+            if coverage_area != grid_area:
+                raise ValueError(
+                    f"coverage areas for cell {cell_id!r} must sum to grid_area"
+                )
+
+            if building_area == 0:
+                mu = zero
+                sd = zero
+            else:
+                weighted = zero
+                for height, area in entry["buildings"]:
+                    weighted += height * area
+                mu = weighted / building_area
+                squared = zero
+                for height, area in entry["buildings"]:
+                    deviation = height - mu
+                    squared += area * deviation * deviation
+                sd = (squared / building_area).sqrt()
+
+            dominant = "roof"
+            dominant_area = areas["roof"]
+            for kind in ("impervious", "green", "other"):
+                if areas[kind] > dominant_area:
+                    dominant = kind
+                    dominant_area = areas[kind]
+
+            rendered.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"h":"' + _format6(mu) + '"'
+                + ',"sd":"' + _format6(sd) + '"'
+                + ',"r":"' + _format6(areas["roof"] / grid_area) + '"'
+                + ',"i":"' + _format6(areas["impervious"] / grid_area) + '"'
+                + ',"g":"' + _format6(areas["green"] / grid_area) + '"'
+                + ',"o":"' + _format6(areas["other"] / grid_area) + '"'
+                + ',"A":"' + _format6(entry["albedo"] / grid_area) + '"'
+                + ',"E":"' + _format6(entry["emissivity"] / grid_area) + '"'
+                + ',"load":"' + _format6(entry["load"] / grid_area) + '"'
+                + ',"dom":' + json.dumps(dominant)
+                + '}'
+            )
+
+        return '{"cells":[' + ",".join(rendered) + ']}'
