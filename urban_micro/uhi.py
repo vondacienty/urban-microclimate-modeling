@@ -48,6 +48,7 @@ __all__ = [
     "effect_matrix_spatiotemporal_report",
     "effect_matrix_temporal_lag_report",
     "ventilation_report",
+    "microclimate_coupling_report",
     "vent_effect_report",
     "effect_matrix_ventilation_effect_report",
     "effect_matrix_cluster_report",
@@ -67,6 +68,12 @@ _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
 _SATELLITE_KEYS = frozenset({"cell_id", "timestamp", "lst_c"})
 _VENTILATION_KEYS = frozenset(
     {"timestamp", "cell_id", "wind_u", "wind_v", "height", "density"}
+)
+_COUPLING_KEYS = frozenset(
+    {
+        "timestamp", "cell_id", "residual", "temp",
+        "wind_u", "wind_v", "height", "density",
+    }
 )
 _ZONES = frozenset({"urban", "rural"})
 _ITEM_KINDS = frozenset({"building", "impervious", "green", "other"})
@@ -5822,6 +5829,129 @@ def ventilation_report(records: list, *, minutes: int = 60) -> str:
                     + ',"height":' + _format6(h)
                     + ',"density":' + _format6(d)
                     + ',"ventilation":' + _format6(ventilation)
+                    + '}'
+                )
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"cells":[' + ",".join(cell_items) + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def _validate_coupling_record(
+    record: object,
+) -> tuple[int, str, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal]:
+    if not isinstance(record, Mapping):
+        raise ValueError("each record must be a mapping")
+    if set(record.keys()) != _COUPLING_KEYS:
+        raise ValueError(
+            "each record must contain exactly the keys 'timestamp', "
+            "'cell_id', 'residual', 'temp', 'wind_u', 'wind_v', 'height' "
+            "and 'density'"
+        )
+
+    timestamp = _validate_timestamp(record["timestamp"])
+
+    cell_id = record["cell_id"]
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ValueError("cell_id must be a non-empty string")
+
+    residual = _validate_finite_number(record["residual"], "residual")
+    temp = _validate_finite_number(record["temp"], "temp")
+    wind_u = _validate_finite_number(record["wind_u"], "wind_u")
+    wind_v = _validate_finite_number(record["wind_v"], "wind_v")
+    height = _validate_finite_number(record["height"], "height")
+    density = _validate_finite_number(record["density"], "density")
+    if height < 0:
+        raise ValueError("height must be non-negative")
+    if not 0 <= density <= 1:
+        raise ValueError("density must be in [0, 1]")
+    return timestamp, cell_id, residual, temp, wind_u, wind_v, height, density
+
+
+def microclimate_coupling_report(rows: list, *, minutes: int = 60) -> str:
+    """Aggregate residual/temp/wind rows into a time-bucket x cell coupling report.
+
+    ``rows`` is a list of mappings, each with exactly the keys ``timestamp``,
+    ``cell_id``, ``residual``, ``temp``, ``wind_u``, ``wind_v``, ``height``
+    and ``density``: ``timestamp`` must be a non-boolean non-negative
+    integer, ``cell_id`` a non-empty string and the other six fields finite
+    non-boolean int/float values with ``height >= 0`` and
+    ``0 <= density <= 1``. ``(timestamp, cell_id)`` pairs must be unique.
+    ``minutes`` must be a non-boolean integer in ``1..1440`` that divides
+    1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``floor(t / (minutes * 60)) * (minutes * 60)``; buckets are emitted in
+    ascending order and, within each bucket, cells in ascending string
+    order. Each cell object carries the group size ``n`` and ``coupling``
+    computed from the within-group arithmetic means (``r``, ``x``, ``u``,
+    ``v``, ``h`` and ``d`` below) as
+    ``r * x * sqrt(u ** 2 + v ** 2) * (1 - d) / (1 + h / 10)``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups``, each group object uses the key order
+    ``key, cells`` and each cell object uses the key order
+    ``key, n, coupling`` with ``key`` the cell id. An empty ``rows`` yields
+    ``{"minutes":60,"groups":[]}``. Bucket keys and ``n`` are integers and
+    ``coupling`` is rendered as a string with exactly six decimals, negative
+    zero normalized to ``0.000000``. ``rows`` not being a list raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    minutes = _validate_minutes(minutes)
+
+    parsed = [_validate_coupling_record(record) for record in rows]
+    seen = set()
+    for timestamp, cell_id, *_ in parsed:
+        key = (timestamp, cell_id)
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # bucket start -> cell_id -> list of
+        # (residual, temp, wind_u, wind_v, height, density)
+        buckets: dict[int, dict[str, list[tuple[Decimal, ...]]]] = {}
+        for timestamp, cell_id, residual, temp, wind_u, wind_v, height, density in parsed:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(
+                (residual, temp, wind_u, wind_v, height, density)
+            )
+
+        groups = []
+        for bucket in sorted(buckets):
+            cell_items = []
+            for cell_id in sorted(buckets[bucket]):
+                cell_rows = buckets[bucket][cell_id]
+                n = len(cell_rows)
+                sums = [Decimal(0)] * 6
+                for values in cell_rows:
+                    for index in range(6):
+                        sums[index] += values[index]
+                r = sums[0] / n
+                x = sums[1] / n
+                u = sums[2] / n
+                v = sums[3] / n
+                h = sums[4] / n
+                d = sums[5] / n
+                speed = (u * u + v * v).sqrt()
+                coupling = r * x * speed * (1 - d) / (1 + h / 10)
+                cell_items.append(
+                    '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"coupling":"' + _format6(coupling) + '"'
                     + '}'
                 )
             groups.append(
