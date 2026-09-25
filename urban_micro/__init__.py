@@ -44,6 +44,7 @@ from .uhi import (
     model_residual_report,
     scenario,
     temperature_fusion_report,
+    temperature_fusion_uhi_report,
     vent_effect_report,
     ventilation_report,
 )
@@ -95,6 +96,7 @@ __all__ = [
     "model_residual_report",
     "scenario",
     "temperature_fusion_report",
+    "temperature_fusion_uhi_report",
     "vent_effect_report",
     "ventilation_report",
 ]
