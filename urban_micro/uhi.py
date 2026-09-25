@@ -5965,6 +5965,121 @@ def microclimate_coupling_report(rows: list, *, minutes: int = 60) -> str:
         )
 
 
+def microclimate_coupling_uhi_report(
+    rows: list,
+    zones: dict,
+    *,
+    minutes: int = 60,
+) -> str:
+    """Aggregate coupling rows into a per-zone urban/rural UHI report.
+
+    ``rows`` follows the ``microclimate_coupling_report`` contract: a list
+    of mappings, each with exactly the keys ``timestamp``, ``cell_id``,
+    ``residual``, ``temp``, ``wind_u``, ``wind_v``, ``height`` and
+    ``density`` — ``timestamp`` a non-boolean non-negative integer,
+    ``cell_id`` a non-empty string and the other six fields finite
+    non-boolean int/float values with ``height >= 0`` and
+    ``0 <= density <= 1``; ``(timestamp, cell_id)`` pairs must be unique.
+    ``zones`` maps non-empty grid cell ID strings to ``'urban'`` or
+    ``'rural'`` and, when non-empty, its keys must be exactly the set of
+    cell ids occurring in ``rows``; the empty combination ``rows=[]`` and
+    ``zones={}`` yields ``{"minutes":60,"groups":[]}``. ``minutes`` must
+    be a non-boolean integer in ``1..1440`` that divides 1440.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)``. Within each
+    ``(B, c)`` pair the six numeric fields are averaged and the coupling
+    is computed from those means (``r``, ``x``, ``u``, ``v``, ``h`` and
+    ``d``) as ``q = r * x * sqrt(u ** 2 + v ** 2) * (1 - d) / (1 + h / 10)``.
+    Within each bucket the per-cell couplings are averaged per zone; a
+    bucket is dropped when either zone has no contributing cell.
+    ``n_urban``/``n_rural`` count the contributing cells and ``uhi`` is
+    the urban mean minus the rural mean.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, groups`` and each group object uses the key order
+    ``key, n_urban, n_rural, urban, rural, uhi`` with groups in ascending
+    bucket order. Bucket keys and the two counts are integers; ``urban``,
+    ``rural`` and ``uhi`` are strings with exactly six decimals, negative
+    zero normalized to ``"0.000000"``. ``rows`` not being a list or
+    ``zones`` not being a dict raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    zones = _validate_fusion_zones(zones)
+    minutes = _validate_minutes(minutes)
+
+    parsed = [_validate_coupling_record(record) for record in rows]
+    seen = set()
+    cell_ids = set()
+    for timestamp, cell_id, *_ in parsed:
+        key = (timestamp, cell_id)
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        cell_ids.add(cell_id)
+    if set(zones) != cell_ids:
+        raise ValueError("zones keys must be exactly the cell ids in rows")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # bucket start -> cell_id -> list of
+        # (residual, temp, wind_u, wind_v, height, density)
+        buckets: dict[int, dict[str, list[tuple[Decimal, ...]]]] = {}
+        for timestamp, cell_id, residual, temp, wind_u, wind_v, height, density in parsed:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            buckets.setdefault(bucket, {}).setdefault(cell_id, []).append(
+                (residual, temp, wind_u, wind_v, height, density)
+            )
+
+        groups = []
+        for bucket in sorted(buckets):
+            zone_sums: dict[str, list] = {}
+            for cell_id, cell_rows in buckets[bucket].items():
+                n = len(cell_rows)
+                sums = [Decimal(0)] * 6
+                for values in cell_rows:
+                    for index in range(6):
+                        sums[index] += values[index]
+                r = sums[0] / n
+                x = sums[1] / n
+                u = sums[2] / n
+                v = sums[3] / n
+                h = sums[4] / n
+                d = sums[5] / n
+                speed = (u * u + v * v).sqrt()
+                q = r * x * speed * (1 - d) / (1 + h / 10)
+                zone_acc = zone_sums.setdefault(zones[cell_id], [Decimal(0), 0])
+                zone_acc[0] += q
+                zone_acc[1] += 1
+            urban = zone_sums.get("urban")
+            rural = zone_sums.get("rural")
+            if not urban or not rural:
+                continue
+            urban_mean = urban[0] / urban[1]
+            rural_mean = rural[0] / rural[1]
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"n_urban":' + str(urban[1])
+                + ',"n_rural":' + str(rural[1])
+                + ',"urban":"' + _format6(urban_mean) + '"'
+                + ',"rural":"' + _format6(rural_mean) + '"'
+                + ',"uhi":"' + _format6(urban_mean - rural_mean) + '"'
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
 def _validate_airflow_row(row: object) -> tuple[int, str, Decimal]:
     """Validate one ``(t, c, v)`` airflow three-tuple."""
     if not isinstance(row, tuple) or len(row) != 3:
