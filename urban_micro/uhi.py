@@ -6,7 +6,7 @@ from bisect import bisect_left
 from collections.abc import Mapping
 from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
 from fractions import Fraction
-from itertools import permutations
+from itertools import combinations, permutations
 import json
 import math
 
@@ -35,6 +35,7 @@ __all__ = [
     "effect_matrix_jackknife_report",
     "effect_matrix_lags_fdr_report",
     "effect_matrix_lags_group_fdr_report",
+    "effect_matrix_lags_group_compare_report",
     "effect_matrix_permutation_report",
     "effect_matrix_trimmed_report",
     "effect_matrix_robust_report",
@@ -5906,6 +5907,315 @@ def effect_matrix_lags_group_fdr_report(
                 if lag_items:
                     groups.append(
                         '{"key":' + json.dumps(label, ensure_ascii=False)
+                        + ',"lags":[' + ",".join(lag_items) + ']}'
+                    )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+            + "\n"
+        )
+
+
+def effect_matrix_lags_group_compare_report(
+    details: list,
+    neighbors: list,
+    lags: list,
+    labels: dict,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Compare same-label neighbor deltas pairwise across lags and emit JSON.
+
+    ``details``, ``neighbors``, ``lags``, ``labels``, ``minutes`` and
+    ``alpha`` follow exactly the same validation, bucketing and same-label
+    pairing rules as :func:`effect_matrix_lags_group_fdr_report`: each
+    participating edge ``(u, v)`` with ``labels[u] == labels[v]`` contributes
+    ``x = Delta_u - Delta_v`` at ``(lag, B)`` when both endpoints have a
+    bucket mean at ``B`` and at ``B - lag * minutes * 60``.
+
+    Labels with at least one same-label edge are compared pairwise in
+    ascending ``a < b`` order. For a label pair ``(a, b)`` and a given
+    ``(lag, B)`` a test is emitted only when both labels have at least one
+    pairing at that ``(lag, B)``; with ``n_a`` and ``n_b`` the two pairing
+    counts, ``n_a + n_b > 16`` raises ``ValueError``. The statistic is
+    ``diff = mean(a) - mean(b)`` and ``p`` is the exact two-sided
+    permutation p-value: the ``n_a + n_b`` values are pooled, all
+    ``C(n_a + n_b, n_a)`` position subsets are enumerated as the group-a
+    assignment, and
+    ``p = #{|diff'| >= |diff|} / C(n_a + n_b, n_a)`` over those
+    reassignments.
+
+    With ``N`` the total number of ``(a, b, lag, B)`` tests, all tests are
+    ranked ascending by ``(p, a, b, lag, B)`` and each rank ``j`` (1-based)
+    gets the Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    test; ``reject`` is ``q <= alpha``, compared on the unquantized values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``minutes, alpha, groups``, each group object
+    uses the key order ``a, b, lags``, each lag object the key order
+    ``lag, tests`` and each test object the key order
+    ``key, n_a, n_b, diff, p, q, reject`` (with ``key`` the bucket start
+    ``B``). Groups, lag objects and tests are in ascending ``(a, b)``, lag
+    and bucket order respectively; label pairs without any test are
+    omitted. Labels render as JSON strings, lags, buckets and the counts as
+    integers, ``reject`` as a boolean and ``alpha``, ``diff``, ``p`` and
+    ``q`` with exactly six decimals, negative zero normalized to
+    ``0.000000``. An empty ``details``, an empty ``lags`` or the absence of
+    any comparison yields ``{"minutes":60,"alpha":0.050000,"groups":[]}``
+    (plus the trailing newline). ``details``, ``neighbors`` or ``lags``
+    not being a list, or ``labels`` not being a dict, raises ``TypeError``;
+    every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(neighbors, list):
+        raise TypeError("neighbors must be a list")
+    if not isinstance(lags, list):
+        raise TypeError("lags must be a list")
+    minutes = _validate_minutes(minutes)
+    seen_lags: set[int] = set()
+    for lag in lags:
+        if isinstance(lag, bool) or not isinstance(lag, int):
+            raise ValueError("each lag must be an integer")
+        if lag < 1:
+            raise ValueError("each lag must be a positive integer")
+        if lag in seen_lags:
+            raise ValueError(f"duplicate lag: {lag!r}")
+        seen_lags.add(lag)
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    parsed = _validate_detail_rows(details)
+
+    if not isinstance(labels, dict):
+        raise TypeError("labels must be a dict")
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    if set(labels) != cell_ids:
+        raise ValueError("labels keys must be exactly the details cell ids")
+    for cell_id, label in labels.items():
+        if not isinstance(label, str) or not label:
+            raise ValueError("each label must be a non-empty string")
+
+    edges: set[tuple[str, str]] = set()
+    for item in neighbors:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each neighbor must be an (a, b) two-tuple")
+        endpoint_a, endpoint_b = item
+        for endpoint in (endpoint_a, endpoint_b):
+            if not isinstance(endpoint, str) or not endpoint:
+                raise ValueError(
+                    "neighbor endpoints must be non-empty cell id strings"
+                )
+            if endpoint not in cell_ids:
+                raise ValueError(f"unknown cell id in neighbor: {endpoint!r}")
+        if endpoint_a == endpoint_b:
+            raise ValueError("neighbor self-loops are not allowed")
+        edge = (
+            (endpoint_a, endpoint_b)
+            if endpoint_a < endpoint_b
+            else (endpoint_b, endpoint_a)
+        )
+        if edge in edges:
+            raise ValueError(f"duplicate neighbor edge: {edge!r}")
+        edges.add(edge)
+
+    # label -> sorted list of same-label edges participating in its tests
+    label_edges: dict[str, list[tuple[str, str]]] = {}
+    for edge in sorted(edges):
+        label_a = labels[edge[0]]
+        label_b = labels[edge[1]]
+        if label_a == label_b:
+            label_edges.setdefault(label_a, []).append(edge)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> [delta sum, row count]
+        buckets: dict[int, dict[str, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = buckets.setdefault(bucket, {}).setdefault(
+                    cell_id, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        bucket_means: dict[int, dict[str, Decimal]] = {
+            bucket: {
+                cell_id: total / count
+                for cell_id, (total, count) in cells.items()
+            }
+            for bucket, cells in buckets.items()
+        }
+
+        def pairings(label: str, lag: int, bucket: int) -> list[Decimal]:
+            offset_buckets = lag * minutes * 60
+            previous = bucket_means.get(bucket - offset_buckets)
+            if previous is None:
+                return []
+            current = bucket_means.get(bucket)
+            if current is None:
+                return []
+            paired: list[Decimal] = []
+            for endpoint_a, endpoint_b in label_edges[label]:
+                if (
+                    endpoint_a in current
+                    and endpoint_b in current
+                    and endpoint_a in previous
+                    and endpoint_b in previous
+                ):
+                    delta_a = current[endpoint_a] - previous[endpoint_a]
+                    delta_b = current[endpoint_b] - previous[endpoint_b]
+                    paired.append(delta_a - delta_b)
+            return paired
+
+        # One record per emitted (a, b, lag, bucket) test:
+        # ``[a, b, lag, B, n_a, n_b, diff, p, q]`` with q filled in below.
+        grouped: dict[tuple[str, str], dict[int, list[list]]] = {}
+        records: list[list] = []
+        compared_labels = sorted(label_edges)
+        for index_a, group_a in enumerate(compared_labels):
+            for group_b in compared_labels[index_a + 1:]:
+                lag_groups: dict[int, list[list]] = {}
+                for lag in sorted(seen_lags):
+                    lag_records: list[list] = []
+                    for bucket in sorted(bucket_means):
+                        values_a = pairings(group_a, lag, bucket)
+                        if not values_a:
+                            continue
+                        values_b = pairings(group_b, lag, bucket)
+                        if not values_b:
+                            continue
+                        n_a = len(values_a)
+                        n_b = len(values_b)
+                        if n_a + n_b > _SPATIOTEMPORAL_MAX_N:
+                            raise ValueError(
+                                f"labels {group_a!r}/{group_b!r} lag {lag} "
+                                f"bucket {bucket} has {n_a + n_b} pairings; "
+                                f"lags group compare report requires at most "
+                                f"{_SPATIOTEMPORAL_MAX_N} combined pairings "
+                                f"per test"
+                            )
+
+                        total_a = Decimal(0)
+                        for value in values_a:
+                            total_a += value
+                        total_b = Decimal(0)
+                        for value in values_b:
+                            total_b += value
+                        diff = total_a / n_a - total_b / n_b
+
+                        # |sum_a'/n_a - sum_b'/n_b| >= |diff| is equivalent
+                        # (n_a, n_b > 0) to
+                        # |n_b*sum_a' - n_a*sum_b'| >= |n_b*total_a -
+                        # n_a*total_b|; compare the raw scaled sums so exact
+                        # ties are decided without any division rounding.
+                        pooled = values_a + values_b
+                        total_all = total_a + total_b
+                        threshold = abs(n_b * total_a - n_a * total_b)
+                        assignments = 0
+                        hits = 0
+                        for subset in combinations(
+                            range(n_a + n_b), n_a
+                        ):
+                            assignments += 1
+                            sum_a = Decimal(0)
+                            for position in subset:
+                                sum_a += pooled[position]
+                            sum_b = total_all - sum_a
+                            if (
+                                abs(n_b * sum_a - n_a * sum_b)
+                                >= threshold
+                            ):
+                                hits += 1
+                        p_value = Decimal(hits) / Decimal(assignments)
+
+                        record = [
+                            group_a,
+                            group_b,
+                            lag,
+                            bucket,
+                            n_a,
+                            n_b,
+                            diff,
+                            p_value,
+                            None,
+                        ]
+                        lag_records.append(record)
+                        records.append(record)
+                    lag_groups[lag] = lag_records
+                grouped[(group_a, group_b)] = lag_groups
+
+        # Benjamini-Hochberg q-values across ALL (a, b, lag, bucket) tests:
+        # rank ascending by (p, a, b, lag, B), then accumulate the running
+        # minimum of N * p_l / l from the top rank down, mapping q back.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (
+                records[idx][7],
+                records[idx][0],
+                records[idx][1],
+                records[idx][2],
+                records[idx][3],
+            ),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate = Decimal(count) * records[idx][7] / rank
+            if candidate < running:
+                running = candidate
+            records[idx][8] = running
+
+        groups = []
+        if parsed:
+            for pair in sorted(grouped):
+                lag_items = []
+                for lag in sorted(seen_lags):
+                    tests = []
+                    for (
+                        _,
+                        _,
+                        _,
+                        bucket,
+                        n_a,
+                        n_b,
+                        diff,
+                        p_value,
+                        q_value,
+                    ) in grouped[pair][lag]:
+                        reject = q_value <= alpha_value
+                        tests.append(
+                            '{"key":' + str(bucket)
+                            + ',"n_a":' + str(n_a)
+                            + ',"n_b":' + str(n_b)
+                            + ',"diff":' + _format6(diff)
+                            + ',"p":' + _format6(p_value)
+                            + ',"q":' + _format6(q_value)
+                            + ',"reject":' + ("true" if reject else "false")
+                            + '}'
+                        )
+                    if tests:
+                        lag_items.append(
+                            '{"lag":' + str(lag)
+                            + ',"tests":[' + ",".join(tests) + ']}'
+                        )
+                if lag_items:
+                    groups.append(
+                        '{"a":' + json.dumps(pair[0], ensure_ascii=False)
+                        + ',"b":' + json.dumps(pair[1], ensure_ascii=False)
                         + ',"lags":[' + ",".join(lag_items) + ']}'
                     )
 
