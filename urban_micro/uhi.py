@@ -50,6 +50,7 @@ __all__ = [
     "ventilation_report",
     "microclimate_coupling_report",
     "microclimate_coupling_uhi_report",
+    "microclimate_coupling_trend_report",
     "vent_effect_report",
     "effect_matrix_ventilation_effect_report",
     "effect_matrix_cluster_report",
@@ -6079,6 +6080,149 @@ def microclimate_coupling_uhi_report(
 
         return (
             '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def microclimate_coupling_trend_report(
+    rows: list,
+    zones: dict,
+    *,
+    minutes: int = 60,
+    min_points: int = 2,
+) -> str:
+    """Fit a time trend to the per-bucket UHI coupling delta and emit JSON.
+
+    ``rows`` is a list of mappings, each with exactly the keys ``timestamp``,
+    ``cell_id``, ``residual``, ``temp``, ``wind_u``, ``wind_v``, ``height``
+    and ``density``: ``timestamp`` must be a non-boolean non-negative
+    integer, ``cell_id`` a non-empty string and the other six fields finite
+    non-boolean int/float values with ``height >= 0`` and
+    ``0 <= density <= 1``. ``(timestamp, cell_id)`` pairs must be unique.
+    ``zones`` maps non-empty grid cell ID strings to ``'urban'`` or
+    ``'rural'``; its keys must be exactly the cell IDs occurring in ``rows``
+    and both classes must be non-empty. ``minutes`` must be a non-boolean
+    integer in ``1..1440`` that divides 1440 and ``min_points`` a
+    non-boolean integer greater than or equal to 2.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)``. Within each
+    ``(B, c)`` pair the six fields are averaged (means ``r``, ``x``, ``u``,
+    ``v``, ``h`` and ``d`` below) and the cell coupling is
+    ``q = r * x * sqrt(u ** 2 + v ** 2) * (1 - d) / (1 + h / 10)``. Within
+    each bucket the cell couplings are averaged per zone; a bucket is
+    dropped when either zone has no contributing cell, and ``delta`` is the
+    urban mean minus the rural mean.
+
+    When fewer than ``min_points`` buckets remain, ``groups`` is empty.
+    Otherwise an ordinary least-squares slope is fitted to the points
+    ``(x, y)`` with ``x`` the bucket start and ``y`` the bucket ``delta``:
+    ``slope = sum((x - x_bar) * (y - y_bar)) / sum((x - x_bar) ** 2)`` and
+    ``groups`` carries a single object with ``key`` ``"uhi"``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, min_points, groups`` and the group object uses the
+    key order ``key, n, slope`` with ``n`` the number of fitted buckets.
+    ``n`` is an integer and ``slope`` is a string with exactly six decimals,
+    negative zero normalized to ``"0.000000"``. ``rows`` not being a list or
+    ``zones`` not being a dict raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    zones = _validate_fusion_zones(zones)
+    minutes = _validate_minutes(minutes)
+    min_points = _validate_min_points(min_points)
+
+    parsed = [_validate_coupling_record(record) for record in rows]
+    seen = set()
+    cell_ids = set()
+    for timestamp, cell_id, *_ in parsed:
+        key = (timestamp, cell_id)
+        if key in seen:
+            raise ValueError(f"duplicate (timestamp, cell_id) pair: {key!r}")
+        seen.add(key)
+        cell_ids.add(cell_id)
+
+    if set(zones) != cell_ids:
+        raise ValueError(
+            "zones keys must be exactly the cell IDs occurring in rows"
+        )
+    if set(zones.values()) != _ZONES:
+        raise ValueError(
+            "zones must contain at least one 'urban' and one 'rural' cell"
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # bucket start -> cell_id -> [sum_r, sum_x, sum_u, sum_v, sum_h, sum_d, n]
+        buckets: dict[int, dict[str, list]] = {}
+        for timestamp, cell_id, residual, temp, wind_u, wind_v, height, density in parsed:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            acc = buckets.setdefault(bucket, {}).setdefault(
+                cell_id, [Decimal(0)] * 6 + [0]
+            )
+            for index, value in enumerate(
+                (residual, temp, wind_u, wind_v, height, density)
+            ):
+                acc[index] += value
+            acc[6] += 1
+
+        # bucket start -> urban mean coupling minus rural mean coupling
+        points: list[tuple[int, Decimal]] = []
+        for bucket in sorted(buckets):
+            zone_sums: dict[str, list] = {}
+            for cell_id, acc in buckets[bucket].items():
+                n = acc[6]
+                r = acc[0] / n
+                x = acc[1] / n
+                u = acc[2] / n
+                v = acc[3] / n
+                h = acc[4] / n
+                d = acc[5] / n
+                speed = (u * u + v * v).sqrt()
+                q = r * x * speed * (1 - d) / (1 + h / 10)
+                zone_acc = zone_sums.setdefault(zones[cell_id], [Decimal(0), 0])
+                zone_acc[0] += q
+                zone_acc[1] += 1
+            urban = zone_sums.get("urban")
+            rural = zone_sums.get("rural")
+            if not urban or not rural:
+                continue
+            points.append(
+                (bucket, urban[0] / urban[1] - rural[0] / rural[1])
+            )
+
+        groups = []
+        if len(points) >= min_points:
+            n = len(points)
+            x_total = Decimal(0)
+            y_total = Decimal(0)
+            for bucket, delta in points:
+                x_total += bucket
+                y_total += delta
+            x_bar = x_total / n
+            y_bar = y_total / n
+            sxx = Decimal(0)
+            sxy = Decimal(0)
+            for bucket, delta in points:
+                dx = bucket - x_bar
+                sxx += dx * dx
+                sxy += dx * (delta - y_bar)
+            slope = sxy / sxx
+            groups.append(
+                '{"key":"uhi","n":' + str(n)
+                + ',"slope":"' + _format6(slope) + '"}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"min_points":' + str(min_points)
             + ',"groups":[' + ",".join(groups) + ']}'
         )
 
