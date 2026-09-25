@@ -46,6 +46,7 @@ __all__ = [
     "effect_matrix_wilcoxon_report",
     "effect_matrix_spatial_lag_report",
     "effect_matrix_spatiotemporal_report",
+    "effect_matrix_spatiotemporal_fdr_report",
     "effect_matrix_temporal_lag_report",
     "ventilation_report",
     "microclimate_coupling_report",
@@ -5204,6 +5205,212 @@ def effect_matrix_spatiotemporal_report(
             '{"minutes":' + str(minutes)
             + ',"lag":' + str(lag)
             + ',"z":' + _format6(z_value)
+            + ',"groups":[' + ",".join(items) + ']}'
+        )
+
+
+def effect_matrix_spatiotemporal_fdr_report(
+    details: list,
+    neighbors: list,
+    *,
+    minutes: int = 60,
+    lag: int = 1,
+    alpha: float = 0.05,
+) -> str:
+    """Pair neighbor deltas across a temporal lag per bucket and BH-adjust.
+
+    ``details`` is a list of ``scenario`` eight-tuples ``(timestamp, cell_id,
+    base, post, delta, cg, cr, cm)``: ``timestamp`` must be a non-boolean
+    non-negative integer, ``cell_id`` a non-empty string and the other six
+    fields finite non-boolean int/float values; ``(timestamp, cell_id)``
+    pairs must be unique. ``neighbors`` is a list of ``(a, b)`` two-tuples
+    describing an undirected adjacency: ``a`` and ``b`` must be distinct
+    non-empty cell id strings occurring in ``details``; self-loops and
+    repeated edges (in either orientation) are illegal. ``minutes`` must be
+    a non-boolean integer in ``1..1440`` that divides 1440; ``lag`` must be
+    a positive non-boolean integer; ``alpha`` is a non-boolean finite number
+    with ``0 < alpha <= 1``.
+
+    Rows are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)`` and the deltas within
+    each ``(B, c)`` pair are averaged. For each bucket ``B``, the edges are
+    visited in lexicographic order and an edge ``(a, b)`` contributes a
+    pairing only when both endpoints have a value at ``B`` and at
+    ``B - lag * minutes * 60``; with ``d_{B, c}`` the bucket/cell mean and
+    ``Delta_c = d_{B, c} - d_{B - lag * minutes * 60, c}``, the paired value
+    is ``x = Delta_a - Delta_b``. A bucket with no pairings is omitted; a
+    bucket with more than 16 pairings raises ``ValueError``.
+
+    With ``n`` the number of pairings in a bucket, ``mean = sum(x) / n`` and
+    ``p`` is the exact two-sided sign-flip p-value: the proportion of all
+    ``2 ** n`` sign vectors ``s_i`` in ``{-1, 1}`` for which
+    ``|sum(s_i * x_i) / n| >= |mean|``. With ``N`` the number of retained
+    buckets, buckets are ranked ascending by ``(p, B)`` and each rank ``j``
+    (1-based) gets the Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    bucket; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and no trailing newline; the top-level key
+    order is ``minutes, lag, alpha, groups`` and each group object uses the
+    key order ``key, n, mean, p, q, reject`` with groups in ascending bucket
+    order. ``alpha``, ``mean``, ``p`` and ``q`` are rendered with exactly
+    six decimals, negative zero normalized to ``0.000000``; bucket keys and
+    ``n`` are integers. An empty result yields
+    ``{"minutes":60,"lag":1,"alpha":0.050000,"groups":[]}``. ``details`` or
+    ``neighbors`` not being a list raises ``TypeError``; every other
+    contract violation raises ``ValueError``.
+    """
+    if not isinstance(details, list):
+        raise TypeError("details must be a list")
+    if not isinstance(neighbors, list):
+        raise TypeError("neighbors must be a list")
+    minutes = _validate_minutes(minutes)
+    if isinstance(lag, bool) or not isinstance(lag, int):
+        raise ValueError("lag must be an integer")
+    if lag < 1:
+        raise ValueError("lag must be a positive integer")
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    parsed = _validate_detail_rows(details)
+
+    cell_ids = {cell_id for _, cell_id, *_ in parsed}
+    edges: set[tuple[str, str]] = set()
+    for item in neighbors:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each neighbor must be an (a, b) two-tuple")
+        endpoint_a, endpoint_b = item
+        for endpoint in (endpoint_a, endpoint_b):
+            if not isinstance(endpoint, str) or not endpoint:
+                raise ValueError(
+                    "neighbor endpoints must be non-empty cell id strings"
+                )
+            if endpoint not in cell_ids:
+                raise ValueError(f"unknown cell id in neighbor: {endpoint!r}")
+        if endpoint_a == endpoint_b:
+            raise ValueError("neighbor self-loops are not allowed")
+        edge = (
+            (endpoint_a, endpoint_b)
+            if endpoint_a < endpoint_b
+            else (endpoint_b, endpoint_a)
+        )
+        if edge in edges:
+            raise ValueError(f"duplicate neighbor edge: {edge!r}")
+        edges.add(edge)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # bucket start -> cell_id -> [delta sum, row count]
+        buckets: dict[int, dict[str, list]] = {}
+        if parsed:
+            bucket_seconds = minutes * 60
+            for validated in parsed:
+                timestamp, cell_id, delta = validated[0], validated[1], validated[4]
+                bucket = (timestamp // bucket_seconds) * bucket_seconds
+                acc = buckets.setdefault(bucket, {}).setdefault(
+                    cell_id, [Decimal(0), 0]
+                )
+                acc[0] += delta
+                acc[1] += 1
+
+        bucket_means: dict[int, dict[str, Decimal]] = {
+            bucket: {
+                cell_id: total / count
+                for cell_id, (total, count) in cells.items()
+            }
+            for bucket, cells in buckets.items()
+        }
+
+        # One record per retained bucket: ``[bucket, n, mean, p, q]`` with q
+        # filled in by the Benjamini-Hochberg step below.
+        records: list[list] = []
+        offset_buckets = lag * minutes * 60
+        for bucket in sorted(bucket_means):
+            previous = bucket_means.get(bucket - offset_buckets)
+            if previous is None:
+                continue
+            current = bucket_means[bucket]
+            paired: list[Decimal] = []
+            for endpoint_a, endpoint_b in sorted(edges):
+                if (
+                    endpoint_a in current
+                    and endpoint_b in current
+                    and endpoint_a in previous
+                    and endpoint_b in previous
+                ):
+                    delta_a = current[endpoint_a] - previous[endpoint_a]
+                    delta_b = current[endpoint_b] - previous[endpoint_b]
+                    paired.append(delta_a - delta_b)
+            if not paired:
+                continue
+            n = len(paired)
+            if n > _SPATIOTEMPORAL_MAX_N:
+                raise ValueError(
+                    f"bucket {bucket} has {n} pairings; spatiotemporal report "
+                    f"requires at most {_SPATIOTEMPORAL_MAX_N} pairings per bucket"
+                )
+
+            total = Decimal(0)
+            for value in paired:
+                total += value
+            mean = total / n
+
+            # |sum(s_i * x_i) / n| >= |mean| is equivalent (n > 0) to
+            # |sum(s_i * x_i)| >= |total|; compare the raw sums so exact
+            # ties are decided without any division rounding.
+            hits = 0
+            for mask in range(1 << n):
+                signed_sum = Decimal(0)
+                for index, value in enumerate(paired):
+                    if (mask >> index) & 1:
+                        signed_sum -= value
+                    else:
+                        signed_sum += value
+                if abs(signed_sum) >= abs(total):
+                    hits += 1
+            p_value = Decimal(hits) / Decimal(1 << n)
+
+            records.append([bucket, n, mean, p_value, None])
+
+        # Benjamini-Hochberg q-values across all retained buckets: rank
+        # ascending by (p, bucket), then accumulate the running minimum of
+        # N * p_l / l from the top rank down, mapping q back to each bucket.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (records[idx][3], records[idx][0]),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate = Decimal(count) * records[idx][3] / rank
+            if candidate < running:
+                running = candidate
+            records[idx][4] = running
+
+        items = []
+        for bucket, n, mean, p_value, q_value in records:
+            reject = q_value <= alpha_value
+            items.append(
+                '{"key":' + str(bucket)
+                + ',"n":' + str(n)
+                + ',"mean":' + _format6(mean)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if reject else "false")
+                + '}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"lag":' + str(lag)
+            + ',"alpha":' + _format6(alpha_value)
             + ',"groups":[' + ",".join(items) + ']}'
         )
 
