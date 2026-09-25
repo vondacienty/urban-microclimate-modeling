@@ -7374,3 +7374,173 @@ def surface_thermal_report(items: list) -> str:
             )
 
         return '{"cells":[' + ",".join(rendered) + ']}'
+
+
+def _validate_thermal_delta(value: object, name: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite int or float")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return Decimal(str(value))
+
+
+def surface_thermal_scenario_report(items: list, actions: list) -> str:
+    """Apply per-kind albedo/emissivity shifts and report the load delta.
+
+    ``items`` follows the ``surface_thermal_report`` seven-tuple contract:
+    each row is a ``(cell_id, kind, height, area, grid_area, albedo,
+    emissivity)`` tuple validated exactly as there, with a consistent
+    ``grid_area`` per cell (compared via ``Decimal(str(x))``). ``actions``
+    is a list of strict ``(cell_id, kind, d_albedo, d_emissivity)``
+    four-tuples: ``cell_id`` must occur in ``items``, ``kind`` must be one
+    of ``roof``, ``impervious``, ``green`` or ``other`` and the cell must
+    contain at least one coverage item of that kind, ``d_albedo`` and
+    ``d_emissivity`` must be finite non-boolean int/floats, and each
+    ``(cell_id, kind)`` pair may appear at most once. An action shifts the
+    albedo and emissivity of every coverage item of that kind in that cell
+    by the given deltas; after applying, every shifted item must keep
+    albedo in ``[0, 1]`` and emissivity in ``(0, 1]``.
+
+    For every cell the report carries the coverage area-weighted means
+    ``A = sum(a*A)/grid_area`` and ``E = sum(a*E)/grid_area`` and the
+    thermal load ``sum(a*(1-A)*E)/grid_area``, each computed on the
+    original items (``base_*``) and on the shifted items (``post_*``);
+    cells untouched by any action are unchanged, so their ``post_*``
+    values equal the ``base_*`` ones. ``delta_load`` is
+    ``post_load - base_load`` and ``n_actions`` the number of actions
+    targeting the cell.
+
+    All arithmetic uses ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN local context. Cells are emitted in ascending cell id
+    order. Returns a compact JSON string with no spaces and no trailing
+    newline; the top-level key is ``cells`` and each cell object uses the
+    key order ``key, n_actions, base_A, post_A, base_E, post_E, base_load,
+    post_load, delta_load`` with ``key`` a string, ``n_actions`` an
+    integer and the eight numeric fields rendered as fixed six-decimal
+    strings, negative zero normalized to ``0.000000``. An empty ``items``
+    yields ``{"cells":[]}``. ``items`` or ``actions`` not being a list
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not isinstance(actions, list):
+        raise TypeError("actions must be a list")
+    parsed = [_validate_thermal_item(item) for item in items]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zero = Decimal(0)
+        one = Decimal(1)
+        cells: dict[str, dict] = {}
+        for cell_id, kind, height, area, grid_area, albedo, emissivity in parsed:
+            entry = cells.get(cell_id)
+            if entry is None:
+                entry = {"g": grid_area, "coverage": []}
+                cells[cell_id] = entry
+            elif entry["g"] != grid_area:
+                raise ValueError(
+                    f"grid_area for cell {cell_id!r} must be consistent across items"
+                )
+            if kind != "building":
+                entry["coverage"].append([kind, area, albedo, emissivity])
+
+        seen_actions: set[tuple[object, object]] = set()
+        cell_actions: dict[str, list[tuple[object, Decimal, Decimal]]] = {}
+        for action in actions:
+            if not isinstance(action, tuple) or len(action) != 4:
+                raise ValueError(
+                    "each action must be a (cell_id, kind, d_albedo,"
+                    " d_emissivity) tuple"
+                )
+            action_cell, action_kind, d_albedo, d_emissivity = action
+            _check_hashable(action_cell, "cell_id")
+            entry = cells.get(action_cell)
+            if entry is None:
+                raise ValueError(
+                    f"action cell {action_cell!r} is not present in items"
+                )
+            _check_hashable(action_kind, "kind")
+            if action_kind not in _THERMAL_COVERAGE_KINDS:
+                raise ValueError(
+                    "action kind must be one of 'roof', 'impervious', 'green'"
+                    " or 'other'"
+                )
+            da = _validate_thermal_delta(d_albedo, "d_albedo")
+            de = _validate_thermal_delta(d_emissivity, "d_emissivity")
+            action_key = (action_cell, action_kind)
+            if action_key in seen_actions:
+                raise ValueError(
+                    f"duplicate action for cell {action_cell!r}"
+                    f" kind {action_kind!r}"
+                )
+            seen_actions.add(action_key)
+            targets = [
+                coverage
+                for coverage in entry["coverage"]
+                if coverage[0] == action_kind
+            ]
+            if not targets:
+                raise ValueError(
+                    f"cell {action_cell!r} contains no {action_kind!r}"
+                    " coverage item"
+                )
+            for coverage in targets:
+                if not zero <= coverage[2] + da <= one:
+                    raise ValueError(
+                        f"shifted albedo for cell {action_cell!r}"
+                        f" kind {action_kind!r} must stay within [0, 1]"
+                    )
+                if not zero < coverage[3] + de <= one:
+                    raise ValueError(
+                        f"shifted emissivity for cell {action_cell!r}"
+                        f" kind {action_kind!r} must stay within (0, 1]"
+                    )
+            cell_actions.setdefault(action_cell, []).append(
+                (action_kind, da, de)
+            )
+
+        rendered = []
+        for cell_id in sorted(cells):
+            entry = cells[cell_id]
+            coverage = entry["coverage"]
+            base_albedo = zero
+            base_emissivity = zero
+            base_load = zero
+            for _, area, albedo, emissivity in coverage:
+                base_albedo += area * albedo
+                base_emissivity += area * emissivity
+                base_load += area * (one - albedo) * emissivity
+            actions_for_cell = cell_actions.get(cell_id, [])
+            for action_kind, da, de in actions_for_cell:
+                for coverage_item in coverage:
+                    if coverage_item[0] == action_kind:
+                        coverage_item[2] += da
+                        coverage_item[3] += de
+            post_albedo = zero
+            post_emissivity = zero
+            post_load = zero
+            for _, area, albedo, emissivity in coverage:
+                post_albedo += area * albedo
+                post_emissivity += area * emissivity
+                post_load += area * (one - albedo) * emissivity
+            grid_area = entry["g"]
+            base_load_mean = base_load / grid_area
+            post_load_mean = post_load / grid_area
+            rendered.append(
+                '{"key":' + json.dumps(cell_id, ensure_ascii=False)
+                + ',"n_actions":' + str(len(actions_for_cell))
+                + ',"base_A":"' + _format6(base_albedo / grid_area) + '"'
+                + ',"post_A":"' + _format6(post_albedo / grid_area) + '"'
+                + ',"base_E":"' + _format6(base_emissivity / grid_area) + '"'
+                + ',"post_E":"' + _format6(post_emissivity / grid_area) + '"'
+                + ',"base_load":"' + _format6(base_load_mean) + '"'
+                + ',"post_load":"' + _format6(post_load_mean) + '"'
+                + ',"delta_load":"'
+                + _format6(post_load_mean - base_load_mean) + '"'
+                + '}'
+            )
+
+        return '{"cells":[' + ",".join(rendered) + ']}'
