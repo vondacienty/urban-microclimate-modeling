@@ -60,6 +60,7 @@ __all__ = [
     "temperature_fusion_report",
     "temperature_fusion_uhi_report",
     "surface_morphology_report",
+    "surface_thermal_zone_scenario_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -8481,3 +8482,241 @@ def surface_thermal_attribution_report(items: list, actions: list) -> str:
                 )
 
         return '{"actions":[' + ",".join(rendered) + ']}'
+
+
+def surface_thermal_zone_scenario_report(
+    items: list, zones: dict, actions: list
+) -> str:
+    """Aggregate scenario thermal loads per urban/rural zone into a UHI report.
+
+    ``items`` follows the same ``(cell_id, kind, height, area, grid_area,
+    albedo, emissivity)`` seven-tuple contract as
+    :func:`surface_thermal_report`; duplicate items are allowed. ``zones``
+    is a dict whose keys are exactly the cell ids occurring in ``items``
+    and whose values are ``'urban'`` or ``'rural'``; both zones must be
+    non-empty. ``actions`` follows the same strict
+    ``(cell_id, kind, d_albedo, d_emissivity)`` four-tuple contract as
+    :func:`surface_thermal_scenario_report`: the cell must contain a
+    coverage item of the named kind, each ``(cell_id, kind)`` pair may
+    appear at most once, ``d_albedo``/``d_emissivity`` are non-boolean
+    finite int/float values and applying them to every coverage item of
+    that kind in that cell must leave ``albedo`` in ``[0, 1]`` and
+    ``emissivity`` in ``(0, 1]``.
+
+    For each cell the per-grid-area thermal load is
+    ``sum(a*(1-A)*E)/grid_area`` before (``base``) and after (``post``)
+    applying the actions, with ``delta = post - base``. Each zone group
+    carries ``n`` (the number of cells in the zone) and the cell means of
+    the three values. The UHI object carries the urban mean minus the
+    rural mean for ``base``, ``post`` and ``delta``.
+
+    All arithmetic uses ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN local context. Returns a compact UTF-8 JSON string
+    with no spaces and no trailing newline; the top-level key order is
+    ``groups, uhi``, groups are ordered urban then rural and each group
+    object uses the key order ``zone, n, base, post, delta`` with
+    ``zone`` a string, ``n`` an integer and the three numeric fields
+    rendered as fixed six-decimal strings, negative zero normalized to
+    ``0.000000``. The only legal empty input is ``items=[]``,
+    ``zones={}`` and ``actions=[]`` together, which yields
+    ``{"groups":[],"uhi":null}``. ``items`` or ``actions`` not being a
+    list or ``zones`` not being a dict raises ``TypeError``; every other
+    contract violation raises ``ValueError``.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not isinstance(zones, dict):
+        raise TypeError("zones must be a dict")
+    if not isinstance(actions, list):
+        raise TypeError("actions must be a list")
+    parsed = [_validate_thermal_item(item) for item in items]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zero = Decimal(0)
+        one = Decimal(1)
+        cells: dict[str, dict] = {}
+        for cell_id, kind, height, area, grid_area, albedo, emissivity in parsed:
+            entry = cells.get(cell_id)
+            if entry is None:
+                entry = {
+                    "g": grid_area,
+                    "n_build": 0,
+                    "n_cov": 0,
+                    "building_area": zero,
+                    "areas": dict.fromkeys(_THERMAL_COVERAGE_KINDS, zero),
+                    "coverage": [],
+                }
+                cells[cell_id] = entry
+            elif entry["g"] != grid_area:
+                raise ValueError(
+                    f"grid_area for cell {cell_id!r} must be consistent across items"
+                )
+            if kind == "building":
+                entry["n_build"] += 1
+                entry["building_area"] += area
+            else:
+                entry["n_cov"] += 1
+                entry["areas"][kind] += area
+                entry["coverage"].append((kind, area, albedo, emissivity))
+
+        for cell_id, entry in cells.items():
+            if entry["n_build"] < 1:
+                raise ValueError(
+                    f"cell {cell_id!r} must contain at least one building item"
+                )
+            if entry["n_cov"] < 1:
+                raise ValueError(
+                    f"cell {cell_id!r} must contain at least one coverage item"
+                )
+            if entry["building_area"] > entry["g"]:
+                raise ValueError(
+                    f"total building area for cell {cell_id!r} exceeds grid_area"
+                )
+            coverage_area = zero
+            for kind in _THERMAL_COVERAGE_KINDS:
+                coverage_area += entry["areas"][kind]
+            if coverage_area != entry["g"]:
+                raise ValueError(
+                    f"coverage areas for cell {cell_id!r} must sum to grid_area"
+                )
+
+        for cell_id, zone in zones.items():
+            if not isinstance(cell_id, str) or not cell_id:
+                raise ValueError(
+                    "zones keys must be non-empty cell id strings"
+                )
+            if zone not in _ZONES:
+                raise ValueError(
+                    f"grid cell {cell_id!r} must map to 'urban' or 'rural',"
+                    f" got {zone!r}"
+                )
+        zone_cells = set(zones)
+        item_cells = set(cells)
+        if zone_cells != item_cells:
+            missing = sorted(item_cells - zone_cells)
+            extra = sorted(zone_cells - item_cells)
+            if missing:
+                raise ValueError(f"zones is missing cell: {missing[0]!r}")
+            raise ValueError(f"zones contains unknown cell: {extra[0]!r}")
+        zone_sets = {"urban": set(), "rural": set()}
+        for cell_id, zone in zones.items():
+            zone_sets[zone].add(cell_id)
+
+        infinity = Decimal("Infinity")
+        deltas: dict[str, dict[str, tuple[Decimal, Decimal]]] = {}
+        for action in actions:
+            if not isinstance(action, tuple) or len(action) != 4:
+                raise ValueError(
+                    "each action must be a (cell_id, kind, d_albedo,"
+                    " d_emissivity) tuple"
+                )
+            cell_id, kind, d_albedo, d_emissivity = action
+            if not isinstance(cell_id, str) or not cell_id:
+                raise ValueError("action cell_id must be a non-empty string")
+            entry = cells.get(cell_id)
+            if entry is None:
+                raise ValueError(
+                    f"action cell {cell_id!r} is not present in items"
+                )
+            _check_hashable(kind, "kind")
+            if kind not in _THERMAL_COVERAGE_KINDS:
+                raise ValueError(
+                    "action kind must be one of 'roof', 'impervious', 'green'"
+                    " or 'other'"
+                )
+            if not any(
+                item_kind == kind for item_kind, _, _, _ in entry["coverage"]
+            ):
+                raise ValueError(
+                    f"cell {cell_id!r} contains no coverage item of kind"
+                    f" {kind!r}"
+                )
+            cell_deltas = deltas.setdefault(cell_id, {})
+            if kind in cell_deltas:
+                raise ValueError(
+                    f"duplicate action for cell {cell_id!r} kind {kind!r}"
+                )
+            d_albedo_d = _validate_thermal_number(
+                d_albedo, "d_albedo", minimum=-infinity, maximum=infinity,
+                exclusive_min=False,
+            )
+            d_emissivity_d = _validate_thermal_number(
+                d_emissivity, "d_emissivity", minimum=-infinity,
+                maximum=infinity, exclusive_min=False,
+            )
+            cell_deltas[kind] = (d_albedo_d, d_emissivity_d)
+
+        if not item_cells:
+            return '{"groups":[],"uhi":null}'
+        for zone in ("urban", "rural"):
+            if not zone_sets[zone]:
+                raise ValueError(f"zones must contain at least one {zone} cell")
+
+        # cell id -> (base, post, delta) per-grid-area thermal loads
+        cell_loads: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
+        for cell_id, entry in cells.items():
+            grid_area = entry["g"]
+            cell_deltas = deltas.get(cell_id, {})
+            base_load = zero
+            post_load = zero
+            for kind, area, albedo, emissivity in entry["coverage"]:
+                base_load += area * (one - albedo) * emissivity
+                delta = cell_deltas.get(kind)
+                if delta is not None:
+                    new_albedo = albedo + delta[0]
+                    new_emissivity = emissivity + delta[1]
+                    if new_albedo < zero or new_albedo > one:
+                        raise ValueError(
+                            f"action on cell {cell_id!r} kind {kind!r} pushes"
+                            " albedo out of [0, 1]"
+                        )
+                    if new_emissivity <= zero or new_emissivity > one:
+                        raise ValueError(
+                            f"action on cell {cell_id!r} kind {kind!r} pushes"
+                            " emissivity out of (0, 1]"
+                        )
+                    albedo = new_albedo
+                    emissivity = new_emissivity
+                post_load += area * (one - albedo) * emissivity
+            base = base_load / grid_area
+            post = post_load / grid_area
+            cell_loads[cell_id] = (base, post, post - base)
+
+        groups = []
+        zone_means: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
+        for zone in ("urban", "rural"):
+            members = sorted(zone_sets[zone])
+            count = Decimal(len(members))
+            base_mean = zero
+            post_mean = zero
+            delta_mean = zero
+            for cell_id in members:
+                base, post, delta = cell_loads[cell_id]
+                base_mean += base
+                post_mean += post
+                delta_mean += delta
+            base_mean /= count
+            post_mean /= count
+            delta_mean /= count
+            zone_means[zone] = (base_mean, post_mean, delta_mean)
+            groups.append(
+                '{"zone":' + json.dumps(zone)
+                + ',"n":' + str(len(members))
+                + ',"base":"' + _format6(base_mean) + '"'
+                + ',"post":"' + _format6(post_mean) + '"'
+                + ',"delta":"' + _format6(delta_mean) + '"'
+                + '}'
+            )
+
+        urban_base, urban_post, urban_delta = zone_means["urban"]
+        rural_base, rural_post, rural_delta = zone_means["rural"]
+        uhi = (
+            '{"base":"' + _format6(urban_base - rural_base) + '"'
+            + ',"post":"' + _format6(urban_post - rural_post) + '"'
+            + ',"delta":"' + _format6(urban_delta - rural_delta) + '"'
+            + '}'
+        )
+        return '{"groups":[' + ",".join(groups) + '],"uhi":' + uhi + '}'
