@@ -6587,6 +6587,24 @@ def _validate_fusion_cells(cells: object) -> dict:
     return cells
 
 
+def _validate_fusion_zones(zones: object) -> dict:
+    if not isinstance(zones, dict):
+        raise TypeError(
+            "zones must be a dict mapping grid cell IDs to 'urban' or 'rural'"
+        )
+    for cell_id, zone in zones.items():
+        if not isinstance(cell_id, str) or not cell_id:
+            raise ValueError(
+                f"zones keys must be non-empty grid cell ID strings, "
+                f"got {cell_id!r}"
+            )
+        if zone not in _ZONES:
+            raise ValueError(
+                f"cell {cell_id!r} must map to 'urban' or 'rural', got {zone!r}"
+            )
+    return zones
+
+
 def _validate_fusion_station_record(
     record: object, cells: dict
 ) -> tuple[str, int, Decimal]:
@@ -6753,6 +6771,146 @@ def temperature_fusion_report(
                     '{"key":' + str(bucket)
                     + ',"cells":[' + ",".join(cell_items) + ']}'
                 )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"groups":[' + ",".join(groups) + ']}'
+        )
+
+
+def temperature_fusion_uhi_report(
+    station: list,
+    satellite: list,
+    cells: dict,
+    zones: dict,
+    *,
+    minutes: int = 60,
+    min_count: int = 1,
+) -> str:
+    """Fuse station and satellite temperatures into an urban/rural UHI report.
+
+    ``station`` records must be mappings with exactly the keys
+    ``station_id`` (a non-empty string), ``timestamp`` (a non-boolean
+    non-negative integer) and ``temp_c`` (a finite non-boolean
+    int/float); ``satellite`` records must be mappings with exactly the
+    keys ``cell_id`` (a non-empty string), ``timestamp`` and ``lst_c``
+    under the same rules. ``cells`` maps non-empty station ID strings to
+    non-empty grid cell ID strings and must contain every station ID
+    occurring in ``station``; ``zones`` maps grid cell ID strings to
+    ``"urban"`` or ``"rural"`` and must cover every cell referenced by
+    ``cells`` or occurring in ``satellite``. ``minutes`` must be a
+    non-boolean integer in ``1..1440`` that divides 1440 and
+    ``min_count`` a non-boolean positive integer.
+
+    Both sources are bucketed by Unix epoch with key
+    ``B = floor(t / (minutes * 60)) * (minutes * 60)``. Within each
+    ``(B, cell)`` pair station temperatures are averaged per station
+    first; the pair is dropped unless at least ``min_count`` distinct
+    stations contribute and the cell has satellite coverage. Satellite
+    temperatures are averaged per cell and ``bias = station_mean -
+    satellite_mean`` for each contributing station. Within a bucket the
+    station biases are averaged per zone (rural satellite-only cells
+    cannot occur here); a bucket missing either zone is dropped and
+    ``uhi = mean(urban bias) - mean(rural bias)``.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
+    UTF-8 JSON string with no spaces and no trailing newline; the
+    top-level key order is ``minutes, groups`` and each group object
+    uses the key order ``key, n_urban, n_rural, urban_bias,
+    rural_bias, uhi`` with groups in ascending bucket order. Bucket
+    keys and the two counts are integers; the three temperatures are
+    strings with exactly six decimals, negative zero normalized to
+    ``"0.000000"``. An empty result yields
+    ``{"minutes":60,"groups":[]}``. ``station`` or ``satellite`` not
+    being a list, ``cells`` or ``zones`` not being a dict raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    """
+    if not isinstance(station, list):
+        raise TypeError("station must be a list")
+    if not isinstance(satellite, list):
+        raise TypeError("satellite must be a list")
+    cells = _validate_fusion_cells(cells)
+    zones = _validate_fusion_zones(zones)
+    minutes = _validate_minutes(minutes)
+    min_count = _validate_min_count(min_count)
+
+    station_rows = [_validate_fusion_station_record(record, cells) for record in station]
+    satellite_rows = [_validate_fusion_satellite_record(record) for record in satellite]
+
+    required_cells = set(cells.values())
+    for cell_id, _, _ in satellite_rows:
+        required_cells.add(cell_id)
+    missing = required_cells - zones.keys()
+    if missing:
+        raise ValueError(f"cells missing a zone mapping: {sorted(missing)!r}")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        bucket_seconds = minutes * 60
+        # bucket -> cell_id -> station_id -> [sum, count]
+        station_buckets: dict[int, dict[str, dict[str, list]]] = {}
+        for station_id, timestamp, temp in station_rows:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            cell_id = cells[station_id]
+            station_acc = (
+                station_buckets.setdefault(bucket, {})
+                .setdefault(cell_id, {})
+                .setdefault(station_id, [Decimal(0), 0])
+            )
+            station_acc[0] += temp
+            station_acc[1] += 1
+
+        # bucket -> cell_id -> [sum, count]
+        satellite_buckets: dict[int, dict[str, list]] = {}
+        for cell_id, timestamp, temp in satellite_rows:
+            bucket = (timestamp // bucket_seconds) * bucket_seconds
+            cell_acc = satellite_buckets.setdefault(bucket, {}).setdefault(
+                cell_id, [Decimal(0), 0]
+            )
+            cell_acc[0] += temp
+            cell_acc[1] += 1
+
+        groups = []
+        for bucket in sorted(station_buckets):
+            sat_cells = satellite_buckets.get(bucket)
+            if not sat_cells:
+                continue
+            # zone -> [bias_sum, station_count]
+            zone_acc: dict[str, list] = {
+                "urban": [Decimal(0), 0],
+                "rural": [Decimal(0), 0],
+            }
+            for cell_id, per_station in station_buckets[bucket].items():
+                if cell_id not in sat_cells:
+                    continue
+                n_station = len(per_station)
+                if n_station < min_count:
+                    continue
+                sat_total, sat_count = sat_cells[cell_id]
+                lst_mean = sat_total / sat_count
+                zone = zones[cell_id]
+                for total, count in per_station.values():
+                    zone_acc[zone][0] += total / count - lst_mean
+                    zone_acc[zone][1] += 1
+            n_urban = zone_acc["urban"][1]
+            n_rural = zone_acc["rural"][1]
+            if n_urban == 0 or n_rural == 0:
+                continue
+            urban_bias = zone_acc["urban"][0] / n_urban
+            rural_bias = zone_acc["rural"][0] / n_rural
+            uhi = urban_bias - rural_bias
+            groups.append(
+                '{"key":' + str(bucket)
+                + ',"n_urban":' + str(n_urban)
+                + ',"n_rural":' + str(n_rural)
+                + ',"urban_bias":"' + _format6(urban_bias) + '"'
+                + ',"rural_bias":"' + _format6(rural_bias) + '"'
+                + ',"uhi":"' + _format6(uhi) + '"'
+                + '}'
+            )
 
         return (
             '{"minutes":' + str(minutes)
