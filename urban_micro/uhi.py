@@ -8115,6 +8115,299 @@ def scenario_sensitivity(
         )
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite number {value!r} is not valid JSON input")
+
+
+def scenario_decision(reports: dict, weights: dict) -> str:
+    """Combine per-panel scenario sensitivity reports into one decision.
+
+    ``reports`` maps ``(region, window)`` two-tuples of non-empty strings
+    to :func:`scenario_sensitivity` JSON output strings; every report must
+    rank the same set of at least two scenario keys and agree on each
+    key's ``kind`` and ``share``. ``weights`` maps exactly the same
+    ``(region, window)`` keys to positive finite non-boolean int/float
+    panel weights. Passing a non-dict for either argument raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+
+    Within a panel the candidate is the rank object with the smallest
+    ``rank``; the panel recommends its candidate only when the candidate
+    is ``stable``, every pair involving it has ``reject`` true and the
+    pair ``diff`` is negative when the candidate is ``a`` and positive
+    when it is ``b``.
+
+    With ``W`` the total weight, each scenario's ``score`` is the
+    weighted average of its panel scores, its ``support`` is the total
+    weight of the panels recommending it divided by ``W`` and its
+    ``stable`` is true only when it is stable in every panel. Scenarios
+    are ranked ascending by ``(score, key)`` with integer ranks starting
+    at 1. ``recommend`` is the first-ranked key when it is stable and its
+    support is exactly 1, and ``null`` otherwise.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``total_weight, recommend, ranks`` and each
+    rank object uses the key order
+    ``key, kind, share, score, support, rank, stable`` in ascending
+    ``(rank, key)`` order. Keys and kinds render as JSON strings,
+    ``stable`` as a boolean, ``rank`` as an integer and ``total_weight``,
+    ``share``, ``score`` and ``support`` with exactly six decimals,
+    negative zero normalized to ``0.000000``. Empty ``reports`` requires
+    empty ``weights`` and yields
+    ``{"total_weight":0.000000,"recommend":null,"ranks":[]}``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    for panel in reports:
+        if (
+            not isinstance(panel, tuple)
+            or len(panel) != 2
+            or not isinstance(panel[0], str)
+            or not panel[0]
+            or not isinstance(panel[1], str)
+            or not panel[1]
+        ):
+            raise ValueError(
+                "each reports key must be a (region, window) tuple of two "
+                "non-empty strings"
+            )
+    if set(weights) != set(reports):
+        raise ValueError("weights keys must be exactly the reports keys")
+    weight_values: dict[tuple, Decimal] = {}
+    for panel, weight in weights.items():
+        decimal_weight = _validate_finite_number(weight, "each weight")
+        if decimal_weight <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values[panel] = decimal_weight
+
+    if not reports:
+        return '{"total_weight":0.000000,"recommend":null,"ranks":[]}\n'
+
+    # panel -> per-scenario parsed values, plus the panel's pair records.
+    panel_scores: dict[tuple, dict[str, Decimal]] = {}
+    panel_rank_numbers: dict[tuple, dict[str, Decimal]] = {}
+    panel_stables: dict[tuple, dict[str, bool]] = {}
+    panel_pairs: dict[tuple, list[tuple[str, str, Decimal, bool]]] = {}
+    scenario_keys: set[str] | None = None
+    kind_values: dict[str, str] = {}
+    share_values: dict[str, Decimal] = {}
+    for panel in sorted(reports):
+        text = reports[panel]
+        if not isinstance(text, str):
+            raise ValueError(
+                "each reports value must be a scenario_sensitivity "
+                "JSON string"
+            )
+        try:
+            document = json.loads(
+                text,
+                parse_float=Decimal,
+                parse_int=Decimal,
+                parse_constant=_reject_json_constant,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"report for {panel!r} is not valid scenario_sensitivity "
+                "output"
+            ) from exc
+        if not isinstance(document, dict):
+            raise ValueError(
+                f"report for {panel!r} must be a JSON object"
+            )
+        ranks = document.get("ranks")
+        pairs = document.get("pairs")
+        if not isinstance(ranks, list) or not isinstance(pairs, list):
+            raise ValueError(
+                f"report for {panel!r} must hold 'ranks' and 'pairs' arrays"
+            )
+
+        scores: dict[str, Decimal] = {}
+        rank_numbers: dict[str, Decimal] = {}
+        stables: dict[str, bool] = {}
+        kinds: dict[str, str] = {}
+        shares: dict[str, Decimal] = {}
+        for item in ranks:
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"report for {panel!r} has a non-object rank entry"
+                )
+            key = item.get("key")
+            kind = item.get("kind")
+            share = item.get("share")
+            score = item.get("score")
+            rank = item.get("rank")
+            stable = item.get("stable")
+            if not isinstance(key, str) or not key:
+                raise ValueError(
+                    f"report for {panel!r} has a rank entry with a "
+                    "non-empty-string 'key' violation"
+                )
+            if key in scores:
+                raise ValueError(
+                    f"report for {panel!r} ranks scenario {key!r} twice"
+                )
+            if not isinstance(kind, str):
+                raise ValueError(
+                    f"report for {panel!r} has a rank entry with a "
+                    "non-string 'kind'"
+                )
+            if (
+                not isinstance(share, Decimal)
+                or not isinstance(score, Decimal)
+                or not isinstance(rank, Decimal)
+            ):
+                raise ValueError(
+                    f"report for {panel!r} has a rank entry with "
+                    "non-numeric 'share', 'score' or 'rank'"
+                )
+            if not isinstance(stable, bool):
+                raise ValueError(
+                    f"report for {panel!r} has a rank entry with a "
+                    "non-boolean 'stable'"
+                )
+            scores[key] = score
+            rank_numbers[key] = rank
+            stables[key] = stable
+            kinds[key] = kind
+            shares[key] = share
+
+        keys = set(scores)
+        if scenario_keys is None:
+            if len(keys) < 2:
+                raise ValueError(
+                    "each report must rank at least two scenarios"
+                )
+            scenario_keys = keys
+            kind_values = kinds
+            share_values = shares
+        else:
+            if keys != scenario_keys:
+                raise ValueError(
+                    "all reports must rank the same scenario keys"
+                )
+            for key in keys:
+                if (
+                    kinds[key] != kind_values[key]
+                    or shares[key] != share_values[key]
+                ):
+                    raise ValueError(
+                        f"scenario {key!r} must keep the same kind and "
+                        "share across reports"
+                    )
+
+        pair_records: list[tuple[str, str, Decimal, bool]] = []
+        for item in pairs:
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"report for {panel!r} has a non-object pair entry"
+                )
+            key_a = item.get("a")
+            key_b = item.get("b")
+            diff = item.get("diff")
+            reject = item.get("reject")
+            if not isinstance(key_a, str) or not isinstance(key_b, str):
+                raise ValueError(
+                    f"report for {panel!r} has a pair entry with "
+                    "non-string 'a' or 'b'"
+                )
+            if not isinstance(diff, Decimal):
+                raise ValueError(
+                    f"report for {panel!r} has a pair entry with a "
+                    "non-numeric 'diff'"
+                )
+            if not isinstance(reject, bool):
+                raise ValueError(
+                    f"report for {panel!r} has a pair entry with a "
+                    "non-boolean 'reject'"
+                )
+            pair_records.append((key_a, key_b, diff, reject))
+
+        panel_scores[panel] = scores
+        panel_rank_numbers[panel] = rank_numbers
+        panel_stables[panel] = stables
+        panel_pairs[panel] = pair_records
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = Decimal(0)
+        for panel in sorted(reports):
+            total_weight += weight_values[panel]
+
+        # Each panel recommends its lowest-rank candidate only when the
+        # candidate is stable, every pair involving it rejects and the
+        # pair difference points away from the candidate.
+        support_weight = {key: Decimal(0) for key in scenario_keys}
+        for panel in sorted(reports):
+            rank_numbers = panel_rank_numbers[panel]
+            candidate = min(
+                rank_numbers, key=lambda key: (rank_numbers[key], key)
+            )
+            if not panel_stables[panel][candidate]:
+                continue
+            recommended = True
+            for key_a, key_b, diff, reject in panel_pairs[panel]:
+                if key_a == candidate:
+                    if not reject or diff >= 0:
+                        recommended = False
+                        break
+                elif key_b == candidate:
+                    if not reject or diff <= 0:
+                        recommended = False
+                        break
+            if recommended:
+                support_weight[candidate] += weight_values[panel]
+
+        scores = {}
+        supports = {}
+        stables = {}
+        for key in scenario_keys:
+            accumulated = Decimal(0)
+            stable = True
+            for panel in sorted(reports):
+                accumulated += weight_values[panel] * panel_scores[panel][key]
+                if not panel_stables[panel][key]:
+                    stable = False
+            scores[key] = accumulated / total_weight
+            supports[key] = support_weight[key] / total_weight
+            stables[key] = stable
+
+        ranked = sorted(scores, key=lambda key: (scores[key], key))
+        first = ranked[0]
+        recommend = (
+            first if stables[first] and supports[first] == 1 else None
+        )
+
+        rank_items = []
+        for index, key in enumerate(ranked):
+            rank_items.append(
+                '{"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"kind":'
+                + json.dumps(kind_values[key], ensure_ascii=False)
+                + ',"share":' + _format6(share_values[key])
+                + ',"score":' + _format6(scores[key])
+                + ',"support":' + _format6(supports[key])
+                + ',"rank":' + str(index + 1)
+                + ',"stable":' + ("true" if stables[key] else "false")
+                + '}'
+            )
+        return (
+            '{"total_weight":' + _format6(total_weight)
+            + ',"recommend":'
+            + (
+                json.dumps(recommend, ensure_ascii=False)
+                if recommend is not None
+                else "null"
+            )
+            + ',"ranks":[' + ",".join(rank_items) + ']}'
+            + "\n"
+        )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
