@@ -9,6 +9,7 @@ from fractions import Fraction
 from itertools import combinations, permutations
 import json
 import math
+import re
 
 __all__ = [
     "compute_uhi",
@@ -75,6 +76,7 @@ __all__ = [
     "temperature_fusion_uhi_report",
     "surface_morphology_report",
     "surface_thermal_zone_scenario_report",
+    "decision_priority_consensus",
     "decision_priority_shift",
 ]
 
@@ -8987,6 +8989,33 @@ def _decision_priority_matrix_parse_constant(value: str) -> Decimal:
     raise ValueError(_PRIORITY_MATRIX_ERROR)
 
 
+_PRIORITY_MATRIX_FLOAT_RE = re.compile(r"-?\d+\.\d{6}")
+_PRIORITY_MATRIX_INT_RE = re.compile(r"\d+")
+
+
+class _PriorityMatrixFloat(Decimal):
+    """Marker for a JSON float token in canonical six-decimal form."""
+
+
+class _PriorityMatrixInt(Decimal):
+    """Marker for a JSON integer token in canonical unsigned form."""
+
+
+def _decision_priority_matrix_parse_float(token: str) -> Decimal:
+    # ``total_weight`` and ``priority`` must render as six-decimal
+    # fractions with no exponent.
+    if not _PRIORITY_MATRIX_FLOAT_RE.fullmatch(token):
+        raise ValueError(_PRIORITY_MATRIX_ERROR)
+    return _PriorityMatrixFloat(token)
+
+
+def _decision_priority_matrix_parse_int(token: str) -> Decimal:
+    # Ranks and rank statistics must render as unsigned decimal integers.
+    if not _PRIORITY_MATRIX_INT_RE.fullmatch(token):
+        raise ValueError(_PRIORITY_MATRIX_ERROR)
+    return _PriorityMatrixInt(token)
+
+
 def _decision_priority_matrix_groups(raw: object) -> dict:
     """Parse one :func:`decision_priority_matrix` JSON output.
 
@@ -8996,11 +9025,14 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
     """
     if not isinstance(raw, str):
         raise ValueError(_PRIORITY_MATRIX_ERROR)
+    # Canonical matrices carry exactly one trailing newline.
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_PRIORITY_MATRIX_ERROR)
     try:
         data = json.loads(
             raw,
-            parse_float=Decimal,
-            parse_int=Decimal,
+            parse_float=_decision_priority_matrix_parse_float,
+            parse_int=_decision_priority_matrix_parse_int,
             parse_constant=_decision_priority_matrix_parse_constant,
         )
     except ValueError:
@@ -9013,7 +9045,7 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
     groups_raw = data["groups"]
     spreads_raw = data["spreads"]
     if (
-        not isinstance(total_weight, Decimal)
+        not isinstance(total_weight, _PriorityMatrixFloat)
         or not total_weight.is_finite()
         or total_weight < 0
         or not isinstance(groups_raw, list)
@@ -9023,7 +9055,7 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
 
     def _valid_rank(value: object) -> bool:
         return (
-            isinstance(value, Decimal)
+            isinstance(value, _PriorityMatrixInt)
             and value.is_finite()
             and value == value.to_integral_value()
             and value >= 1
@@ -9073,7 +9105,7 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
             if (
                 not isinstance(candidate_key, str)
                 or not candidate_key
-                or not isinstance(priority, Decimal)
+                or not isinstance(priority, _PriorityMatrixFloat)
                 or not priority.is_finite()
                 or not _valid_rank(rank)
             ):
@@ -9106,7 +9138,7 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
             or not key
             or not _valid_rank(min_rank)
             or not _valid_rank(max_rank)
-            or not isinstance(gap, Decimal)
+            or not isinstance(gap, _PriorityMatrixInt)
             or not gap.is_finite()
             or gap != gap.to_integral_value()
             or gap < 0
@@ -9277,6 +9309,150 @@ def decision_priority_shift(base: str, snapshots: dict) -> str:
     return (
         '{"changes":[' + ",".join(change_items) + ']'
         + ',"summary":[' + ",".join(summary_items) + ']}'
+        + "\n"
+    )
+
+
+def decision_priority_consensus(
+    base: str, snapshots: dict, evidence: dict
+) -> str:
+    """Aggregate snapshot priority shifts with per-candidate evidence.
+
+    ``base`` must be a :func:`decision_priority_matrix` JSON output and
+    ``snapshots`` a non-empty dict mapping non-empty string snapshot names
+    to :func:`decision_priority_matrix` JSON outputs that share the
+    baseline's ``(by, key)`` groups and, within each group, its candidate
+    keys. ``evidence`` must be a dict keyed by exactly the full set of
+    ``(snapshot, by, group, candidate)`` tuples with boolean values. A
+    non-string ``base``, non-dict ``snapshots`` or non-dict ``evidence``
+    raises ``TypeError``; any other contract violation raises
+    ``ValueError``.
+
+    For every candidate and each of its snapshot groups ``delta`` is the
+    snapshot rank minus the baseline rank; ``direction`` is ``"rise"``
+    when every delta is non-positive with at least one negative,
+    ``"fall"`` when every delta is non-negative with at least one
+    positive, ``"same"`` when every delta is zero and ``"mixed"``
+    otherwise. ``support`` is the share of true evidence entries across
+    the candidate's observations, computed with ``Decimal`` precision
+    1000 and ROUND_HALF_EVEN quantization to six decimals with negative
+    zero normalized to ``0.000000``. ``stable`` is true exactly when
+    every delta is zero and ``recommend`` exactly when the candidate's
+    snapshot ranks are all 1 and its evidence is all true.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``candidates,
+    recommend``. Each candidate object uses the key order ``key,
+    direction, support, stable, recommend`` with candidates in ascending
+    key order; ``stable`` and ``recommend`` render as booleans and the
+    top-level ``recommend`` lists the recommended candidate keys in
+    ascending order.
+    """
+    if not isinstance(base, str):
+        raise TypeError("base must be a str")
+    if not isinstance(snapshots, dict):
+        raise TypeError("snapshots must be a dict")
+    if not isinstance(evidence, dict):
+        raise TypeError("evidence must be a dict")
+    if not snapshots:
+        raise ValueError("snapshots must be a non-empty dict")
+    for name in snapshots:
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                "each snapshots key must be a non-empty string"
+            )
+
+    base_groups = _decision_priority_matrix_groups(base)
+    snapshot_groups: dict[str, dict] = {}
+    for name in sorted(snapshots):
+        groups = _decision_priority_matrix_groups(snapshots[name])
+        if set(groups) != set(base_groups):
+            raise ValueError(
+                "each snapshot must share the baseline's (by, key) groups"
+            )
+        for group_key, ranks in groups.items():
+            if set(ranks) != set(base_groups[group_key]):
+                raise ValueError(
+                    "each snapshot group must share the baseline's "
+                    "candidate keys"
+                )
+        snapshot_groups[name] = groups
+
+    candidate_keys: set[str] = set()
+    for ranks in base_groups.values():
+        candidate_keys = set(ranks)
+        break
+
+    observations: list[tuple[str, str, str]] = [
+        (name, by, group_key)
+        for name in sorted(snapshot_groups)
+        for by, group_key in base_groups
+    ]
+    expected_evidence = {
+        (name, by, group_key, candidate_key)
+        for name, by, group_key in observations
+        for candidate_key in candidate_keys
+    }
+    if set(evidence) != expected_evidence:
+        raise ValueError(
+            "evidence keys must be the full "
+            "(snapshot, by, group, candidate) set"
+        )
+    for value in evidence.values():
+        if not isinstance(value, bool):
+            raise ValueError("each evidence value must be a bool")
+
+    candidate_items: list[str] = []
+    recommend_keys: list[str] = []
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for candidate_key in sorted(candidate_keys):
+            deltas: list[int] = []
+            true_count = 0
+            all_rank_one = True
+            for name, by, group_key in observations:
+                rank = snapshot_groups[name][(by, group_key)][
+                    candidate_key
+                ]
+                deltas.append(
+                    rank - base_groups[(by, group_key)][candidate_key]
+                )
+                if rank != 1:
+                    all_rank_one = False
+                if evidence[(name, by, group_key, candidate_key)]:
+                    true_count += 1
+            if all(delta == 0 for delta in deltas):
+                direction = "same"
+            elif all(delta <= 0 for delta in deltas):
+                direction = "rise"
+            elif all(delta >= 0 for delta in deltas):
+                direction = "fall"
+            else:
+                direction = "mixed"
+            stable = all(delta == 0 for delta in deltas)
+            recommend = all_rank_one and true_count == len(deltas)
+            support = Decimal(true_count) / Decimal(len(deltas))
+            if recommend:
+                recommend_keys.append(candidate_key)
+            candidate_items.append(
+                '{"key":'
+                + json.dumps(candidate_key, ensure_ascii=False)
+                + ',"direction":' + json.dumps(direction)
+                + ',"support":' + _format6(support)
+                + ',"stable":' + ("true" if stable else "false")
+                + ',"recommend":' + ("true" if recommend else "false")
+                + '}'
+            )
+
+    return (
+        '{"candidates":[' + ",".join(candidate_items) + ']'
+        + ',"recommend":['
+        + ",".join(
+            json.dumps(key, ensure_ascii=False) for key in recommend_keys
+        )
+        + ']}'
         + "\n"
     )
 
