@@ -12077,10 +12077,18 @@ def _frontier_intervals_parse(
 
 
 def _frontier_attribution_validate(
-    reports: dict, weights: dict, factors: dict
+    reports: dict,
+    weights: dict,
+    factors: dict,
+    *,
+    name: str = "factors",
+    categories: tuple = ("weather", "cover", "morphology"),
 ) -> tuple[list, dict, dict, set]:
     """Validate the shared ``(reports, weights, factors)`` contract of
     :func:`frontier_interval_attribution` and :func:`interval_sig`.
+
+    ``name`` and ``categories`` let :func:`intervention_sig` reuse the
+    same checks for its ``kinds`` mapping.
 
     Returns ``(panel_keys, weight_values, parsed, common_cases)`` with
     ``panel_keys`` the sorted ``(region, window)`` pairs,
@@ -12094,7 +12102,7 @@ def _frontier_attribution_validate(
     if not isinstance(weights, dict):
         raise TypeError("weights must be a dict")
     if not isinstance(factors, dict):
-        raise TypeError("factors must be a dict")
+        raise TypeError(f"{name} must be a dict")
     if len(reports) < 2:
         raise ValueError("reports must contain at least two entries")
 
@@ -12159,15 +12167,14 @@ def _frontier_attribution_validate(
     assert common_cases is not None  # reports is non-empty
     if set(factors) != common_cases:
         raise ValueError(
-            "factors keys must be exactly the case keys common to all "
+            f"{name} keys must be exactly the case keys common to all "
             "intervals"
         )
+    allowed = ", ".join(f'"{c}"' for c in categories[:-1])
+    allowed += f' or "{categories[-1]}"'
     for category in factors.values():
-        if category not in ("weather", "cover", "morphology"):
-            raise ValueError(
-                'each factors value must be "weather", "cover" or '
-                '"morphology"'
-            )
+        if category not in categories:
+            raise ValueError(f"each {name} value must be {allowed}")
     return panel_keys, weight_values, parsed, common_cases
 
 
@@ -12569,6 +12576,233 @@ def interval_sig(
             '{"start":' + _format6(start)
             + ',"end":' + _format6(end)
             + ',"items":[' + ",".join(item_strings) + "]}"
+        )
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"intervals":[' + ",".join(interval_strings) + "]}\n"
+    )
+
+
+_INTERVENTION_SIG_KINDS = ("green", "roof", "material")
+
+
+def intervention_sig(
+    reports: dict,
+    weights: dict,
+    kinds: dict,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Sign-flip significance of green/roof/material intervention gains.
+
+    ``reports``, ``weights`` and ``alpha`` follow the
+    :func:`interval_sig` contract. ``kinds`` must be a dict mapping
+    every case key shared by all intervals of all reports to exactly one
+    of ``"green"``, ``"roof"`` or ``"material"``; a non-dict ``kinds``
+    raises ``TypeError`` and every other contract violation raises
+    ``ValueError``.
+
+    For each interval, each ``region`` (``window``) key groups the
+    panels with that key. A group-kind sample holds one ``(x, weight)``
+    pair per group panel with at least one member case, ``x`` the
+    arithmetic mean of that panel's member-case gains and ``weight``
+    the panel weight; panels without a member case are skipped. The
+    ``n <= 16`` limit, the empty-sample defaults, the weighted
+    ``mean``/``se``, the ``1.96`` interval and the exact sign-flip ``p``
+    follow :func:`interval_sig`.
+
+    The ``q`` values come from a Benjamini-Hochberg adjustment over all
+    items of all intervals sorted by ascending ``(p, start, by, key,
+    kind)``; ``reject`` is ``q <= alpha`` on the unquantized values.
+    Within each group, ``rank`` orders the items by ``reject`` true
+    first, then descending ``mean``, then ascending ``kind``. All
+    arithmetic is ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, intervals``,
+    each interval uses ``start, end, groups``, each group uses ``by,
+    key, items`` and each item uses ``kind, n, mean, se, lower, upper,
+    p, q, reject, rank``. Groups list the ``region`` keys before the
+    ``window`` keys, each in ascending key order, and items follow
+    ``rank``. ``n`` and ``rank`` are integers, ``reject`` a boolean and
+    every other number renders with six decimals, negative zero
+    normalized to ``0.000000``.
+    """
+    panel_keys, weight_values, parsed, common_cases = (
+        _frontier_attribution_validate(
+            reports,
+            weights,
+            kinds,
+            name="kinds",
+            categories=_INTERVENTION_SIG_KINDS,
+        )
+    )
+    alpha_value = _portfolio_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be in (0, 1]")
+
+    case_kinds = {
+        case_key: kinds[case_key] for case_key in common_cases
+    }
+    segment_count = len(parsed[panel_keys[0]][1])
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        intervals: list[tuple[Decimal, Decimal, list]] = []
+        flat: list[tuple[Decimal, Decimal, str, str, str, dict]] = []
+        for index in range(segment_count):
+            start, end = parsed[panel_keys[0]][1][index][:2]
+
+            groups: list[tuple[str, str, list[dict]]] = []
+            for axis, by in ((0, "region"), (1, "window")):
+                for key in sorted({panel[axis] for panel in panel_keys}):
+                    items: list[dict] = []
+                    for kind in _INTERVENTION_SIG_KINDS:
+                        sample: list[tuple[Decimal, Decimal]] = []
+                        for panel in panel_keys:
+                            if panel[axis] != key:
+                                continue
+                            member = [
+                                gain
+                                for case_key, gain
+                                in parsed[panel][1][index][3].items()
+                                if case_kinds.get(case_key) == kind
+                            ]
+                            if member:
+                                sample.append((
+                                    sum(member, Decimal(0))
+                                    / Decimal(len(member)),
+                                    weight_values[panel],
+                                ))
+                        n = len(sample)
+                        if n > _INTERVAL_SIG_MAX_N:
+                            raise ValueError(
+                                "each sample must contain at most 16 "
+                                "entries"
+                            )
+                        if n == 0:
+                            mean = se = lower = upper = Decimal(0)
+                            p = Decimal(1)
+                        else:
+                            total_weight = sum(
+                                (weight for _x, weight in sample),
+                                Decimal(0),
+                            )
+                            mean = sum(
+                                (
+                                    weight * x
+                                    for x, weight in sample
+                                ),
+                                Decimal(0),
+                            ) / total_weight
+                            if n == 1:
+                                se = Decimal(0)
+                            else:
+                                se = (
+                                    sum(
+                                        (
+                                            weight * (x - mean) ** 2
+                                            for x, weight in sample
+                                        ),
+                                        Decimal(0),
+                                    )
+                                    / (Decimal(n) * total_weight)
+                                ).sqrt()
+                            lower = mean - _INTERVAL_SIG_Z * se
+                            upper = mean + _INTERVAL_SIG_Z * se
+                            threshold = abs(mean)
+                            flips = 0
+                            for mask in range(1 << n):
+                                statistic = sum(
+                                    (
+                                        weight * x
+                                        if mask >> position & 1
+                                        else -(weight * x)
+                                        for position, (x, weight)
+                                        in enumerate(sample)
+                                    ),
+                                    Decimal(0),
+                                ) / total_weight
+                                if abs(statistic) >= threshold:
+                                    flips += 1
+                            p = Decimal(flips) / Decimal(1 << n)
+                        item = {
+                            "kind": kind,
+                            "n": n,
+                            "mean": mean,
+                            "se": se,
+                            "lower": lower,
+                            "upper": upper,
+                            "p": p,
+                        }
+                        items.append(item)
+                        flat.append((p, start, by, key, kind, item))
+                    groups.append((by, key, items))
+            intervals.append((start, end, groups))
+
+        # Benjamini-Hochberg q values over all items of all intervals.
+        total = len(flat)
+        ordered = sorted(range(total), key=lambda i: flat[i][:5])
+        q_values: list[Decimal] = [Decimal(0)] * total
+        running: Decimal | None = None
+        for rank in range(total, 0, -1):
+            position = ordered[rank - 1]
+            candidate = Decimal(total) * flat[position][0] / Decimal(rank)
+            if running is None or candidate < running:
+                running = candidate
+            q_values[position] = running
+        for position in range(total):
+            item = flat[position][5]
+            item["q"] = q_values[position]
+            item["reject"] = q_values[position] <= alpha_value
+
+        # Rank the items of each group: reject first, then descending
+        # mean, then ascending kind.
+        for _start, _end, groups in intervals:
+            for _by, _key, items in groups:
+                ranked = sorted(
+                    items,
+                    key=lambda item: (
+                        not item["reject"],
+                        -item["mean"],
+                        item["kind"],
+                    ),
+                )
+                for rank, item in enumerate(ranked, 1):
+                    item["rank"] = rank
+
+    interval_strings: list[str] = []
+    for start, end, groups in intervals:
+        group_strings = []
+        for by, key, items in groups:
+            item_strings = []
+            for item in sorted(items, key=lambda it: it["rank"]):
+                item_strings.append(
+                    '{"kind":'
+                    + json.dumps(item["kind"], ensure_ascii=False)
+                    + ',"n":' + str(item["n"])
+                    + ',"mean":' + _format6(item["mean"])
+                    + ',"se":' + _format6(item["se"])
+                    + ',"lower":' + _format6(item["lower"])
+                    + ',"upper":' + _format6(item["upper"])
+                    + ',"p":' + _format6(item["p"])
+                    + ',"q":' + _format6(item["q"])
+                    + ',"reject":' + ("true" if item["reject"] else "false")
+                    + ',"rank":' + str(item["rank"])
+                    + "}"
+                )
+            group_strings.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_strings) + "]}"
+            )
+        interval_strings.append(
+            '{"start":' + _format6(start)
+            + ',"end":' + _format6(end)
+            + ',"groups":[' + ",".join(group_strings) + "]}"
         )
     return (
         '{"alpha":' + _format6(alpha_value)
