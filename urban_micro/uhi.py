@@ -79,6 +79,7 @@ __all__ = [
     "decision_priority_shift",
     "decision_priority_consensus",
     "portfolio",
+    "portfolio_attribution",
     "portfolio_robustness",
 ]
 
@@ -9894,8 +9895,9 @@ def portfolio_robustness(
     ascending scenario-name order. Every numeric value except ``rank``
     renders with six decimals, negative zero normalized to
     ``0.000000``. A non-dict ``reports``, ``weights``, ``gains``,
-    ``cost`` or ``rules`` raises ``TypeError``; every other contract
-    violation raises ``ValueError``.
+    ``cost`` or ``rules`` — or a non-dict per-scenario ``gains`` value —
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
     """
     if not isinstance(reports, dict):
         raise TypeError("reports must be a dict")
@@ -9946,7 +9948,7 @@ def portfolio_robustness(
     for s, name in enumerate(scenario_names):
         scenario_gain = gains[name]
         if not isinstance(scenario_gain, dict):
-            raise ValueError("each gains value must be a dict")
+            raise TypeError("each gains value must be a dict")
         if set(scenario_gain) != candidate_set:
             raise ValueError(
                 "each gains dict keys must be exactly the candidate keys"
@@ -10100,6 +10102,198 @@ def portfolio_robustness(
     return (
         '{"total_weight":' + _format6(total_weight)
         + ',"portfolios":[' + ",".join(portfolio_items) + "]}\n"
+    )
+
+
+def portfolio_attribution(
+    reports: dict,
+    weights: dict,
+    gains: dict,
+    pick: list,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Test per-candidate significance across weighted scenarios.
+
+    ``reports``, ``weights`` and ``gains`` follow the
+    :func:`portfolio_robustness` contract, with the scenario count ``n``
+    additionally limited to at most 16. ``pick`` is a list of distinct
+    candidate keys and may be empty. ``alpha`` is a non-boolean finite
+    number with ``0 < alpha <= 1``.
+
+    For each picked candidate ``i`` and scenario ``s`` the per-scenario
+    value is ``v_s = gain[s][i] * support[s][i]``. With
+    ``W = sum_s weight_s`` the statistics are ``expected = sum_s
+    weight_s * v_s / W``, ``worst = min_s v_s`` and ``sensitivity =
+    max_s v_s - worst``. The p-value is the exact sign-enumeration
+    proportion: over all ``2**n`` sign vectors, ``p`` is the proportion
+    with ``|sum_s sign_s * weight_s * v_s / W| >= |expected|``. The
+    p-values of the picked candidates are ranked ascending by
+    ``(p, key)`` and each rank ``j`` (1-based) gets the
+    Benjamini-Hochberg q-value ``q_j = min(1, min(N * p_l / l for l in
+    j..N))``; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All arithmetic is ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context. Returns a compact UTF-8 JSON string with
+    no spaces and exactly one trailing newline; the top-level key order
+    is ``alpha, total_weight, items``. Each item uses the key order
+    ``key, n, expected, worst, sensitivity, p, q, reject`` with items in
+    ascending key order; ``n`` is the integer scenario count, ``reject``
+    is a boolean and every other numeric value renders with six
+    decimals, negative zero normalized to ``0.000000``. An empty
+    ``pick`` yields ``"items":[]``. A non-dict ``reports``, ``weights``
+    or ``gains``, a non-dict per-scenario ``gains`` value or a non-list
+    ``pick`` raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(gains, dict):
+        raise TypeError("gains must be a dict")
+    if not isinstance(pick, list):
+        raise TypeError("pick must be a list")
+
+    if len(reports) < 2:
+        raise ValueError("reports must contain at least two scenarios")
+    if len(reports) > 16:
+        raise ValueError("reports must contain at most 16 scenarios")
+    scenario_names: list[str] = []
+    for name in reports:
+        if not isinstance(name, str) or not name:
+            raise ValueError("each reports key must be a non-empty string")
+        scenario_names.append(name)
+    scenario_names.sort()
+
+    scenario_keys: list[list[str]] = []
+    scenario_supports: list[list[Decimal]] = []
+    candidate_set: set[str] | None = None
+    for name in scenario_names:
+        pairs = _consensus_candidates(reports[name])
+        keys = [key for key, _ in pairs]
+        if candidate_set is None:
+            candidate_set = set(keys)
+        elif set(keys) != candidate_set:
+            raise ValueError("every report must share the same candidate keys")
+        scenario_keys.append(keys)
+        scenario_supports.append([support for _, support in pairs])
+    assert candidate_set is not None
+
+    if set(weights) != set(scenario_names):
+        raise ValueError("weights keys must be exactly the scenario keys")
+    weight_values: list[Decimal] = []
+    total_weight = Decimal(0)
+    for name in scenario_names:
+        weight_value = _portfolio_number(weights[name], "weight")
+        if weight_value <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values.append(weight_value)
+        total_weight += weight_value
+
+    if set(gains) != set(scenario_names):
+        raise ValueError("gains keys must be exactly the scenario keys")
+    gains_by_scenario: list[list[Decimal]] = []
+    for s, name in enumerate(scenario_names):
+        scenario_gain = gains[name]
+        if not isinstance(scenario_gain, dict):
+            raise TypeError("each gains value must be a dict")
+        if set(scenario_gain) != candidate_set:
+            raise ValueError(
+                "each gains dict keys must be exactly the candidate keys"
+            )
+        keys = scenario_keys[s]
+        row: list[Decimal] = []
+        for key in keys:
+            gain_value = _portfolio_number(scenario_gain[key], "gain")
+            if gain_value < 0:
+                raise ValueError("each gain must be non-negative")
+            row.append(gain_value)
+        gains_by_scenario.append(row)
+
+    picked: set[str] = set()
+    for key in pick:
+        if not isinstance(key, str) or key not in candidate_set:
+            raise ValueError("each pick entry must be a candidate key")
+        if key in picked:
+            raise ValueError("pick keys must not repeat")
+        picked.add(key)
+
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    m = len(scenario_names)
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        index = {key: i for i, key in enumerate(scenario_keys[0])}
+        # candidate key -> (expected, worst, sensitivity, p)
+        stats: dict[str, tuple[Decimal, Decimal, Decimal, Decimal]] = {}
+        for key in sorted(picked):
+            i = index[key]
+            values = [
+                gains_by_scenario[s][i] * scenario_supports[s][i]
+                for s in range(m)
+            ]
+            weighted = Decimal(0)
+            for s in range(m):
+                weighted += weight_values[s] * values[s]
+            expected = weighted / total_weight
+            worst = min(values)
+            sensitivity = max(values) - worst
+            # |sum sign*w*v / W| >= |expected| reduces to comparing the
+            # unscaled sums since W > 0; the all-positive sign vector
+            # always meets the threshold.
+            target = abs(weighted)
+            hits = 0
+            for signs in range(1 << m):
+                total = Decimal(0)
+                for s in range(m):
+                    term = weight_values[s] * values[s]
+                    total += term if (signs >> s) & 1 else -term
+                if abs(total) >= target:
+                    hits += 1
+            p = Decimal(hits) / Decimal(1 << m)
+            stats[key] = (expected, worst, sensitivity, p)
+
+        # Benjamini-Hochberg q-values: rank ascending by (p, key), then
+        # accumulate the running minimum of N * p_l / l from the top
+        # rank down.
+        count = len(stats)
+        ranked = sorted(stats, key=lambda key: (stats[key][3], key))
+        q_values: dict[str, Decimal] = {}
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            key = ranked[rank - 1]
+            candidate = Decimal(count) * stats[key][3] / rank
+            if candidate < running:
+                running = candidate
+            q_values[key] = running
+
+        items = []
+        for key in sorted(stats):
+            expected, worst, sensitivity, p = stats[key]
+            q_value = q_values[key]
+            reject = q_value <= alpha_value
+            items.append(
+                '{"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"n":' + str(m)
+                + ',"expected":' + _format6(expected)
+                + ',"worst":' + _format6(worst)
+                + ',"sensitivity":' + _format6(sensitivity)
+                + ',"p":' + _format6(p)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if reject else "false")
+                + "}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"total_weight":' + _format6(total_weight)
+        + ',"items":[' + ",".join(items) + "]}\n"
     )
 
 
