@@ -87,6 +87,7 @@ __all__ = [
     "frontier_joint",
     "frontier_interval_attribution",
     "interval_sig",
+    "intervention_portfolio",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -12785,6 +12786,358 @@ def intervention_sig(
     return (
         '{"alpha":' + _format6(alpha_value)
         + ',"intervals":[' + ",".join(interval_strings) + "]}\n"
+    )
+
+
+_INTERVENTION_PORTFOLIO_ERROR = (
+    "report must be an intervention_sig JSON output"
+)
+_INTERVENTION_PORTFOLIO_NUMBER_RE = re.compile(
+    r"-?(?:0|[1-9][0-9]*)\.[0-9]{6}"
+)
+
+
+class _InterventionNumber(Decimal):
+    """Marker for a canonical fixed-six-decimal number token."""
+
+
+def _intervention_portfolio_parse_constant(value: str) -> Decimal:
+    raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+
+
+def _intervention_portfolio_items(
+    report: str,
+) -> dict[str, list[tuple[int, Decimal, Decimal, Decimal, bool]]]:
+    """Parse one :func:`intervention_sig` JSON output.
+
+    Returns the per-kind list of ``(n, mean, lower, upper, reject)``
+    item tuples in report order. The input must be byte-for-byte
+    identical to a canonical output (key order, escaping, spacing and
+    the six-decimal number tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not report.endswith("\n") or report.endswith("\n\n"):
+        raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+    payload = report[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVENTION_PORTFOLIO_NUMBER_RE.fullmatch(value):
+            raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+        number = _InterventionNumber(value)
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+        return number
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_constant=_intervention_portfolio_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_INTERVENTION_PORTFOLIO_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "intervals"}:
+        raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+    alpha = data["alpha"]
+    intervals_raw = data["intervals"]
+    if (
+        not isinstance(alpha, _InterventionNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(intervals_raw, list)
+        or not intervals_raw
+    ):
+        raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+
+    items: dict[str, list[tuple[int, Decimal, Decimal, Decimal, bool]]] = {
+        kind: [] for kind in _INTERVENTION_KINDS
+    }
+    interval_tokens: list[str] = []
+    last_start: Decimal | None = None
+    for interval in intervals_raw:
+        if not isinstance(interval, dict) or set(interval) != {
+            "start", "end", "groups",
+        }:
+            raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+        start = interval["start"]
+        end = interval["end"]
+        groups_raw = interval["groups"]
+        if (
+            not isinstance(start, _InterventionNumber)
+            or not isinstance(end, _InterventionNumber)
+            or not isinstance(groups_raw, list)
+            or not groups_raw
+        ):
+            raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+        if last_start is not None and start < last_start:
+            raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+        last_start = start
+
+        group_tokens: list[str] = []
+        seen_by: set[str] = set()
+        last_group: tuple[str, str] | None = None
+        for group in groups_raw:
+            if not isinstance(group, dict) or set(group) != {
+                "by", "key", "items",
+            }:
+                raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+            by = group["by"]
+            key = group["key"]
+            group_items = group["items"]
+            if (
+                by not in ("region", "window")
+                or not isinstance(key, str)
+                or not isinstance(group_items, list)
+                or len(group_items) != len(_INTERVENTION_KINDS)
+            ):
+                raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+            if last_group is not None and (by, key) <= last_group:
+                raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+            last_group = (by, key)
+            seen_by.add(by)
+
+            item_tokens: list[str] = []
+            last_rank_key: tuple[bool, Decimal, str] | None = None
+            for rank, item in enumerate(group_items, 1):
+                if not isinstance(item, dict) or set(item) != {
+                    "kind", "n", "mean", "se", "lower", "upper",
+                    "p", "q", "reject", "rank",
+                }:
+                    raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+                kind = item["kind"]
+                n = item["n"]
+                mean = item["mean"]
+                se = item["se"]
+                lower = item["lower"]
+                upper = item["upper"]
+                p = item["p"]
+                q = item["q"]
+                reject = item["reject"]
+                item_rank = item["rank"]
+                if (
+                    kind not in _INTERVENTION_KINDS
+                    or isinstance(n, bool)
+                    or not isinstance(n, int)
+                    or not 0 <= n <= _INTERVAL_SIG_MAX_N
+                    or not isinstance(mean, _InterventionNumber)
+                    or not isinstance(se, _InterventionNumber)
+                    or not isinstance(lower, _InterventionNumber)
+                    or not isinstance(upper, _InterventionNumber)
+                    or not isinstance(p, _InterventionNumber)
+                    or not isinstance(q, _InterventionNumber)
+                    or p < 0
+                    or p > 1
+                    or q < 0
+                    or q > 1
+                    or not isinstance(reject, bool)
+                    or isinstance(item_rank, bool)
+                    or not isinstance(item_rank, int)
+                    or item_rank != rank
+                ):
+                    raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+                rank_key = (not reject, -mean, kind)
+                if (
+                    last_rank_key is not None
+                    and rank_key < last_rank_key
+                ):
+                    raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+                last_rank_key = rank_key
+                items[kind].append((n, mean, lower, upper, reject))
+                item_tokens.append(
+                    '{"kind":' + json.dumps(kind, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"mean":' + str(mean)
+                    + ',"se":' + str(se)
+                    + ',"lower":' + str(lower)
+                    + ',"upper":' + str(upper)
+                    + ',"p":' + str(p)
+                    + ',"q":' + str(q)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+        if seen_by != {"region", "window"}:
+            raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+        interval_tokens.append(
+            '{"start":' + str(start)
+            + ',"end":' + str(end)
+            + ',"groups":[' + ",".join(group_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations
+    # (whitespace, escaping, key order); the payload must reproduce the
+    # canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + str(alpha)
+        + ',"intervals":[' + ",".join(interval_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_INTERVENTION_PORTFOLIO_ERROR)
+    return items
+
+
+def intervention_portfolio(report: str, cost: dict, budget: float) -> str:
+    """Select the best robust intervention subset under a budget.
+
+    ``report`` must be a byte-for-byte :func:`intervention_sig` JSON
+    output; ``cost`` must be a dict with exactly the keys ``"green"``,
+    ``"roof"`` and ``"material"``, each a positive finite non-boolean
+    int/float; and ``budget`` must be a non-negative finite non-boolean
+    int/float. A non-string ``report`` or a non-dict ``cost`` raises
+    ``TypeError``; every other contract violation raises
+    ``ValueError``.
+
+    Each kind aggregates its report items with ``n > 0``: ``n`` is the
+    number of such items and ``effect``, ``lower`` and ``upper`` are the
+    means of their ``mean``, ``lower`` and ``upper`` values. A kind with
+    no such item has all three values ``0`` and ``robust`` false;
+    otherwise ``robust`` holds when every member item rejects and the
+    aggregated ``lower`` is positive. Every subset of the robust kinds
+    whose total cost is at most ``budget`` is enumerated (the empty
+    subset included) and the winner maximizes the summed ``lower``, then
+    the summed ``effect``, then minimizes the summed cost, then the
+    lexicographically ascending pick list. The portfolio ``effect``,
+    ``lower`` and ``upper`` are the member sums.
+
+    All arithmetic uses ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context and comparisons use the unquantized values.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``budget, cost,
+    effect, lower, upper, pick, items`` and the items follow the
+    ``green, roof, material`` order with keys ``kind, n, effect, lower,
+    upper, robust, selected``. ``n`` is an integer, ``pick`` an
+    ascending string array, ``robust`` and ``selected`` booleans and
+    every other number renders with six decimals, negative zero
+    normalized to ``0.000000``.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+
+    items = _intervention_portfolio_items(report)
+    if set(cost) != set(_INTERVENTION_KINDS):
+        raise ValueError(
+            'cost keys must be exactly "green", "roof" and "material"'
+        )
+    costs: dict[str, Decimal] = {}
+    for kind in _INTERVENTION_KINDS:
+        cost_value = _portfolio_number(cost[kind], "cost")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        costs[kind] = cost_value
+    budget_value = _portfolio_number(budget, "budget")
+    if budget_value < 0:
+        raise ValueError("budget must be non-negative")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        summaries: dict[str, dict] = {}
+        for kind in _INTERVENTION_KINDS:
+            entries = [
+                (mean, lower, upper, reject)
+                for n, mean, lower, upper, reject in items[kind]
+                if n > 0
+            ]
+            if entries:
+                count = len(entries)
+                effect = (
+                    sum((entry[0] for entry in entries), Decimal(0))
+                    / Decimal(count)
+                )
+                lower = (
+                    sum((entry[1] for entry in entries), Decimal(0))
+                    / Decimal(count)
+                )
+                upper = (
+                    sum((entry[2] for entry in entries), Decimal(0))
+                    / Decimal(count)
+                )
+                robust = all(entry[3] for entry in entries) and lower > 0
+            else:
+                count = 0
+                effect = lower = upper = Decimal(0)
+                robust = False
+            summaries[kind] = {
+                "n": count,
+                "effect": effect,
+                "lower": lower,
+                "upper": upper,
+                "robust": robust,
+            }
+
+        robust_kinds = [
+            kind
+            for kind in _INTERVENTION_KINDS
+            if summaries[kind]["robust"]
+        ]
+        best: tuple | None = None
+        for size in range(len(robust_kinds) + 1):
+            for combo in combinations(robust_kinds, size):
+                total_cost = sum(
+                    (costs[kind] for kind in combo), Decimal(0)
+                )
+                if total_cost > budget_value:
+                    continue
+                total_lower = sum(
+                    (summaries[kind]["lower"] for kind in combo),
+                    Decimal(0),
+                )
+                total_effect = sum(
+                    (summaries[kind]["effect"] for kind in combo),
+                    Decimal(0),
+                )
+                total_upper = sum(
+                    (summaries[kind]["upper"] for kind in combo),
+                    Decimal(0),
+                )
+                pick = tuple(sorted(combo))
+                rank_key = (
+                    -total_lower, -total_effect, total_cost, pick,
+                )
+                if best is None or rank_key < best[0]:
+                    best = (
+                        rank_key, pick, total_cost,
+                        total_effect, total_lower, total_upper,
+                    )
+
+        assert best is not None  # the empty subset is always feasible
+        _rank_key, pick, total_cost, total_effect, total_lower, total_upper = (
+            best
+        )
+        selected = set(pick)
+
+    item_strings: list[str] = []
+    for kind in _INTERVENTION_KINDS:
+        summary = summaries[kind]
+        item_strings.append(
+            '{"kind":' + json.dumps(kind, ensure_ascii=False)
+            + ',"n":' + str(summary["n"])
+            + ',"effect":' + _format6(summary["effect"])
+            + ',"lower":' + _format6(summary["lower"])
+            + ',"upper":' + _format6(summary["upper"])
+            + ',"robust":' + ("true" if summary["robust"] else "false")
+            + ',"selected":' + ("true" if kind in selected else "false")
+            + "}"
+        )
+    pick_json = json.dumps(
+        list(pick), ensure_ascii=False, separators=(",", ":")
+    )
+    return (
+        '{"budget":' + _format6(budget_value)
+        + ',"cost":' + _format6(total_cost)
+        + ',"effect":' + _format6(total_effect)
+        + ',"lower":' + _format6(total_lower)
+        + ',"upper":' + _format6(total_upper)
+        + ',"pick":' + pick_json
+        + ',"items":[' + ",".join(item_strings) + "]}\n"
     )
 
 
