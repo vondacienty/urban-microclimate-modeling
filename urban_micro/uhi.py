@@ -13933,6 +13933,235 @@ def frontier_mix_robust(frontiers: dict, weights: dict) -> str:
     )
 
 
+_FRONTIER_MIX_RANK_MAX_GROUP = 16
+
+
+def frontier_mix_rank_report(
+    frontiers: dict, weights: dict, *, alpha: float = 0.05
+) -> str:
+    """Rank the picks of a weighted frontier blend and test each pair.
+
+    ``frontiers`` and ``weights`` follow the :func:`frontier_mix`
+    contract exactly: a non-dict argument raises ``TypeError`` and every
+    other violation raises ``ValueError``, including frontier reports
+    whose budget sequences or ``(by, key)`` panel sets differ. ``alpha``
+    is a non-boolean finite number with ``0 < alpha <= 1``.
+
+    With ``W`` the total weight, each budget's scenarios are grouped by
+    pick; a group's ``support`` is ``Σw/W`` and its ``effect`` is
+    ``Σ(w·e)/Σw`` over its scenarios. Groups are ranked by descending
+    ``support``, then descending ``effect``, then ascending pick, with
+    ``rank`` the 1-based position. A group's ``stable`` is true only
+    when deleting any single scenario leaves the group present and its
+    rank unchanged.
+
+    Every pair ``a < b`` of distinct picks at a budget contributes one
+    ``tests`` entry with ``diff = effect_a − effect_b``; a pair whose
+    two groups total more than 16 scenarios raises ``ValueError``. The
+    scenarios' ``(weight, effect)`` pairs are enumerated over every
+    assignment into two groups of the observed sizes and ``p`` is the
+    proportion with ``|diff′| >= |diff|``. All tests across every
+    budget are ranked ascending by ``(p, budget, a, b)`` and each rank
+    ``j`` (1-based) gets the Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha`` (compared on the unquantized values).
+
+    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
+    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, points`` and
+    each point uses the key order ``budget, ranks, tests`` with ranks
+    using ``pick, n, support, effect, rank, stable`` and tests using
+    ``a, b, n_a, n_b, diff, p, q, reject``. Points are in ascending
+    budget order, ranks in ascending rank order and tests in ascending
+    ``(a, b)`` order. ``pick``, ``a`` and ``b`` are ascending string
+    arrays, ``n``, ``n_a``, ``n_b`` and ``rank`` are integers,
+    ``stable`` and ``reject`` are booleans and every other number
+    renders with six decimals, negative zero normalized to
+    ``0.000000``.
+    """
+    case_keys, weight_values, parsed, budgets, _panel_keys = (
+        _frontier_mix_inputs(frontiers, weights)
+    )
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = sum(
+            (weight_values[key] for key in case_keys), Decimal(0)
+        )
+
+        def _groups(
+            index: int, keys: list[str]
+        ) -> dict[tuple[str, ...], list]:
+            # pick -> [n, weight sum, weighted effect sum]
+            groups: dict[tuple[str, ...], list] = {}
+            for key in keys:
+                point = parsed[key][1][index]
+                entry = groups.setdefault(
+                    point[3], [0, Decimal(0), Decimal(0)]
+                )
+                entry[0] += 1
+                entry[1] += weight_values[key]
+                entry[2] += weight_values[key] * point[0]
+            return groups
+
+        def _ranking(
+            groups: dict[tuple[str, ...], list], total: Decimal
+        ) -> list[tuple[str, ...]]:
+            return sorted(
+                groups,
+                key=lambda pick: (
+                    -(groups[pick][1] / total),
+                    -(groups[pick][2] / groups[pick][1]),
+                    pick,
+                ),
+            )
+
+        point_strings: list[tuple] = []
+        all_tests: list[tuple] = []
+        for index, budget in enumerate(budgets):
+            groups = _groups(index, case_keys)
+            ranking = _ranking(groups, total_weight)
+
+            rank_strings: list[str] = []
+            for rank, pick in enumerate(ranking, start=1):
+                n, weight_sum, effect_sum = groups[pick]
+                stable = True
+                for dropped in case_keys:
+                    remaining = [k for k in case_keys if k != dropped]
+                    sub_groups = _groups(index, remaining)
+                    if pick not in sub_groups:
+                        stable = False
+                        break
+                    sub_total = total_weight - weight_values[dropped]
+                    sub_ranking = _ranking(sub_groups, sub_total)
+                    if sub_ranking.index(pick) + 1 != rank:
+                        stable = False
+                        break
+                rank_strings.append(
+                    '{"pick":'
+                    + json.dumps(
+                        list(pick), ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + ',"n":' + str(n)
+                    + ',"support":' + _format6(weight_sum / total_weight)
+                    + ',"effect":' + _format6(effect_sum / weight_sum)
+                    + ',"rank":' + str(rank)
+                    + ',"stable":' + ("true" if stable else "false")
+                    + "}"
+                )
+
+            pairs: list[tuple] = []
+            for a, b in combinations(sorted(groups), 2):
+                members = {a: [], b: []}
+                for key in case_keys:
+                    point = parsed[key][1][index]
+                    if point[3] in members:
+                        members[point[3]].append(
+                            (weight_values[key], point[0])
+                        )
+                units = members[a] + members[b]
+                n_a = len(members[a])
+                n_b = len(members[b])
+                if n_a + n_b > _FRONTIER_MIX_RANK_MAX_GROUP:
+                    raise ValueError(
+                        "paired pick groups must total at most "
+                        "16 scenarios"
+                    )
+                effect_a = groups[a][2] / groups[a][1]
+                effect_b = groups[b][2] / groups[b][1]
+                diff = effect_a - effect_b
+                n = n_a + n_b
+                total_a_weight = groups[a][1]
+                total_a_effect = groups[a][2]
+                total_weight_ab = total_a_weight + groups[b][1]
+                total_effect_ab = total_a_effect + groups[b][2]
+                magnitude = abs(diff)
+                hits = 0
+                assignments = math.comb(n, n_a)
+                for combo in combinations(range(n), n_a):
+                    weight_a = Decimal(0)
+                    effect_sum_a = Decimal(0)
+                    for i in combo:
+                        weight_a += units[i][0]
+                        effect_sum_a += units[i][0] * units[i][1]
+                    weight_b = total_weight_ab - weight_a
+                    effect_sum_b = total_effect_ab - effect_sum_a
+                    permuted = (
+                        effect_sum_a / weight_a
+                        - effect_sum_b / weight_b
+                    )
+                    if abs(permuted) >= magnitude:
+                        hits += 1
+                p = Decimal(hits) / Decimal(assignments)
+                all_tests.append((budget, a, b, n_a, n_b, diff, p))
+                pairs.append((a, b))
+
+            point_strings.append((budget, rank_strings, pairs))
+
+        # Benjamini-Hochberg q-values over every test: rank ascending by
+        # (p, budget, a, b), then accumulate the running minimum of
+        # N * p_l / l from the top rank down.
+        count = len(all_tests)
+        ranked = sorted(
+            range(count),
+            key=lambda i: (
+                all_tests[i][6], all_tests[i][0],
+                all_tests[i][1], all_tests[i][2],
+            ),
+        )
+        q_values = [Decimal(1)] * count
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            candidate = Decimal(count) * all_tests[ranked[rank - 1]][6] / rank
+            if candidate < running:
+                running = candidate
+            q_values[ranked[rank - 1]] = running
+
+        test_cursor = 0
+        rendered_points: list[str] = []
+        for budget, rank_strings, pairs in point_strings:
+            test_strings = []
+            for a, b in pairs:
+                _, _, _, n_a, n_b, diff, p = all_tests[test_cursor]
+                q_value = q_values[test_cursor]
+                test_cursor += 1
+                test_strings.append(
+                    '{"a":'
+                    + json.dumps(
+                        list(a), ensure_ascii=False, separators=(",", ":")
+                    )
+                    + ',"b":'
+                    + json.dumps(
+                        list(b), ensure_ascii=False, separators=(",", ":")
+                    )
+                    + ',"n_a":' + str(n_a)
+                    + ',"n_b":' + str(n_b)
+                    + ',"diff":' + _format6(diff)
+                    + ',"p":' + _format6(p)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":'
+                    + ("true" if q_value <= alpha_value else "false")
+                    + "}"
+                )
+            rendered_points.append(
+                '{"budget":' + _format6(budget)
+                + ',"ranks":[' + ",".join(rank_strings) + "]"
+                + ',"tests":[' + ",".join(test_strings) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"points":[' + ",".join(rendered_points) + "]}\n"
+    )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
