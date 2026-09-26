@@ -3,6 +3,7 @@
 from .uhi import (
     align_temp,
     attribute_effects,
+    budget_frontier,
     compute_uhi,
     decision_priority_matrix,
     decision_priority_shift,
@@ -99,6 +100,7 @@ __all__ = [
     "__version__",
     "align_temp",
     "attribute_effects",
+    "budget_frontier",
     "compute_uhi",
     "decision_priority_matrix",
     "decision_priority_shift",

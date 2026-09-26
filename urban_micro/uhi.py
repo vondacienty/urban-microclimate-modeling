@@ -88,7 +88,6 @@ __all__ = [
     "frontier_interval_attribution",
     "interval_sig",
     "intervention_sig",
-    "intervention_portfolio",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -12805,16 +12804,21 @@ def _intervention_sig_parse_constant(value: str) -> Decimal:
     raise ValueError(_INTERVENTION_SIG_ERROR)
 
 
-def _intervention_sig_pool(
+def _intervention_sig_parse(
     raw: object,
-) -> dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]]:
+) -> tuple[
+    dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]],
+    dict[tuple[str, str], dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]]],
+]:
     """Parse one :func:`intervention_sig` JSON output, pooling by kind.
 
-    Returns one ``(mean, lower, upper, reject)`` tuple per item with
-    ``n > 0`` for each of ``green``, ``roof`` and ``material``. The
-    input must be byte-for-byte identical to a canonical output (key
-    order, escaping, spacing, group order, ranks and the six-decimal
-    number tokens included); any deviation raises ``ValueError``.
+    Returns a pair ``(pooled, panels)``. ``pooled`` holds one
+    ``(mean, lower, upper, reject)`` tuple per item with ``n > 0`` for
+    each of ``green``, ``roof`` and ``material``; ``panels`` maps each
+    ``(by, key)`` group to the same tuples split by kind. The input
+    must be byte-for-byte identical to a canonical output (key order,
+    escaping, spacing, group order, ranks and the six-decimal number
+    tokens included); any deviation raises ``ValueError``.
     """
     if not isinstance(raw, str):
         raise ValueError(_INTERVENTION_SIG_ERROR)
@@ -12856,6 +12860,10 @@ def _intervention_sig_pool(
     pooled: dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]] = {
         kind: [] for kind in _INTERVENTION_KINDS
     }
+    panels: dict[
+        tuple[str, str],
+        dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]],
+    ] = {}
     interval_tokens: list[str] = []
     previous_start: Decimal | None = None
     for interval in intervals:
@@ -12907,6 +12915,9 @@ def _intervention_sig_pool(
                 raise ValueError(_INTERVENTION_SIG_ERROR)
             section_keys[by] = key
             section_counts[by] += 1
+            panel = panels.setdefault(
+                (by, key), {kind: [] for kind in _INTERVENTION_KINDS}
+            )
             if not isinstance(items, list) or len(items) != len(
                 _INTERVENTION_KINDS
             ):
@@ -12971,6 +12982,7 @@ def _intervention_sig_pool(
 
                 if count > 0:
                     pooled[kind].append((mean, lower, upper, reject))
+                    panel[kind].append((mean, lower, upper, reject))
                 item_tokens.append(
                     '{"kind":' + json.dumps(kind, ensure_ascii=False)
                     + ',"n":' + str(count)
@@ -13008,7 +13020,7 @@ def _intervention_sig_pool(
     )
     if payload != canonical:
         raise ValueError(_INTERVENTION_SIG_ERROR)
-    return pooled
+    return pooled, panels
 
 
 def intervention_portfolio(report: str, cost: dict, budget: float) -> str:
@@ -13053,7 +13065,7 @@ def intervention_portfolio(report: str, cost: dict, budget: float) -> str:
         raise TypeError("report must be a str")
     if not isinstance(cost, dict):
         raise TypeError("cost must be a dict")
-    pooled = _intervention_sig_pool(report)
+    pooled, _panels = _intervention_sig_parse(report)
     if set(cost) != set(_INTERVENTION_KINDS):
         raise ValueError(
             "cost keys must be exactly 'green', 'roof' and 'material'"
@@ -13172,6 +13184,209 @@ def intervention_portfolio(report: str, cost: dict, budget: float) -> str:
         + ',"pick":' + pick_json
         + ',"items":[' + item_payload + "]}\n"
     )
+
+
+def budget_frontier(report: str, cost: dict, budgets: list) -> str:
+    """Trace the optimal intervention portfolio across a budget frontier.
+
+    ``report`` must be byte-for-byte identical to an
+    :func:`intervention_sig` JSON output; ``cost`` is a dict whose key
+    set is exactly ``{"green", "roof", "material"}`` with strictly
+    positive finite non-boolean int/float values; ``budgets`` is a
+    non-empty list of pairwise distinct non-negative finite non-boolean
+    int/float values. A non-string ``report``, a non-dict ``cost`` or a
+    non-list ``budgets`` raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+
+    The budgets are sorted ascending and one frontier point is computed
+    per budget, reusing the pooling, robustness, feasibility and
+    winner-selection rules of :func:`intervention_portfolio`: items are
+    pooled by kind, a kind is robust when every pooled item rejects
+    with ``lower > 0``, the feasible subsets of the robust kinds are
+    ranked by descending total pooled lower bound, then descending
+    total effect, then ascending total cost, then lexicographically
+    ascending picked kinds. ``switch`` is ``true`` when the point's
+    pick differs from the previous point's; the first point has
+    ``switch = false``.
+
+    Each point also carries one panel per ``(by, key)`` group of the
+    report, ``region`` groups before ``window`` groups with ascending
+    keys within each. A panel pools the items with ``n > 0`` whose kind
+    is picked at that point, across every interval: ``n`` is the number
+    of such items and ``effect``, ``lower`` and ``upper`` are the
+    arithmetic means of their ``mean``, ``lower`` and ``upper`` values,
+    all zero when the panel has no items.
+
+    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
+    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``points``, each point
+    uses ``budget, cost, effect, lower, upper, pick, switch, panels``
+    and each panel uses ``by, key, n, effect, lower, upper``. ``n`` is
+    an integer, ``switch`` a boolean, ``pick`` an ascending string
+    array and every other number renders with six decimals, negative
+    zero normalized to ``0.000000``.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+    if not isinstance(budgets, list):
+        raise TypeError("budgets must be a list")
+    pooled, panels = _intervention_sig_parse(report)
+    if set(cost) != set(_INTERVENTION_KINDS):
+        raise ValueError(
+            "cost keys must be exactly 'green', 'roof' and 'material'"
+        )
+    cost_values: dict[str, Decimal] = {}
+    for kind in _INTERVENTION_KINDS:
+        cost_value = _portfolio_number(cost[kind], "cost")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        cost_values[kind] = cost_value
+    if not budgets:
+        raise ValueError("budgets must be a non-empty list")
+    budget_values: list[Decimal] = []
+    seen_budgets: set[Decimal] = set()
+    for budget in budgets:
+        budget_value = _portfolio_number(budget, "budget")
+        if budget_value < 0:
+            raise ValueError("each budget must be non-negative")
+        if budget_value in seen_budgets:
+            raise ValueError("budgets must be distinct")
+        seen_budgets.add(budget_value)
+        budget_values.append(budget_value)
+    budget_values.sort()
+
+    panel_keys = sorted(
+        panels, key=lambda pair: (pair[0] != "region", pair[1])
+    )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        kind_stats: dict[str, tuple[int, Decimal, Decimal, Decimal, bool]] = {}
+        robust_kinds: list[str] = []
+        for kind in _INTERVENTION_KINDS:
+            members = pooled[kind]
+            count = len(members)
+            if count == 0:
+                kind_stats[kind] = (
+                    0, Decimal(0), Decimal(0), Decimal(0), False,
+                )
+                continue
+            effect = sum(
+                (member[0] for member in members), Decimal(0)
+            ) / Decimal(count)
+            lower = sum(
+                (member[1] for member in members), Decimal(0)
+            ) / Decimal(count)
+            upper = sum(
+                (member[2] for member in members), Decimal(0)
+            ) / Decimal(count)
+            robust = all(
+                member[3] and member[1] > 0 for member in members
+            )
+            kind_stats[kind] = (count, effect, lower, upper, robust)
+            if robust:
+                robust_kinds.append(kind)
+        robust_kinds.sort()
+
+        point_strings: list[str] = []
+        previous_pick: tuple[str, ...] | None = None
+        for budget_value in budget_values:
+            best: tuple[
+                Decimal, Decimal, Decimal, tuple[str, ...]
+            ] | None = None
+            for size in range(len(robust_kinds) + 1):
+                for idxs in combinations(range(len(robust_kinds)), size):
+                    pick = tuple(robust_kinds[i] for i in idxs)
+                    total_cost = sum(
+                        (cost_values[kind] for kind in pick), Decimal(0)
+                    )
+                    if total_cost > budget_value:
+                        continue
+                    total_effect = sum(
+                        (kind_stats[kind][1] for kind in pick), Decimal(0)
+                    )
+                    total_lower = sum(
+                        (kind_stats[kind][2] for kind in pick), Decimal(0)
+                    )
+                    if (
+                        best is None
+                        or total_lower > best[0]
+                        or (
+                            total_lower == best[0]
+                            and (
+                                total_effect > best[1]
+                                or (
+                                    total_effect == best[1]
+                                    and (
+                                        total_cost < best[2]
+                                        or (
+                                            total_cost == best[2]
+                                            and pick < best[3]
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    ):
+                        best = (total_lower, total_effect, total_cost, pick)
+
+            assert best is not None  # the empty subset is always feasible
+            total_lower, total_effect, total_cost, pick = best
+            total_upper = sum(
+                (kind_stats[kind][3] for kind in pick), Decimal(0)
+            )
+            switch = previous_pick is not None and pick != previous_pick
+            previous_pick = pick
+
+            panel_strings: list[str] = []
+            for by, key in panel_keys:
+                items: list[tuple[Decimal, Decimal, Decimal, bool]] = []
+                for kind in pick:
+                    items.extend(panels[(by, key)][kind])
+                count = len(items)
+                if count == 0:
+                    panel_effect = Decimal(0)
+                    panel_lower = Decimal(0)
+                    panel_upper = Decimal(0)
+                else:
+                    panel_effect = sum(
+                        (item[0] for item in items), Decimal(0)
+                    ) / Decimal(count)
+                    panel_lower = sum(
+                        (item[1] for item in items), Decimal(0)
+                    ) / Decimal(count)
+                    panel_upper = sum(
+                        (item[2] for item in items), Decimal(0)
+                    ) / Decimal(count)
+                panel_strings.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"key":' + json.dumps(key, ensure_ascii=False)
+                    + ',"n":' + str(count)
+                    + ',"effect":' + _format6(panel_effect)
+                    + ',"lower":' + _format6(panel_lower)
+                    + ',"upper":' + _format6(panel_upper)
+                    + "}"
+                )
+
+            point_strings.append(
+                '{"budget":' + _format6(budget_value)
+                + ',"cost":' + _format6(total_cost)
+                + ',"effect":' + _format6(total_effect)
+                + ',"lower":' + _format6(total_lower)
+                + ',"upper":' + _format6(total_upper)
+                + ',"pick":' + json.dumps(
+                    list(pick), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"switch":' + ("true" if switch else "false")
+                + ',"panels":[' + ",".join(panel_strings) + "]}"
+            )
+
+    return '{"points":[' + ",".join(point_strings) + "]}\n"
 
 
 _TEMPORAL_LAG_MAX_N = 8
