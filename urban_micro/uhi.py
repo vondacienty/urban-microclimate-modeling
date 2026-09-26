@@ -7711,6 +7711,403 @@ def score_test(
         )
 
 
+_SCENARIO_SENSITIVITY_KINDS = ("green", "roof", "material")
+
+
+def scenario_sensitivity(
+    base: list,
+    sets: dict,
+    edges: list,
+    lags: list,
+    labels: dict,
+    windows: dict,
+    weights: dict,
+    kinds: dict,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Rank share-adjusted weighted scenario scores and test their differences.
+
+    ``base``, every table in ``sets``, ``edges``, ``lags``, ``labels``,
+    ``windows``, ``weights`` and ``minutes`` follow exactly the same
+    validation, bucketing, same-label edge pairing, edge order, exception
+    rules, ``(timestamp, cell_id)`` key-set equality, group means, weights
+    contract and score computation as :func:`score_test` (including the
+    combined-sample-size limit of 16 per in-group pair of sets). ``alpha``
+    must be a finite non-boolean int/float in ``(0, 1]``; any other value
+    raises ``ValueError``.
+
+    ``kinds`` must be a dict whose keys are exactly the ``sets`` keys; a
+    non-dict ``kinds`` raises ``TypeError``. Each value must be a
+    ``(kind, share)`` two-tuple where ``kind`` is one of ``"green"``,
+    ``"roof"`` or ``"material"`` and ``share`` is a finite non-boolean
+    int/float with ``0 < share <= 1``; every other violation raises
+    ``ValueError``.
+
+    For each group ``g`` and set ``s`` the adjusted value is
+    ``v = mean / share`` with the set's own share, and the set's score is
+    ``sum(w_g * v_g) / sum(w_g)``; sets are ranked ascending by
+    ``(score, key)``. With ``G`` the number of groups, ``G > 16`` raises
+    ``ValueError``. Each set's leave-one-group-out stability is checked by
+    deleting every group in turn and re-ranking the remaining weighted
+    scores; ``stable`` is ``true`` when the set's rank never changes, and
+    always ``true`` when ``G <= 1``.
+
+    Each pair of distinct sets ``a < b`` takes the per-group difference
+    ``d_g = v_a,g - v_b,g`` and ``diff = sum(w_g * d_g) / sum(w_g)``. The
+    exact two-sided sign-permutation p-value enumerates all ``2 ** G`` sign
+    assignments ``s`` and ``p`` is the proportion with
+    ``|sum(s_g * w_g * d_g) / sum(w_g)| >= |diff|``, compared on the
+    unquantized values. With ``N`` the number of pairs, all pairs are ranked
+    ascending by ``(p, a, b)`` and each rank ``j`` (1-based) gets the
+    Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha``, compared on the unquantized values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``ranks, pairs``, each rank object uses the key
+    order ``key, kind, share, score, rank, stable`` and each pair object the
+    key order ``a, b, diff, p, q, reject``. Ranks are in ascending
+    ``(rank, key)`` and pairs in ascending ``(a, b)`` order. Set keys and
+    ``kind`` render as JSON strings, ``rank`` as an integer, ``stable`` and
+    ``reject`` as booleans and ``share``, ``score``, ``diff``, ``p`` and
+    ``q`` with exactly six decimals, negative zero normalized to
+    ``0.000000``. With no groups the only valid input is ``weights={}`` and
+    both arrays are empty.
+    """
+    if not isinstance(sets, dict):
+        raise TypeError("sets must be a dict")
+    if len(sets) < 2:
+        raise ValueError("sets must contain at least two entries")
+    for key, table in sets.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("each sets key must be a non-empty string")
+        if not isinstance(table, list):
+            raise ValueError("each sets value must be a list")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(kinds, dict):
+        raise TypeError("kinds must be a dict")
+    if set(kinds) != set(sets):
+        raise ValueError("kinds keys must be exactly the sets keys")
+    kind_names: dict[str, str] = {}
+    share_values: dict[str, Decimal] = {}
+    for key, entry in kinds.items():
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise ValueError(
+                "each kinds value must be a (kind, share) two-tuple"
+            )
+        kind, share = entry
+        if kind not in _SCENARIO_SENSITIVITY_KINDS:
+            raise ValueError(
+                "each kind must be one of 'green', 'roof' or 'material'"
+            )
+        if isinstance(share, bool) or not isinstance(share, (int, float)):
+            raise ValueError("each share must be a finite int or float")
+        if isinstance(share, float) and not math.isfinite(share):
+            raise ValueError("each share must be finite")
+        decimal_share = Decimal(str(share))
+        if decimal_share <= 0 or decimal_share > 1:
+            raise ValueError(
+                "each share must be greater than 0 and at most 1"
+            )
+        kind_names[key] = kind
+        share_values[key] = decimal_share
+
+    minutes, lag_list, alpha_value, parsed_base, xmap_base = (
+        _lags_group_x_values(base, edges, lags, labels, minutes, alpha)
+    )
+
+    base_keys = {(row[0], row[1]) for row in parsed_base}
+
+    # key -> label -> lag -> bucket start -> [e, ...] (after-minus-base).
+    emaps: dict[str, dict] = {}
+    for key in sorted(sets):
+        _, _, _, parsed_set, xmap_set = _lags_group_x_values(
+            sets[key], edges, lags, labels, minutes, alpha
+        )
+        set_keys = {(row[0], row[1]) for row in parsed_set}
+        if set_keys != base_keys:
+            raise ValueError(
+                f"sets table {key!r} must share the same (timestamp, cell_id) "
+                "pairs as base"
+            )
+
+        with localcontext() as ctx:
+            ctx.prec = _MODEL_PRECISION
+            ctx.rounding = ROUND_HALF_EVEN
+
+            # Identical (timestamp, cell_id) key sets make the two xmaps
+            # structurally identical, so the per-(label, lag, B) value lists
+            # pair up element-wise in the same ascending edge order.
+            emap: dict[str, dict[int, dict[int, list[Decimal]]]] = {}
+            for label in sorted(xmap_base):
+                lag_map: dict[int, dict[int, list[Decimal]]] = {}
+                for lag in lag_list:
+                    base_buckets = xmap_base[label].get(lag, {})
+                    set_buckets = xmap_set[label].get(lag, {})
+                    bucket_map: dict[int, list[Decimal]] = {}
+                    for bucket in sorted(base_buckets):
+                        base_values = base_buckets[bucket]
+                        set_values = set_buckets[bucket]
+                        bucket_map[bucket] = [
+                            set_value - base_value
+                            for set_value, base_value in zip(
+                                set_values, base_values
+                            )
+                        ]
+                    lag_map[lag] = bucket_map
+                emap[label] = lag_map
+        emaps[key] = emap
+
+    # Resolve the windows contract against the base table, exactly as
+    # scenario_score does.
+    if not isinstance(windows, dict):
+        raise TypeError("windows must be a dict")
+    all_buckets: set[int] = set()
+    if parsed_base:
+        bucket_seconds = minutes * 60
+        for validated in parsed_base:
+            timestamp = validated[0]
+            all_buckets.add((timestamp // bucket_seconds) * bucket_seconds)
+    if set(windows) != all_buckets:
+        raise ValueError(
+            "windows keys must be exactly the details-derived bucket starts"
+        )
+    for bucket, name in windows.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("each window name must be a non-empty string")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (label, window, lag) -> set key -> concatenated [e, ...] over the
+        # window's buckets in ascending B order (each bucket's values already
+        # in ascending edge order).
+        triple_samples: dict[
+            tuple[str, str, int], dict[str, list[Decimal]]
+        ] = {}
+        for bucket in sorted(all_buckets):
+            name = windows[bucket]
+            for key in sorted(emaps):
+                emap = emaps[key]
+                for label in sorted(emap):
+                    for lag in lag_list:
+                        values = emap[label].get(lag, {}).get(bucket)
+                        if values:
+                            triple_samples.setdefault(
+                                (label, name, lag), {}
+                            ).setdefault(key, []).extend(values)
+
+        # Only triples with a non-empty sample carry a weight.
+        groups = sorted(triple_samples)
+        if set(weights) != set(groups):
+            raise ValueError(
+                "weights keys must be exactly the non-empty "
+                "(label, window, lag) triples"
+            )
+        weight_values: dict[tuple[str, str, int], Decimal] = {}
+        for triple, weight in weights.items():
+            if (
+                not isinstance(triple, tuple)
+                or len(triple) != 3
+                or not isinstance(triple[0], str)
+                or not isinstance(triple[1], str)
+                or isinstance(triple[2], bool)
+                or not isinstance(triple[2], int)
+            ):
+                raise ValueError(
+                    "each weights key must be a (label, window, lag) triple "
+                    "with two strings and an integer lag"
+                )
+            if isinstance(weight, bool) or not isinstance(
+                weight, (int, float)
+            ):
+                raise ValueError("each weight must be a finite int or float")
+            if isinstance(weight, float) and not math.isfinite(weight):
+                raise ValueError("each weight must be finite")
+            decimal_weight = Decimal(str(weight))
+            if decimal_weight <= 0:
+                raise ValueError("each weight must be positive")
+            weight_values[triple] = decimal_weight
+
+        group_count = len(groups)
+        if group_count > _SCORE_TEST_MAX_GROUPS:
+            raise ValueError(
+                f"there are {group_count} groups; scenario sensitivity "
+                f"requires at most {_SCORE_TEST_MAX_GROUPS} groups"
+            )
+
+        total_weight = Decimal(0)
+        for triple in groups:
+            total_weight += weight_values[triple]
+
+        # Per-set unquantized share-adjusted values v = mean / share for
+        # every group the set has a sample in.
+        group_means: dict[
+            tuple[str, str, int], dict[str, Decimal]
+        ] = {}
+        for triple in groups:
+            samples = triple_samples[triple]
+            present = sorted(samples)
+            for index_a, key_a in enumerate(present):
+                for key_b in present[index_a + 1:]:
+                    n_a = len(samples[key_a])
+                    n_b = len(samples[key_b])
+                    if n_a + n_b > _SPATIOTEMPORAL_MAX_N:
+                        label, name, lag = triple
+                        raise ValueError(
+                            f"label {label!r} window {name!r} lag {lag} sets "
+                            f"{key_a!r}/{key_b!r} have {n_a}+{n_b} values; "
+                            f"scenario sensitivity requires at most "
+                            f"{_SPATIOTEMPORAL_MAX_N} combined values per "
+                            f"comparison"
+                        )
+            means: dict[str, Decimal] = {}
+            for key, sample in samples.items():
+                total = Decimal(0)
+                for value in sample:
+                    total += value
+                means[key] = (total / len(sample)) / share_values[key]
+            group_means[triple] = means
+
+        rank_items: list[str] = []
+        pair_items: list[str] = []
+        if total_weight > 0:
+            weighted: dict[str, Decimal] = {}
+            for triple in groups:
+                weight = weight_values[triple]
+                for key, mean in group_means[triple].items():
+                    weighted[key] = weighted.get(key, Decimal(0)) + (
+                        weight * mean
+                    )
+            scores = {
+                key: value / total_weight for key, value in weighted.items()
+            }
+            ranked_keys = sorted(scores, key=lambda key: (scores[key], key))
+            for index, key in enumerate(ranked_keys):
+                rank = index + 1
+                # Leave-one-group-out stability: re-rank the scores with
+                # each single group deleted; the set is stable when its
+                # rank never changes (always true with at most one group).
+                stable = True
+                if group_count > 1:
+                    for dropped in groups:
+                        reduced_total = total_weight - weight_values[dropped]
+                        reduced: dict[str, Decimal] = {}
+                        for triple in groups:
+                            if triple == dropped:
+                                continue
+                            weight = weight_values[triple]
+                            for other, mean in group_means[triple].items():
+                                reduced[other] = reduced.get(
+                                    other, Decimal(0)
+                                ) + (weight * mean)
+                        reduced_scores = {
+                            other: value / reduced_total
+                            for other, value in reduced.items()
+                        }
+                        reduced_ranked = sorted(
+                            reduced_scores,
+                            key=lambda other: (
+                                reduced_scores[other],
+                                other,
+                            ),
+                        )
+                        if reduced_ranked.index(key) + 1 != rank:
+                            stable = False
+                            break
+                rank_items.append(
+                    '{"key":' + json.dumps(key, ensure_ascii=False)
+                    + ',"kind":' + json.dumps(
+                        kind_names[key], ensure_ascii=False
+                    )
+                    + ',"share":' + _format6(share_values[key])
+                    + ',"score":' + _format6(scores[key])
+                    + ',"rank":' + str(rank)
+                    + ',"stable":' + ("true" if stable else "false")
+                    + '}'
+                )
+
+            # One record per emitted (a, b) pair: ``[a, b, diff, p, q]``
+            # with q filled in below.
+            records: list[list] = []
+            present_keys = sorted(weighted)
+            for index_a, key_a in enumerate(present_keys):
+                for key_b in present_keys[index_a + 1:]:
+                    # w_g * d_g per group; the common positive denominator
+                    # sum(w_g) cancels in the |.| comparison, so the sign
+                    # enumeration compares the unscaled sums exactly.
+                    scaled: list[Decimal] = []
+                    for triple in groups:
+                        means = group_means[triple]
+                        scaled.append(
+                            weight_values[triple]
+                            * (means[key_a] - means[key_b])
+                        )
+                    total_diff = Decimal(0)
+                    for value in scaled:
+                        total_diff += value
+                    diff = total_diff / total_weight
+
+                    threshold = abs(total_diff)
+                    assignments = 1 << group_count
+                    hits = 0
+                    for mask in range(assignments):
+                        signed = Decimal(0)
+                        for position in range(group_count):
+                            if mask >> position & 1:
+                                signed += scaled[position]
+                            else:
+                                signed -= scaled[position]
+                        if abs(signed) >= threshold:
+                            hits += 1
+                    p_value = Decimal(hits) / Decimal(assignments)
+                    records.append([key_a, key_b, diff, p_value, None])
+
+            # Benjamini-Hochberg q-values across all pairs: rank ascending
+            # by (p, a, b), then accumulate the running minimum of
+            # N * p_l / l from the top rank down, mapping q back.
+            count = len(records)
+            ranked = sorted(
+                range(count),
+                key=lambda idx: (
+                    records[idx][3],
+                    records[idx][0],
+                    records[idx][1],
+                ),
+            )
+            running = Decimal(1)
+            for rank in range(count, 0, -1):
+                idx = ranked[rank - 1]
+                candidate = Decimal(count) * records[idx][3] / rank
+                if candidate < running:
+                    running = candidate
+                records[idx][4] = running
+
+            for key_a, key_b, diff, p_value, q_value in records:
+                reject = q_value <= alpha_value
+                pair_items.append(
+                    '{"a":' + json.dumps(key_a, ensure_ascii=False)
+                    + ',"b":' + json.dumps(key_b, ensure_ascii=False)
+                    + ',"diff":' + _format6(diff)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + '}'
+                )
+
+        return (
+            '{"ranks":[' + ",".join(rank_items) + ']'
+            + ',"pairs":[' + ",".join(pair_items) + ']}'
+            + "\n"
+        )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
