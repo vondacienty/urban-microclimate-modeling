@@ -81,6 +81,7 @@ __all__ = [
     "portfolio",
     "portfolio_robustness",
     "portfolio_attribution",
+    "panel_priority",
     "panel_report",
 ]
 
@@ -10470,53 +10471,17 @@ def _panel_attribution_items(raw: object) -> list[tuple[str, Decimal, bool]]:
 _PANEL_GROUP_ORDER = {"region": 0, "window": 1, "overall": 2}
 
 
-def panel_report(
-    reports: dict,
-    weights: dict,
-    *,
-    alpha: float = 0.05,
-) -> str:
-    """Aggregate portfolio attribution reports across a region/window panel.
+def _panel_report_data(
+    reports: dict, weights: dict, alpha: float
+) -> tuple[Decimal, list[tuple[str, str, list[int]]], list[list]]:
+    """Validate the :func:`panel_report` contract and compute group records.
 
-    ``reports`` must be a dict with 2 to 16 entries mapping non-empty
-    ``(region, window)`` string pairs to canonical
-    :func:`portfolio_attribution` JSON outputs whose candidate key sets
-    are all identical. ``weights`` is a dict with exactly those pair
-    keys and strictly positive finite non-boolean int/float values.
-    ``alpha`` must be a finite non-boolean number with
-    ``0 < alpha <= 1``.
-
-    Candidates are tested within three group dimensions, sorted by
-    region, by window and overall across every panel (the overall group
-    key is ``"all"``). For a group containing panels with weights
-    ``w`` and source per-candidate values ``v`` (each report's
-    ``expected``) and ``n`` panels, ``mean = sum(w*v)/sum(w)``,
-    ``range = max(v) - min(v)`` and ``stable = sum(w * source reject) /
-    sum(w)`` with the source ``reject`` flags taken straight from the
-    reports. The p-value enumerates all ``2**n`` sign vectors: ``p`` is
-    the proportion of vectors with
-    ``|sum_i sign_i * w_i * v_i / sum(w)| >= |mean|``. All tests across
-    every group and candidate are pooled for one Benjamini-Hochberg
-    pass: tests rank ascending by ``(p, dimension order, group key,
-    candidate)`` with dimensions ordered region, window, overall, and
-    rank ``j`` (1-based, of ``N``) gets
-    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
-    ``q <= alpha``, compared on the unquantized values. All arithmetic
-    is ``Decimal(str(x))`` under a precision-1000, ROUND_HALF_EVEN
-    context.
-
-    Returns a compact UTF-8 JSON string with no spaces and exactly one
-    trailing newline; the top-level key order is ``alpha, groups``.
-    Each group object uses the key order ``by, key, items``, groups
-    appear as all region groups (key ascending), then all window groups
-    (key ascending), then the single overall group, and each item uses
-    the key order ``key, n, mean, range, stable, p, q, reject`` with
-    items in ascending candidate order. ``n`` is an integer and
-    ``reject`` a boolean; every other numeric value renders with six
-    decimals, negative zero normalized to ``0.000000``, and Unicode is
-    preserved. A non-dict ``reports`` or ``weights`` raises
-    ``TypeError``; every other contract violation raises
-    ``ValueError``.
+    Returns ``(alpha_value, groups_spec, records)``: ``groups_spec``
+    lists ``(by, group_key, member panel indices)`` in canonical group
+    emission order and each record is
+    ``[by, group_key, candidate, n, mean, range, stable, p, q]`` with
+    unquantized ``Decimal`` statistics and pooled Benjamini-Hochberg
+    ``q`` values. See :func:`panel_report` for the full contract.
     """
     if not isinstance(reports, dict):
         raise TypeError("reports must be a dict")
@@ -10677,47 +10642,255 @@ def panel_report(
                 running = candidate_q
             records[idx][8] = running
 
-        group_strings: list[str] = []
-        for by, group_key, _members in groups_spec:
-            group_records = [
-                record
-                for record in records
-                if record[0] == by and record[1] == group_key
-            ]
-            group_records.sort(key=lambda record: record[2])
-            item_strings: list[str] = []
-            for (
-                _by,
-                _group_key,
-                candidate,
-                group_n,
-                mean,
-                value_range,
-                stable,
-                p_value,
-                q_value,
-            ) in group_records:
-                item_strings.append(
-                    '{"key":' + json.dumps(candidate, ensure_ascii=False)
-                    + ',"n":' + str(group_n)
-                    + ',"mean":' + _format6(mean)
-                    + ',"range":' + _format6(value_range)
-                    + ',"stable":' + _format6(stable)
-                    + ',"p":' + _format6(p_value)
-                    + ',"q":' + _format6(q_value)
-                    + ',"reject":'
-                    + ("true" if q_value <= alpha_value else "false")
-                    + "}"
-                )
-            group_strings.append(
-                '{"by":' + json.dumps(by, ensure_ascii=False)
-                + ',"key":' + json.dumps(group_key, ensure_ascii=False)
-                + ',"items":[' + ",".join(item_strings) + "]}"
+    return alpha_value, groups_spec, records
+
+
+def panel_report(
+    reports: dict,
+    weights: dict,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Aggregate portfolio attribution reports across a region/window panel.
+
+    ``reports`` must be a dict with 2 to 16 entries mapping non-empty
+    ``(region, window)`` string pairs to canonical
+    :func:`portfolio_attribution` JSON outputs whose candidate key sets
+    are all identical. ``weights`` is a dict with exactly those pair
+    keys and strictly positive finite non-boolean int/float values.
+    ``alpha`` must be a finite non-boolean number with
+    ``0 < alpha <= 1``.
+
+    Candidates are tested within three group dimensions, sorted by
+    region, by window and overall across every panel (the overall group
+    key is ``"all"``). For a group containing panels with weights
+    ``w`` and source per-candidate values ``v`` (each report's
+    ``expected``) and ``n`` panels, ``mean = sum(w*v)/sum(w)``,
+    ``range = max(v) - min(v)`` and ``stable = sum(w * source reject) /
+    sum(w)`` with the source ``reject`` flags taken straight from the
+    reports. The p-value enumerates all ``2**n`` sign vectors: ``p`` is
+    the proportion of vectors with
+    ``|sum_i sign_i * w_i * v_i / sum(w)| >= |mean|``. All tests across
+    every group and candidate are pooled for one Benjamini-Hochberg
+    pass: tests rank ascending by ``(p, dimension order, group key,
+    candidate)`` with dimensions ordered region, window, overall, and
+    rank ``j`` (1-based, of ``N``) gets
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha``, compared on the unquantized values. All arithmetic
+    is ``Decimal(str(x))`` under a precision-1000, ROUND_HALF_EVEN
+    context.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups``.
+    Each group object uses the key order ``by, key, items``, groups
+    appear as all region groups (key ascending), then all window groups
+    (key ascending), then the single overall group, and each item uses
+    the key order ``key, n, mean, range, stable, p, q, reject`` with
+    items in ascending candidate order. ``n`` is an integer and
+    ``reject`` a boolean; every other numeric value renders with six
+    decimals, negative zero normalized to ``0.000000``, and Unicode is
+    preserved. A non-dict ``reports`` or ``weights`` raises
+    ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    alpha_value, groups_spec, records = _panel_report_data(
+        reports, weights, alpha
+    )
+
+    group_strings: list[str] = []
+    for by, group_key, _members in groups_spec:
+        group_records = [
+            record
+            for record in records
+            if record[0] == by and record[1] == group_key
+        ]
+        group_records.sort(key=lambda record: record[2])
+        item_strings: list[str] = []
+        for (
+            _by,
+            _group_key,
+            candidate,
+            group_n,
+            mean,
+            value_range,
+            stable,
+            p_value,
+            q_value,
+        ) in group_records:
+            item_strings.append(
+                '{"key":' + json.dumps(candidate, ensure_ascii=False)
+                + ',"n":' + str(group_n)
+                + ',"mean":' + _format6(mean)
+                + ',"range":' + _format6(value_range)
+                + ',"stable":' + _format6(stable)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":'
+                + ("true" if q_value <= alpha_value else "false")
+                + "}"
             )
+        group_strings.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"key":' + json.dumps(group_key, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_strings) + "]}"
+        )
 
     return (
         '{"alpha":' + _format6(alpha_value)
         + ',"groups":[' + ",".join(group_strings) + "]}\n"
+    )
+
+
+def panel_priority(
+    reports: dict,
+    weights: dict,
+    cost: dict,
+    limit: float,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Select the best affordable significant-candidate subset of a panel.
+
+    ``reports``, ``weights`` and ``alpha`` follow the
+    :func:`panel_report` contract. ``cost`` is a dict whose keys are
+    exactly the candidate keys with strictly positive finite non-boolean
+    int/float values and ``limit`` is a non-negative finite non-boolean
+    int/float. A non-dict ``reports``, ``weights`` or ``cost`` raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+
+    The grouped items are computed as in :func:`panel_report`. Each
+    candidate's ``stable`` is the minimum of its per-group ``stable``
+    values, its ``score`` is the overall group's ``mean`` times that
+    ``stable`` and it is ``significant`` exactly when every group's
+    ``reject`` is true. Candidates are ranked by descending ``score``,
+    then ascending ``cost``, then ascending key, with integer ranks
+    starting at 1. Every subset of the significant candidates whose
+    total cost is at most ``limit`` is enumerated exhaustively — the
+    empty subset is always feasible — and the winner maximizes total
+    score, then minimizes total cost, then minimizes the
+    lexicographically ascending selected-key list. All arithmetic is
+    ``Decimal(str(x))`` under a precision-1000, ROUND_HALF_EVEN
+    context.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, limit, cost,
+    score, pick, items`` with ``cost`` and ``score`` the selected
+    totals. ``pick`` is the ascending selected-key array. Each item
+    uses the key order ``key, cost, score, stable, significant, rank,
+    pick`` and items are sorted by ``rank``; ``significant`` and
+    ``pick`` are booleans, ``rank`` is an integer and every other
+    numeric value renders with six decimals, negative zero normalized
+    to ``0.000000``. With no candidates ``cost`` and ``score`` are
+    ``0.000000`` and both arrays are empty.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+
+    alpha_value, _groups_spec, records = _panel_report_data(
+        reports, weights, alpha
+    )
+
+    overall_mean: dict[str, Decimal] = {}
+    min_stable: dict[str, Decimal] = {}
+    significant: dict[str, bool] = {}
+    for by, _group_key, candidate, _n, mean, _range, stable, _p, q in records:
+        if candidate not in min_stable or stable < min_stable[candidate]:
+            min_stable[candidate] = stable
+        if by == "overall":
+            overall_mean[candidate] = mean
+        reject = q <= alpha_value
+        if candidate in significant:
+            significant[candidate] = significant[candidate] and reject
+        else:
+            significant[candidate] = reject
+
+    candidates = sorted(overall_mean)
+    if set(cost) != set(candidates):
+        raise ValueError("cost keys must be exactly the candidate keys")
+    costs: dict[str, Decimal] = {}
+    for key in candidates:
+        cost_value = _portfolio_number(cost[key], "cost")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        costs[key] = cost_value
+    limit_value = _portfolio_number(limit, "limit")
+    if limit_value < 0:
+        raise ValueError("limit must be non-negative")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        scores = {
+            key: overall_mean[key] * min_stable[key] for key in candidates
+        }
+        ranked = sorted(
+            candidates, key=lambda key: (-scores[key], costs[key], key)
+        )
+        ranks = {key: rank for rank, key in enumerate(ranked, 1)}
+
+        sig_keys = [key for key in candidates if significant[key]]
+        sig_count = len(sig_keys)
+        best: tuple[Decimal, Decimal, tuple[str, ...]] | None = None
+        for size in range(sig_count + 1):
+            for idxs in combinations(range(sig_count), size):
+                total_cost = sum(
+                    (costs[sig_keys[i]] for i in idxs), Decimal(0)
+                )
+                if total_cost > limit_value:
+                    continue
+                total_score = sum(
+                    (scores[sig_keys[i]] for i in idxs), Decimal(0)
+                )
+                chosen_keys = tuple(sig_keys[i] for i in idxs)
+                if (
+                    best is None
+                    or total_score > best[0]
+                    or (
+                        total_score == best[0]
+                        and (
+                            total_cost < best[1]
+                            or (
+                                total_cost == best[1]
+                                and chosen_keys < best[2]
+                            )
+                        )
+                    )
+                ):
+                    best = (total_score, total_cost, chosen_keys)
+
+        assert best is not None  # the empty subset is always feasible
+        total_score, total_cost, chosen_keys = best
+        chosen = frozenset(chosen_keys)
+
+        item_strings: list[str] = []
+        for key in ranked:
+            item_strings.append(
+                '{"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"cost":' + _format6(costs[key])
+                + ',"score":' + _format6(scores[key])
+                + ',"stable":' + _format6(min_stable[key])
+                + ',"significant":'
+                + ("true" if significant[key] else "false")
+                + ',"rank":' + str(ranks[key])
+                + ',"pick":' + ("true" if key in chosen else "false")
+                + "}"
+            )
+
+    pick_json = json.dumps(
+        list(chosen_keys), ensure_ascii=False, separators=(",", ":")
+    )
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"limit":' + _format6(limit_value)
+        + ',"cost":' + _format6(total_cost)
+        + ',"score":' + _format6(total_score)
+        + ',"pick":' + pick_json
+        + ',"items":[' + ",".join(item_strings) + "]}\n"
     )
 
 
