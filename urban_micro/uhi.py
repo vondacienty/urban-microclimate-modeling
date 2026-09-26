@@ -79,6 +79,7 @@ __all__ = [
     "decision_priority_shift",
     "decision_priority_consensus",
     "portfolio",
+    "portfolio_robustness",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -9776,6 +9777,278 @@ def portfolio(
         + ',"score":' + _format6(total_score)
         + ',"pick":' + pick_json
         + ',"skip":[' + ",".join(skip_items) + "]}\n"
+    )
+
+
+def portfolio_robustness(
+    reports: dict,
+    weights: dict,
+    gains: dict,
+    cost: dict,
+    limit: float,
+    rules: dict,
+) -> str:
+    """Rank candidate subsets by their robustness across consensus reports.
+
+    ``reports`` must be a dict with at least two non-empty string keys,
+    each value a canonical :func:`decision_priority_consensus` JSON
+    output; all reports must share exactly the same candidate key set.
+    ``weights`` must have exactly the report keys and its values are
+    positive, finite, non-boolean int/float numbers. ``gains`` must have
+    exactly the report keys and each value must be a dict whose keys are
+    exactly the shared candidate keys with non-negative, finite,
+    non-boolean int/float values. ``cost``, ``limit`` and ``rules``
+    follow exactly the same contract as :func:`portfolio`. Passing a
+    non-dict for any mapping argument (including a ``gains`` entry)
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+
+    For every feasible subset (the same budget, mutex and requires
+    rules as :func:`portfolio`) and each report (scenario) ``s``, its
+    score is ``v_s = sum(gain * support)`` over the selected
+    candidates, with ``support`` taken from that scenario's report; all
+    arithmetic uses ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context. ``expected`` is the weighted mean
+    ``sum(weight * v) / sum(weight)``, ``worst`` is ``min(v)`` and
+    ``sensitivity`` is ``max(v) - worst``. Subsets are ranked by
+    descending ``expected``, then descending ``worst``, then ascending
+    ``sensitivity``, then ascending total ``cost``, then
+    lexicographically ascending selected-key list.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is
+    ``total_weight, portfolios`` and each portfolio object uses the key
+    order ``rank, pick, cost, expected, worst, sensitivity, scores``.
+    ``rank`` is an integer, every other number renders with exactly six
+    decimals (negative zero normalized to ``0.000000``), ``pick`` is the
+    ascending selected-key array and each ``scores`` entry is a
+    ``key, score`` pair in ascending scenario-key order.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(gains, dict):
+        raise TypeError("gains must be a dict")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+    if not isinstance(rules, dict):
+        raise TypeError("rules must be a dict")
+    if len(reports) < 2:
+        raise ValueError("reports must contain at least two entries")
+    for name in reports:
+        if not isinstance(name, str) or not name:
+            raise ValueError("each reports key must be a non-empty string")
+
+    scenario_names: list[str] = []
+    supports_by_scenario: dict[str, list[Decimal]] = {}
+    candidate_set: set[str] | None = None
+    keys: list[str] = []
+    for name in sorted(reports):
+        pairs = _consensus_candidates(reports[name])
+        report_keys = [key for key, _ in pairs]
+        if candidate_set is None:
+            candidate_set = set(report_keys)
+            keys = report_keys
+        elif set(report_keys) != candidate_set:
+            raise ValueError("every report must share the same candidate keys")
+        scenario_names.append(name)
+        supports_by_scenario[name] = [support for _, support in pairs]
+    assert candidate_set is not None
+
+    if set(weights) != set(reports):
+        raise ValueError("weights keys must be exactly the reports keys")
+    weight_values: dict[str, Decimal] = {}
+    for name in scenario_names:
+        weight_value = _portfolio_number(weights[name], "weight")
+        if weight_value <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values[name] = weight_value
+
+    if set(gains) != set(reports):
+        raise ValueError("gains keys must be exactly the reports keys")
+
+    if set(cost) != candidate_set:
+        raise ValueError("cost keys must be exactly the candidate keys")
+    limit_value = _portfolio_number(limit, "limit")
+    if limit_value < 0:
+        raise ValueError("limit must be non-negative")
+    if set(rules) != {"mutex", "requires"}:
+        raise ValueError("rules keys must be exactly 'mutex' and 'requires'")
+    mutex_raw = rules["mutex"]
+    requires_raw = rules["requires"]
+    if not isinstance(mutex_raw, list) or not isinstance(requires_raw, list):
+        raise ValueError("rules values must be lists")
+
+    n = len(keys)
+    index = {key: i for i, key in enumerate(keys)}
+    costs: list[Decimal] = []
+    for key in keys:
+        cost_value = _portfolio_number(cost[key], "cost")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        costs.append(cost_value)
+
+    gains_by_scenario: dict[str, list[Decimal]] = {}
+    for name in scenario_names:
+        table = gains[name]
+        if not isinstance(table, dict):
+            raise TypeError("each gains value must be a dict")
+        if set(table) != candidate_set:
+            raise ValueError("each gains dict must key on the candidate keys")
+        scenario_gains: list[Decimal] = []
+        for key in keys:
+            gain_value = _portfolio_number(table[key], "gain")
+            if gain_value < 0:
+                raise ValueError("each gain must be non-negative")
+            scenario_gains.append(gain_value)
+        gains_by_scenario[name] = scenario_gains
+
+    def _rule_pair(item: object) -> tuple[int, int]:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each rule must be a two-tuple of candidate keys")
+        left, right = item
+        if (
+            not isinstance(left, str)
+            or not isinstance(right, str)
+            or left not in candidate_set
+            or right not in candidate_set
+            or left == right
+        ):
+            raise ValueError(
+                "each rule must pair two distinct candidate keys"
+            )
+        return index[left], index[right]
+
+    mutex_edges: set[frozenset[int]] = set()
+    for item in mutex_raw:
+        edge = frozenset(_rule_pair(item))
+        if edge in mutex_edges:
+            raise ValueError("mutex pairs must not repeat")
+        mutex_edges.add(edge)
+
+    requires_edges: set[tuple[int, int]] = set()
+    for item in requires_raw:
+        pair = _rule_pair(item)
+        if pair in requires_edges:
+            raise ValueError("requires pairs must not repeat")
+        requires_edges.add(pair)
+
+    requires_by_key: list[list[int]] = [[] for _ in range(n)]
+    for left, right in requires_edges:
+        requires_by_key[left].append(right)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = sum(weight_values.values(), Decimal(0))
+
+        scores_by_scenario: dict[str, list[Decimal]] = {
+            name: [
+                gains_by_scenario[name][i] * supports_by_scenario[name][i]
+                for i in range(n)
+            ]
+            for name in scenario_names
+        }
+
+        def _closure(chosen: frozenset) -> frozenset | None:
+            closure = set(chosen)
+            while True:
+                added = {
+                    required
+                    for member in closure
+                    for required in requires_by_key[member]
+                    if required not in closure
+                }
+                if not added:
+                    break
+                closure |= added
+            if sum((costs[i] for i in closure), Decimal(0)) > limit_value:
+                return None
+            for edge in mutex_edges:
+                left, right = tuple(edge)
+                if left in closure and right in closure:
+                    return None
+            return frozenset(closure)
+
+        feasible: set[frozenset] = set()
+        for size in range(n + 1):
+            for idxs in combinations(range(n), size):
+                closure = _closure(frozenset(idxs))
+                if closure is not None:
+                    feasible.add(closure)
+
+        records: list[
+            tuple[
+                tuple[str, ...],
+                Decimal,
+                Decimal,
+                Decimal,
+                Decimal,
+                list[Decimal],
+            ]
+        ] = []
+        for chosen in feasible:
+            chosen_keys = tuple(keys[i] for i in sorted(chosen))
+            total_cost = sum((costs[i] for i in chosen), Decimal(0))
+            values: list[Decimal] = []
+            for name in scenario_names:
+                row = scores_by_scenario[name]
+                values.append(sum((row[i] for i in chosen), Decimal(0)))
+            weighted = sum(
+                (
+                    weight_values[name] * values[j]
+                    for j, name in enumerate(scenario_names)
+                ),
+                Decimal(0),
+            )
+            expected = weighted / total_weight
+            worst = min(values)
+            sensitivity = max(values) - worst
+            records.append(
+                (chosen_keys, total_cost, expected, worst, sensitivity, values)
+            )
+
+    records.sort(
+        key=lambda record: (
+            -record[2],
+            -record[3],
+            record[4],
+            record[1],
+            record[0],
+        )
+    )
+
+    items: list[str] = []
+    for rank, (chosen_keys, total_cost, expected, worst, sensitivity, values) in enumerate(
+        records, start=1
+    ):
+        pick_json = json.dumps(
+            list(chosen_keys), ensure_ascii=False, separators=(",", ":")
+        )
+        score_items = []
+        for j, name in enumerate(scenario_names):
+            score_items.append(
+                '{"key":'
+                + json.dumps(name, ensure_ascii=False)
+                + ',"score":'
+                + _format6(values[j])
+                + "}"
+            )
+        items.append(
+            '{"rank":' + str(rank)
+            + ',"pick":' + pick_json
+            + ',"cost":' + _format6(total_cost)
+            + ',"expected":' + _format6(expected)
+            + ',"worst":' + _format6(worst)
+            + ',"sensitivity":' + _format6(sensitivity)
+            + ',"scores":[' + ",".join(score_items) + "]}"
+        )
+
+    return (
+        '{"total_weight":' + _format6(total_weight)
+        + ',"portfolios":[' + ",".join(items) + "]}\n"
     )
 
 
