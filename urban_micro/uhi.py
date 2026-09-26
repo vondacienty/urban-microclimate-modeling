@@ -75,6 +75,7 @@ __all__ = [
     "temperature_fusion_uhi_report",
     "surface_morphology_report",
     "surface_thermal_zone_scenario_report",
+    "decision_priority_shift",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -8975,6 +8976,231 @@ def decision_priority_matrix(reports: dict, weights: dict) -> str:
             + ',"spreads":[' + ",".join(spread_items) + ']}'
             + "\n"
         )
+
+
+def _decision_priority_parse_constant(value: str) -> Decimal:
+    raise ValueError("not a decision_priority_matrix JSON output")
+
+
+def _decision_priority_parse(raw: object, label: str) -> dict:
+    """Parse and validate a ``decision_priority_matrix`` JSON output.
+
+    Returns ``{(by, key): {candidate key: rank}}``; any structural
+    violation raises ``ValueError`` naming ``label``.
+    """
+    message = label + " must be a decision_priority_matrix JSON output"
+    if not isinstance(raw, str):
+        raise ValueError(message)
+    try:
+        data = json.loads(
+            raw,
+            parse_constant=_decision_priority_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(message) from None
+    if not isinstance(data, dict) or set(data) != {
+        "total_weight", "groups", "spreads",
+    }:
+        raise ValueError(message)
+    total_weight = data["total_weight"]
+    groups_raw = data["groups"]
+    spreads_raw = data["spreads"]
+    if (
+        isinstance(total_weight, bool)
+        or not isinstance(total_weight, (int, float))
+        or not isinstance(groups_raw, list)
+        or not isinstance(spreads_raw, list)
+    ):
+        raise ValueError(message)
+
+    groups: dict[tuple[str, str], dict[str, int]] = {}
+    for group in groups_raw:
+        if not isinstance(group, dict) or set(group) != {
+            "by", "key", "candidates",
+        }:
+            raise ValueError(message)
+        by = group["by"]
+        group_key = group["key"]
+        candidates_raw = group["candidates"]
+        if (
+            by not in ("region", "window")
+            or not isinstance(group_key, str)
+            or not group_key
+            or not isinstance(candidates_raw, list)
+        ):
+            raise ValueError(message)
+        if (by, group_key) in groups:
+            raise ValueError(message)
+        candidates: dict[str, int] = {}
+        for candidate in candidates_raw:
+            if not isinstance(candidate, dict) or set(candidate) != {
+                "key", "priority", "rank",
+            }:
+                raise ValueError(message)
+            candidate_key = candidate["key"]
+            priority = candidate["priority"]
+            rank = candidate["rank"]
+            if (
+                not isinstance(candidate_key, str)
+                or not candidate_key
+                or isinstance(priority, bool)
+                or not isinstance(priority, (int, float))
+                or isinstance(rank, bool)
+                or not isinstance(rank, int)
+            ):
+                raise ValueError(message)
+            if candidate_key in candidates:
+                raise ValueError(message)
+            candidates[candidate_key] = rank
+        groups[(by, group_key)] = candidates
+
+    for spread in spreads_raw:
+        if not isinstance(spread, dict) or set(spread) != {
+            "key", "min_rank", "max_rank", "gap",
+        }:
+            raise ValueError(message)
+        spread_key = spread["key"]
+        if not isinstance(spread_key, str) or not spread_key:
+            raise ValueError(message)
+        for field in ("min_rank", "max_rank", "gap"):
+            value = spread[field]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(message)
+    return groups
+
+
+def decision_priority_shift(base: str, snapshots: dict) -> str:
+    """Measure rank shifts of snapshot priority matrices against a base.
+
+    ``base`` must be a :func:`decision_priority_matrix` JSON output and
+    ``snapshots`` a non-empty dict mapping non-empty string names to
+    ``decision_priority_matrix`` JSON outputs; a non-string ``base`` or a
+    non-dict ``snapshots`` raises ``TypeError`` and any other violation —
+    an empty ``snapshots``, a non-empty-string key, malformed or
+    non-conforming JSON, or a snapshot whose ``(by, key)`` group set or
+    per-group candidate key set differs from the base — raises
+    ``ValueError``.
+
+    For every snapshot, group and candidate, ``delta`` is the snapshot
+    ``rank`` minus the base rank; ``direction`` is ``"rise"``, ``"fall"``
+    or ``"same"`` for a negative, positive or zero delta. Per candidate
+    key the summary counts the ``rise``/``fall``/``same`` directions and
+    accumulates ``net`` as the sum of deltas and ``max_abs`` as the
+    largest absolute delta; ``stable`` holds exactly when ``max_abs``
+    is 0.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``changes, summary``.
+    Each change object uses the key order ``snapshot, by, key,
+    candidates`` and each candidate object the key order ``key,
+    base_rank, rank, delta, direction``; each summary object uses the
+    key order ``key, rise, fall, same, net, max_abs, stable``. Changes
+    are ordered by snapshot name, region groups before window groups and
+    ascending group key; candidates and summary objects are in ascending
+    key order. Ranks, deltas and the summary statistics render as JSON
+    integers and ``stable`` as a boolean.
+    """
+    if not isinstance(base, str):
+        raise TypeError("base must be a str")
+    if not isinstance(snapshots, dict):
+        raise TypeError("snapshots must be a dict")
+    if not snapshots:
+        raise ValueError("snapshots must contain at least one entry")
+    for name in snapshots:
+        if not isinstance(name, str) or not name:
+            raise ValueError("each snapshots key must be a non-empty string")
+
+    base_groups = _decision_priority_parse(base, "base")
+    snapshot_groups: dict[str, dict] = {}
+    for name in sorted(snapshots):
+        groups = _decision_priority_parse(
+            snapshots[name], "each snapshots value"
+        )
+        if set(groups) != set(base_groups):
+            raise ValueError(
+                f"snapshot {name!r} must share the same (by, key) groups "
+                "as base"
+            )
+        for group_key, candidates in groups.items():
+            if set(candidates) != set(base_groups[group_key]):
+                raise ValueError(
+                    f"snapshot {name!r} must share the same candidate keys "
+                    "as base in every group"
+                )
+        snapshot_groups[name] = groups
+
+    # candidate key -> [rise, fall, same, net, max_abs]
+    stats: dict[str, list[int]] = {}
+    for candidates in base_groups.values():
+        for candidate_key in candidates:
+            stats.setdefault(candidate_key, [0, 0, 0, 0, 0])
+
+    change_items: list[str] = []
+    for name in sorted(snapshot_groups):
+        groups = snapshot_groups[name]
+        for by in ("region", "window"):
+            for group_key in sorted(
+                key for (group_by, key) in groups if group_by == by
+            ):
+                base_candidates = base_groups[(by, group_key)]
+                candidates = groups[(by, group_key)]
+                candidate_items: list[str] = []
+                for candidate_key in sorted(base_candidates):
+                    base_rank = base_candidates[candidate_key]
+                    rank = candidates[candidate_key]
+                    delta = rank - base_rank
+                    if delta < 0:
+                        direction = "rise"
+                    elif delta > 0:
+                        direction = "fall"
+                    else:
+                        direction = "same"
+                    stat = stats[candidate_key]
+                    if delta < 0:
+                        stat[0] += 1
+                    elif delta > 0:
+                        stat[1] += 1
+                    else:
+                        stat[2] += 1
+                    stat[3] += delta
+                    if abs(delta) > stat[4]:
+                        stat[4] = abs(delta)
+                    candidate_items.append(
+                        '{"key":'
+                        + json.dumps(candidate_key, ensure_ascii=False)
+                        + ',"base_rank":' + str(base_rank)
+                        + ',"rank":' + str(rank)
+                        + ',"delta":' + str(delta)
+                        + ',"direction":'
+                        + json.dumps(direction, ensure_ascii=False)
+                        + '}'
+                    )
+                change_items.append(
+                    '{"snapshot":' + json.dumps(name, ensure_ascii=False)
+                    + ',"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"key":' + json.dumps(group_key, ensure_ascii=False)
+                    + ',"candidates":[' + ",".join(candidate_items) + ']}'
+                )
+
+    summary_items: list[str] = []
+    for candidate_key in sorted(stats):
+        rise, fall, same, net, max_abs = stats[candidate_key]
+        summary_items.append(
+            '{"key":' + json.dumps(candidate_key, ensure_ascii=False)
+            + ',"rise":' + str(rise)
+            + ',"fall":' + str(fall)
+            + ',"same":' + str(same)
+            + ',"net":' + str(net)
+            + ',"max_abs":' + str(max_abs)
+            + ',"stable":' + ("true" if max_abs == 0 else "false")
+            + '}'
+        )
+
+    return (
+        '{"changes":[' + ",".join(change_items) + ']'
+        + ',"summary":[' + ",".join(summary_items) + ']}'
+        + "\n"
+    )
 
 
 _TEMPORAL_LAG_MAX_N = 8
