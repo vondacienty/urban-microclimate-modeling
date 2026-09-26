@@ -8115,6 +8115,344 @@ def scenario_sensitivity(
         )
 
 
+def _scenario_decision_parse_constant(value: str) -> Decimal:
+    raise ValueError(
+        "each reports value must be a scenario_sensitivity JSON output"
+    )
+
+
+def scenario_decision(reports: dict, weights: dict) -> str:
+    """Combine per-panel scenario sensitivity reports into one decision.
+
+    ``reports`` must be a dict whose keys are ``(region, window)``
+    two-tuples of non-empty strings and whose values are
+    :func:`scenario_sensitivity` JSON outputs; passing a non-dict raises
+    ``TypeError`` and any other violation raises ``ValueError``. Every
+    report must rank the same set of at least two scenario keys, and a
+    scenario's ``kind`` and ``share`` must agree across all reports.
+    ``weights`` must be a dict with exactly the ``reports`` key set whose
+    values are positive finite non-boolean int/float weights; a non-dict
+    raises ``TypeError`` and any other violation raises ``ValueError``.
+
+    Within each panel the candidate is the scenario with the smallest
+    ``rank``; the panel recommends its candidate only when the candidate's
+    ``stable`` is true, every pair involving it has ``reject`` true, and
+    the pair ``diff`` is negative when the candidate is ``a`` and positive
+    when it is ``b``. With ``W`` the sum of all weights, each scenario's
+    ``score`` is the weight-weighted mean of its per-panel scores, its
+    ``support`` is the fraction of ``W`` held by panels recommending it,
+    and its ``stable`` is true only when it is stable in every panel.
+    Scenarios are ranked ascending by ``(score, key)`` with integer ranks
+    starting at 1. ``recommend`` is the first-ranked scenario's key only
+    when that scenario is stable and its support is exactly 1, and
+    ``null`` otherwise.
+
+    All numbers enter the computation as ``Decimal(str(x))`` (report
+    numbers are parsed straight from the JSON text) under a precision-1000,
+    ROUND_HALF_EVEN local context. Returns a compact UTF-8 JSON string
+    with no spaces and exactly one trailing newline; the top-level key
+    order is ``total_weight, recommend, ranks`` and each rank object uses
+    the key order ``key, kind, share, score, support, rank, stable``.
+    Ranks are in ascending ``(rank, key)`` order. ``rank`` renders as a
+    JSON integer, ``stable`` as a boolean and ``recommend`` as a JSON
+    string or null; every other number renders with exactly six decimals,
+    negative zero normalized to ``0.000000``. With no panels the only
+    valid input is ``reports={}`` and ``weights={}``, yielding
+    ``total_weight`` ``0.000000``, ``recommend`` ``null`` and an empty
+    ``ranks`` array.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    for panel_key in reports:
+        if (
+            not isinstance(panel_key, tuple)
+            or len(panel_key) != 2
+            or not isinstance(panel_key[0], str)
+            or not panel_key[0]
+            or not isinstance(panel_key[1], str)
+            or not panel_key[1]
+        ):
+            raise ValueError(
+                "each reports key must be a (region, window) tuple of two "
+                "non-empty strings"
+            )
+    if set(weights) != set(reports):
+        raise ValueError("weights keys must be exactly the reports keys")
+    if not reports:
+        return '{"total_weight":0.000000,"recommend":null,"ranks":[]}\n'
+
+    weight_values: dict[tuple[str, str], Decimal] = {}
+    for panel_key, weight in weights.items():
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise ValueError("each weight must be a finite int or float")
+        if isinstance(weight, float) and not math.isfinite(weight):
+            raise ValueError("each weight must be finite")
+        decimal_weight = Decimal(str(weight))
+        if decimal_weight <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values[panel_key] = decimal_weight
+
+    # panel key -> {"ranks": scenario key -> (kind, share, score, rank,
+    # stable), "pairs": [(a, b, diff, reject), ...]}
+    panels: dict[tuple[str, str], dict] = {}
+    scenario_keys: set[str] | None = None
+    for panel_key in sorted(reports):
+        raw = reports[panel_key]
+        if not isinstance(raw, str):
+            raise ValueError(
+                "each reports value must be a scenario_sensitivity JSON "
+                "output"
+            )
+        try:
+            data = json.loads(
+                raw,
+                parse_float=Decimal,
+                parse_int=Decimal,
+                parse_constant=_scenario_decision_parse_constant,
+            )
+        except ValueError:
+            raise ValueError(
+                "each reports value must be a scenario_sensitivity JSON "
+                "output"
+            ) from None
+        if not isinstance(data, dict) or set(data) != {"ranks", "pairs"}:
+            raise ValueError(
+                "each reports value must be a scenario_sensitivity JSON "
+                "output"
+            )
+        ranks_raw = data["ranks"]
+        pairs_raw = data["pairs"]
+        if not isinstance(ranks_raw, list) or not isinstance(pairs_raw, list):
+            raise ValueError(
+                "each reports value must be a scenario_sensitivity JSON "
+                "output"
+            )
+
+        rank_map: dict[str, tuple] = {}
+        for item in ranks_raw:
+            if not isinstance(item, dict) or set(item) != {
+                "key", "kind", "share", "score", "rank", "stable",
+            }:
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            key = item["key"]
+            kind = item["kind"]
+            share = item["share"]
+            score = item["score"]
+            rank = item["rank"]
+            stable = item["stable"]
+            if not isinstance(key, str) or not key:
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            if (
+                not isinstance(kind, str)
+                or kind not in _SCENARIO_SENSITIVITY_KINDS
+            ):
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            if (
+                not isinstance(share, Decimal)
+                or not share.is_finite()
+                or share <= 0
+                or share > 1
+            ):
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            if not isinstance(score, Decimal) or not score.is_finite():
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            if (
+                not isinstance(rank, Decimal)
+                or not rank.is_finite()
+                or rank != rank.to_integral_value()
+                or rank < 1
+            ):
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            if not isinstance(stable, bool):
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            if key in rank_map:
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            rank_map[key] = (kind, share, score, rank, stable)
+
+        pair_list: list[tuple] = []
+        for item in pairs_raw:
+            if not isinstance(item, dict) or set(item) != {
+                "a", "b", "diff", "p", "q", "reject",
+            }:
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            key_a = item["a"]
+            key_b = item["b"]
+            diff = item["diff"]
+            p_value = item["p"]
+            q_value = item["q"]
+            reject = item["reject"]
+            if (
+                not isinstance(key_a, str)
+                or not key_a
+                or not isinstance(key_b, str)
+                or not key_b
+            ):
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            for number in (diff, p_value, q_value):
+                if not isinstance(number, Decimal) or not number.is_finite():
+                    raise ValueError(
+                        "each reports value must be a scenario_sensitivity "
+                        "JSON output"
+                    )
+            if not isinstance(reject, bool):
+                raise ValueError(
+                    "each reports value must be a scenario_sensitivity JSON "
+                    "output"
+                )
+            pair_list.append((key_a, key_b, diff, reject))
+
+        if len(rank_map) < 2:
+            raise ValueError(
+                "each report must rank at least two scenarios"
+            )
+        if scenario_keys is None:
+            scenario_keys = set(rank_map)
+        elif set(rank_map) != scenario_keys:
+            raise ValueError(
+                "all reports must rank the same scenario keys"
+            )
+        panels[panel_key] = {"ranks": rank_map, "pairs": pair_list}
+
+    # A scenario's kind and share must agree across every panel.
+    kind_values: dict[str, str] = {}
+    share_values: dict[str, Decimal] = {}
+    for key in scenario_keys:
+        first_kind, first_share = panels[sorted(reports)[0]]["ranks"][key][:2]
+        for panel_key in panels:
+            kind, share = panels[panel_key]["ranks"][key][:2]
+            if kind != first_kind or share != first_share:
+                raise ValueError(
+                    "each scenario's kind and share must agree across all "
+                    "reports"
+                )
+        kind_values[key] = first_kind
+        share_values[key] = first_share
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = Decimal(0)
+        for panel_key in panels:
+            total_weight += weight_values[panel_key]
+
+        # Each panel recommends its smallest-rank candidate only when the
+        # candidate is stable, every pair involving it rejects, and the
+        # pair diff points away from it (negative as ``a``, positive as
+        # ``b``).
+        panel_choice: dict[tuple[str, str], str | None] = {}
+        for panel_key in sorted(panels):
+            rank_map = panels[panel_key]["ranks"]
+            candidate = min(
+                rank_map, key=lambda key: (rank_map[key][3], key)
+            )
+            recommended = rank_map[candidate][4]
+            if recommended:
+                for key_a, key_b, diff, reject in panels[panel_key]["pairs"]:
+                    if candidate != key_a and candidate != key_b:
+                        continue
+                    if not reject:
+                        recommended = False
+                        break
+                    if candidate == key_a and not diff < 0:
+                        recommended = False
+                        break
+                    if candidate == key_b and not diff > 0:
+                        recommended = False
+                        break
+            panel_choice[panel_key] = candidate if recommended else None
+
+        decision_items: list[dict] = []
+        for key in sorted(scenario_keys):
+            weighted_score = Decimal(0)
+            support_weight = Decimal(0)
+            stable = True
+            for panel_key in panels:
+                weight = weight_values[panel_key]
+                weighted_score += weight * panels[panel_key]["ranks"][key][2]
+                if panel_choice[panel_key] == key:
+                    support_weight += weight
+                if not panels[panel_key]["ranks"][key][4]:
+                    stable = False
+            decision_items.append(
+                {
+                    "key": key,
+                    "score": weighted_score / total_weight,
+                    "support": support_weight / total_weight,
+                    "stable": stable,
+                }
+            )
+        decision_items.sort(key=lambda item: (item["score"], item["key"]))
+        for index, item in enumerate(decision_items):
+            item["rank"] = index + 1
+
+        first = decision_items[0]
+        recommend = (
+            first["key"]
+            if first["stable"] and first["support"] == 1
+            else None
+        )
+
+        rank_items: list[str] = []
+        for item in decision_items:
+            key = item["key"]
+            rank_items.append(
+                '{"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"kind":'
+                + json.dumps(kind_values[key], ensure_ascii=False)
+                + ',"share":' + _format6(share_values[key])
+                + ',"score":' + _format6(item["score"])
+                + ',"support":' + _format6(item["support"])
+                + ',"rank":' + str(item["rank"])
+                + ',"stable":' + ("true" if item["stable"] else "false")
+                + '}'
+            )
+
+        return (
+            '{"total_weight":' + _format6(total_weight)
+            + ',"recommend":'
+            + (
+                json.dumps(recommend, ensure_ascii=False)
+                if recommend is not None
+                else "null"
+            )
+            + ',"ranks":[' + ",".join(rank_items) + ']}'
+            + "\n"
+        )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
