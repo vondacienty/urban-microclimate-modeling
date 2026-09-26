@@ -17,6 +17,7 @@ __all__ = [
     "fit_uhi_model",
     "scenario",
     "scenario_rank",
+    "scenario_score",
     "attribute_effects",
     "effect_report",
     "effect_report_csv",
@@ -7072,6 +7073,247 @@ def scenario_rank(
             '{"minutes":' + str(minutes)
             + ',"alpha":' + _format6(alpha_value)
             + ',"groups":[' + ",".join(groups) + ']}'
+            + "\n"
+        )
+
+
+def scenario_score(
+    base: list,
+    sets: dict,
+    edges: list,
+    lags: list,
+    labels: dict,
+    windows: dict,
+    weights: dict,
+    *,
+    minutes: int = 60,
+) -> str:
+    """Rank scenario sets by weighted per-group mean and tally pair wins.
+
+    ``base``, ``sets``, ``edges``, ``lags``, ``labels``, ``windows`` and
+    ``minutes`` follow exactly the same validation, bucketing, same-label
+    edge pairing, edge order, window concatenation, ``(timestamp, cell_id)``
+    key-set and exception rules as in :func:`scenario_rank`; the per-group
+    means are likewise the unquantized means of the set-minus-base ``e``
+    samples, and all numbers enter as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context.
+
+    ``weights`` must be a dict (a non-dict raises ``TypeError``) whose keys
+    are exactly the actual ``(label, window, lag)`` triples with at least one
+    non-empty set sample; each value must be a positive, finite, non-boolean
+    int or float. A key-set mismatch or an illegally shaped key or value
+    raises ``ValueError``. With ``w_g`` the weight of group ``g`` and
+    ``W = sum_g w_g``, each set ``s`` gets
+    ``score_s = sum_g (w_g * mean_sg) / W`` and sets are ranked ascending by
+    ``(score, key)``, receiving ``rank = 1..k``.
+
+    For every pair of distinct sets ``a < b`` each group is decided on the
+    unquantized means: the set with the smaller mean wins the group's
+    weight, equal means split it into the tie weight. ``a_win``, ``b_win``
+    and ``tie`` are the corresponding accumulated weights divided by ``W``.
+    When no group has any sample, only ``weights={}`` is valid: ``W`` is 0
+    and both ``ranks`` and ``pairs`` are empty.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is
+    ``minutes, total_weight, ranks, pairs``, each rank object uses the key
+    order ``key, score, rank`` and each pair object the key order
+    ``a, b, a_win, b_win, tie``. Ranks are in ascending rank order and pairs
+    in ascending ``(a, b)`` order. ``minutes`` and ranks render as integers
+    and every other number with exactly six decimals, negative zero
+    normalized to ``0.000000``.
+    """
+    if not isinstance(sets, dict):
+        raise TypeError("sets must be a dict")
+    if len(sets) < 2:
+        raise ValueError("sets must contain at least two entries")
+    for key, table in sets.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("each sets key must be a non-empty string")
+        if not isinstance(table, list):
+            raise ValueError("each sets value must be a list")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+
+    # scenario_score has no alpha of its own; the shared parser only uses
+    # the argument for validation, so pass the default verbatim.
+    minutes, lag_list, _, parsed_base, xmap_base = (
+        _lags_group_x_values(base, edges, lags, labels, minutes, 0.05)
+    )
+
+    base_keys = {(row[0], row[1]) for row in parsed_base}
+
+    # key -> label -> lag -> bucket start -> [e, ...] (after-minus-base).
+    emaps: dict[str, dict] = {}
+    for key in sorted(sets):
+        _, _, _, parsed_set, xmap_set = _lags_group_x_values(
+            sets[key], edges, lags, labels, minutes, 0.05
+        )
+        set_keys = {(row[0], row[1]) for row in parsed_set}
+        if set_keys != base_keys:
+            raise ValueError(
+                f"sets table {key!r} must share the same (timestamp, cell_id) "
+                "pairs as base"
+            )
+
+        with localcontext() as ctx:
+            ctx.prec = _MODEL_PRECISION
+            ctx.rounding = ROUND_HALF_EVEN
+
+            # Identical (timestamp, cell_id) key sets make the two xmaps
+            # structurally identical, so the per-(label, lag, B) value lists
+            # pair up element-wise in the same ascending edge order.
+            emap: dict[str, dict[int, dict[int, list[Decimal]]]] = {}
+            for label in sorted(xmap_base):
+                lag_map: dict[int, dict[int, list[Decimal]]] = {}
+                for lag in lag_list:
+                    base_buckets = xmap_base[label].get(lag, {})
+                    set_buckets = xmap_set[label].get(lag, {})
+                    bucket_map: dict[int, list[Decimal]] = {}
+                    for bucket in sorted(base_buckets):
+                        base_values = base_buckets[bucket]
+                        set_values = set_buckets[bucket]
+                        bucket_map[bucket] = [
+                            set_value - base_value
+                            for set_value, base_value in zip(
+                                set_values, base_values
+                            )
+                        ]
+                    lag_map[lag] = bucket_map
+                emap[label] = lag_map
+        emaps[key] = emap
+
+    # Resolve the windows contract against the base table, exactly as
+    # _window_shift_report does for scenario_shift.
+    if not isinstance(windows, dict):
+        raise TypeError("windows must be a dict")
+    all_buckets: set[int] = set()
+    if parsed_base:
+        bucket_seconds = minutes * 60
+        for validated in parsed_base:
+            timestamp = validated[0]
+            all_buckets.add((timestamp // bucket_seconds) * bucket_seconds)
+    if set(windows) != all_buckets:
+        raise ValueError(
+            "windows keys must be exactly the details-derived bucket starts"
+        )
+    for bucket, name in windows.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("each window name must be a non-empty string")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (label, window, lag) -> set key -> concatenated [e, ...] over the
+        # window's buckets in ascending B order (each bucket's values already
+        # in ascending edge order).
+        triple_samples: dict[
+            tuple[str, str, int], dict[str, list[Decimal]]
+        ] = {}
+        for bucket in sorted(all_buckets):
+            name = windows[bucket]
+            for key in sorted(emaps):
+                emap = emaps[key]
+                for label in sorted(emap):
+                    for lag in lag_list:
+                        values = emap[label].get(lag, {}).get(bucket)
+                        if values:
+                            triple_samples.setdefault(
+                                (label, name, lag), {}
+                            ).setdefault(key, []).extend(values)
+
+        actual_triples = set(triple_samples)
+        if set(weights) != actual_triples:
+            raise ValueError(
+                "weights keys must be exactly the actual "
+                "(label, window, lag) triples"
+            )
+        weight_map: dict[tuple[str, str, int], Decimal] = {}
+        for triple, weight in weights.items():
+            if isinstance(weight, bool) or not isinstance(
+                weight, (int, float)
+            ):
+                raise ValueError("each weight must be a finite int or float")
+            if isinstance(weight, float) and not math.isfinite(weight):
+                raise ValueError("each weight must be finite")
+            if weight <= 0:
+                raise ValueError("each weight must be positive")
+            weight_map[triple] = Decimal(str(weight))
+
+        total_weight = Decimal(0)
+        for triple in sorted(weight_map):
+            total_weight += weight_map[triple]
+
+        # The identical (timestamp, cell_id) key sets make the pairing
+        # structure the same for every set, so each set has a sample in
+        # exactly the actual triples.
+        set_keys = sorted(sets)
+        triple_means: dict[tuple[str, str, int], dict[str, Decimal]] = {}
+        for triple in sorted(triple_samples):
+            samples = triple_samples[triple]
+            means: dict[str, Decimal] = {}
+            for key in set_keys:
+                sample = samples[key]
+                sample_sum = Decimal(0)
+                for value in sample:
+                    sample_sum += value
+                means[key] = sample_sum / len(sample)
+            triple_means[triple] = means
+
+        rank_items: list[str] = []
+        pair_items: list[str] = []
+        ordered_triples = sorted(actual_triples)
+        if ordered_triples:
+            scores: dict[str, Decimal] = {}
+            for key in set_keys:
+                weighted_sum = Decimal(0)
+                for triple in ordered_triples:
+                    weighted_sum += (
+                        weight_map[triple] * triple_means[triple][key]
+                    )
+                scores[key] = weighted_sum / total_weight
+
+            ranked_keys = sorted(
+                set_keys, key=lambda key: (scores[key], key)
+            )
+            for index, key in enumerate(ranked_keys):
+                rank_items.append(
+                    '{"key":' + json.dumps(key, ensure_ascii=False)
+                    + ',"score":' + _format6(scores[key])
+                    + ',"rank":' + str(index + 1)
+                    + '}'
+                )
+
+            for index_a, key_a in enumerate(set_keys):
+                for key_b in set_keys[index_a + 1:]:
+                    win_a = Decimal(0)
+                    win_b = Decimal(0)
+                    tie = Decimal(0)
+                    for triple in ordered_triples:
+                        weight = weight_map[triple]
+                        mean_a = triple_means[triple][key_a]
+                        mean_b = triple_means[triple][key_b]
+                        if mean_a < mean_b:
+                            win_a += weight
+                        elif mean_b < mean_a:
+                            win_b += weight
+                        else:
+                            tie += weight
+                    pair_items.append(
+                        '{"a":' + json.dumps(key_a, ensure_ascii=False)
+                        + ',"b":' + json.dumps(key_b, ensure_ascii=False)
+                        + ',"a_win":' + _format6(win_a / total_weight)
+                        + ',"b_win":' + _format6(win_b / total_weight)
+                        + ',"tie":' + _format6(tie / total_weight)
+                        + '}'
+                    )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"total_weight":' + _format6(total_weight)
+            + ',"ranks":[' + ",".join(rank_items) + ']'
+            + ',"pairs":[' + ",".join(pair_items) + ']}'
             + "\n"
         )
 
