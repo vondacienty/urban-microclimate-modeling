@@ -13936,51 +13936,27 @@ def frontier_mix_robust(frontiers: dict, weights: dict) -> str:
 _FRONTIER_MIX_RANK_MAX_GROUP = 16
 
 
-def frontier_mix_rank_report(
-    frontiers: dict, weights: dict, *, alpha: float = 0.05
-) -> str:
-    """Rank the picks of a weighted frontier blend and test each pair.
+def _frontier_mix_rank_core(
+    frontiers: dict, weights: dict, alpha: float
+) -> tuple:
+    """Shared computation of :func:`frontier_mix_rank_report` and
+    :func:`frontier_rank_attribution`.
 
-    ``frontiers`` and ``weights`` follow the :func:`frontier_mix`
-    contract exactly: a non-dict argument raises ``TypeError`` and every
-    other violation raises ``ValueError``, including frontier reports
-    whose budget sequences or ``(by, key)`` panel sets differ. ``alpha``
-    is a non-boolean finite number with ``0 < alpha <= 1``.
-
-    With ``W`` the total weight, each budget's scenarios are grouped by
-    pick; a group's ``support`` is ``Σw/W`` and its ``effect`` is
-    ``Σ(w·e)/Σw`` over its scenarios. Groups are ranked by descending
-    ``support``, then descending ``effect``, then ascending pick, with
-    ``rank`` the 1-based position. A group's ``stable`` is true only
-    when deleting any single scenario leaves the group present and its
-    rank unchanged.
-
-    Every pair ``a < b`` of distinct picks at a budget contributes one
-    ``tests`` entry with ``diff = effect_a − effect_b``; a pair whose
-    two groups total more than 16 scenarios raises ``ValueError``. The
-    scenarios' ``(weight, effect)`` pairs are enumerated over every
-    assignment into two groups of the observed sizes and ``p`` is the
-    proportion with ``|diff′| >= |diff|``. All tests across every
-    budget are ranked ascending by ``(p, budget, a, b)`` and each rank
-    ``j`` (1-based) gets the Benjamini-Hochberg q-value
-    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
-    ``q <= alpha`` (compared on the unquantized values).
-
-    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
-    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
-    Returns a compact UTF-8 JSON string with no spaces and exactly one
-    trailing newline; the top-level key order is ``alpha, points`` and
-    each point uses the key order ``budget, ranks, tests`` with ranks
-    using ``pick, n, support, effect, rank, stable`` and tests using
-    ``a, b, n_a, n_b, diff, p, q, reject``. Points are in ascending
-    budget order, ranks in ascending rank order and tests in ascending
-    ``(a, b)`` order. ``pick``, ``a`` and ``b`` are ascending string
-    arrays, ``n``, ``n_a``, ``n_b`` and ``rank`` are integers,
-    ``stable`` and ``reject`` are booleans and every other number
-    renders with six decimals, negative zero normalized to
-    ``0.000000``.
+    Returns ``(alpha_value, point_data, all_tests, q_values)`` where
+    ``point_data`` holds one ``(budget, rank_rows, panel_rows, pairs)``
+    tuple per budget in ascending budget order. ``rank_rows`` holds one
+    ``(pick, n, support, effect, rank, stable)`` tuple per pick in
+    ascending global rank order with ``support`` and ``effect`` the
+    unquantized group values; ``panel_rows`` holds one ``(by, key,
+    effects, rank_of)`` tuple per ``(by, key)`` panel in canonical
+    panel order with ``effects`` mapping each pick to its within-group
+    weighted panel effect and ``rank_of`` the pick's 1-based panel
+    rank; ``pairs`` lists the tested ``(a, b)`` pick pairs in ascending
+    order. ``all_tests`` holds one ``(budget, a, b, n_a, n_b, diff,
+    p)`` tuple per pair in point order and ``q_values`` the matching
+    Benjamini-Hochberg q-values.
     """
-    case_keys, weight_values, parsed, budgets, _panel_keys = (
+    case_keys, weight_values, parsed, budgets, panel_keys = (
         _frontier_mix_inputs(frontiers, weights)
     )
     alpha_value = _validate_finite_number(alpha, "alpha")
@@ -14022,13 +13998,13 @@ def frontier_mix_rank_report(
                 ),
             )
 
-        point_strings: list[tuple] = []
+        point_data: list[tuple] = []
         all_tests: list[tuple] = []
         for index, budget in enumerate(budgets):
             groups = _groups(index, case_keys)
             ranking = _ranking(groups, total_weight)
 
-            rank_strings: list[str] = []
+            rank_rows: list[tuple] = []
             for rank, pick in enumerate(ranking, start=1):
                 n, weight_sum, effect_sum = groups[pick]
                 stable = True
@@ -14043,18 +14019,51 @@ def frontier_mix_rank_report(
                     if sub_ranking.index(pick) + 1 != rank:
                         stable = False
                         break
-                rank_strings.append(
-                    '{"pick":'
-                    + json.dumps(
-                        list(pick), ensure_ascii=False,
-                        separators=(",", ":"),
+                rank_rows.append(
+                    (
+                        pick,
+                        n,
+                        weight_sum / total_weight,
+                        effect_sum / weight_sum,
+                        rank,
+                        stable,
                     )
-                    + ',"n":' + str(n)
-                    + ',"support":' + _format6(weight_sum / total_weight)
-                    + ',"effect":' + _format6(effect_sum / weight_sum)
-                    + ',"rank":' + str(rank)
-                    + ',"stable":' + ("true" if stable else "false")
-                    + "}"
+                )
+
+            panel_rows: list[tuple] = []
+            for by, panel_key in panel_keys:
+                panel_effects: dict[tuple[str, ...], Decimal] = {}
+                for pick in ranking:
+                    effect_sum = sum(
+                        (
+                            weight_values[key]
+                            * parsed[key][1][index][4][(by, panel_key)]
+                            for key in case_keys
+                            if parsed[key][1][index][3] == pick
+                        ),
+                        Decimal(0),
+                    )
+                    panel_effects[pick] = effect_sum / groups[pick][1]
+                panel_ranking = sorted(
+                    ranking,
+                    key=lambda pick: (
+                        -(groups[pick][1] / total_weight),
+                        -panel_effects[pick],
+                        pick,
+                    ),
+                )
+                panel_rows.append(
+                    (
+                        by,
+                        panel_key,
+                        panel_effects,
+                        {
+                            pick: position
+                            for position, pick in enumerate(
+                                panel_ranking, start=1
+                            )
+                        },
+                    )
                 )
 
             pairs: list[tuple] = []
@@ -14103,7 +14112,7 @@ def frontier_mix_rank_report(
                 all_tests.append((budget, a, b, n_a, n_b, diff, p))
                 pairs.append((a, b))
 
-            point_strings.append((budget, rank_strings, pairs))
+            point_data.append((budget, rank_rows, panel_rows, pairs))
 
         # Benjamini-Hochberg q-values over every test: rank ascending by
         # (p, budget, a, b), then accumulate the running minimum of
@@ -14124,37 +14133,238 @@ def frontier_mix_rank_report(
                 running = candidate
             q_values[ranked[rank - 1]] = running
 
-        test_cursor = 0
-        rendered_points: list[str] = []
-        for budget, rank_strings, pairs in point_strings:
-            test_strings = []
-            for a, b in pairs:
-                _, _, _, n_a, n_b, diff, p = all_tests[test_cursor]
-                q_value = q_values[test_cursor]
-                test_cursor += 1
-                test_strings.append(
-                    '{"a":'
-                    + json.dumps(
-                        list(a), ensure_ascii=False, separators=(",", ":")
-                    )
-                    + ',"b":'
-                    + json.dumps(
-                        list(b), ensure_ascii=False, separators=(",", ":")
-                    )
-                    + ',"n_a":' + str(n_a)
-                    + ',"n_b":' + str(n_b)
-                    + ',"diff":' + _format6(diff)
-                    + ',"p":' + _format6(p)
-                    + ',"q":' + _format6(q_value)
-                    + ',"reject":'
-                    + ("true" if q_value <= alpha_value else "false")
+    return alpha_value, point_data, all_tests, q_values
+
+
+def _frontier_mix_rank_tests(
+    point_data: list, all_tests: list, q_values: list, alpha_value: Decimal
+) -> list[list[str]]:
+    """Render the ``tests`` arrays shared by the rank reports: one list
+    of compact JSON test tokens per budget point, in point order."""
+    rendered: list[list[str]] = []
+    test_cursor = 0
+    for _budget, _rank_rows, _panel_rows, pairs in point_data:
+        test_strings: list[str] = []
+        for a, b in pairs:
+            _, _, _, n_a, n_b, diff, p = all_tests[test_cursor]
+            q_value = q_values[test_cursor]
+            test_cursor += 1
+            test_strings.append(
+                '{"a":'
+                + json.dumps(
+                    list(a), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"b":'
+                + json.dumps(
+                    list(b), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"n_a":' + str(n_a)
+                + ',"n_b":' + str(n_b)
+                + ',"diff":' + _format6(diff)
+                + ',"p":' + _format6(p)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":'
+                + ("true" if q_value <= alpha_value else "false")
+                + "}"
+            )
+        rendered.append(test_strings)
+    return rendered
+
+
+def frontier_mix_rank_report(
+    frontiers: dict, weights: dict, *, alpha: float = 0.05
+) -> str:
+    """Rank the picks of a weighted frontier blend and test each pair.
+
+    ``frontiers`` and ``weights`` follow the :func:`frontier_mix`
+    contract exactly: a non-dict argument raises ``TypeError`` and every
+    other violation raises ``ValueError``, including frontier reports
+    whose budget sequences or ``(by, key)`` panel sets differ. ``alpha``
+    is a non-boolean finite number with ``0 < alpha <= 1``.
+
+    With ``W`` the total weight, each budget's scenarios are grouped by
+    pick; a group's ``support`` is ``Σw/W`` and its ``effect`` is
+    ``Σ(w·e)/Σw`` over its scenarios. Groups are ranked by descending
+    ``support``, then descending ``effect``, then ascending pick, with
+    ``rank`` the 1-based position. A group's ``stable`` is true only
+    when deleting any single scenario leaves the group present and its
+    rank unchanged.
+
+    Every pair ``a < b`` of distinct picks at a budget contributes one
+    ``tests`` entry with ``diff = effect_a − effect_b``; a pair whose
+    two groups total more than 16 scenarios raises ``ValueError``. The
+    scenarios' ``(weight, effect)`` pairs are enumerated over every
+    assignment into two groups of the observed sizes and ``p`` is the
+    proportion with ``|diff′| >= |diff|``. All tests across every
+    budget are ranked ascending by ``(p, budget, a, b)`` and each rank
+    ``j`` (1-based) gets the Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha`` (compared on the unquantized values).
+
+    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
+    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, points`` and
+    each point uses the key order ``budget, ranks, tests`` with ranks
+    using ``pick, n, support, effect, rank, stable`` and tests using
+    ``a, b, n_a, n_b, diff, p, q, reject``. Points are in ascending
+    budget order, ranks in ascending rank order and tests in ascending
+    ``(a, b)`` order. ``pick``, ``a`` and ``b`` are ascending string
+    arrays, ``n``, ``n_a``, ``n_b`` and ``rank`` are integers,
+    ``stable`` and ``reject`` are booleans and every other number
+    renders with six decimals, negative zero normalized to
+    ``0.000000``.
+    """
+    alpha_value, point_data, all_tests, q_values = (
+        _frontier_mix_rank_core(frontiers, weights, alpha)
+    )
+    tests_by_point = _frontier_mix_rank_tests(
+        point_data, all_tests, q_values, alpha_value
+    )
+
+    rendered_points: list[str] = []
+    for point_index, (
+        budget, rank_rows, _panel_rows, _pairs
+    ) in enumerate(point_data):
+        rank_strings: list[str] = []
+        for pick, n, support, effect, rank, stable in rank_rows:
+            rank_strings.append(
+                '{"pick":'
+                + json.dumps(
+                    list(pick), ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + ',"n":' + str(n)
+                + ',"support":' + _format6(support)
+                + ',"effect":' + _format6(effect)
+                + ',"rank":' + str(rank)
+                + ',"stable":' + ("true" if stable else "false")
+                + "}"
+            )
+        rendered_points.append(
+            '{"budget":' + _format6(budget)
+            + ',"ranks":[' + ",".join(rank_strings) + "]"
+            + ',"tests":[' + ",".join(tests_by_point[point_index]) + "]}"
+        )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"points":[' + ",".join(rendered_points) + "]}\n"
+    )
+
+
+def frontier_rank_attribution(
+    frontiers: dict, weights: dict, *, alpha: float = 0.05
+) -> str:
+    """Attribute each pick's global rank to the ``(by, key)`` panels.
+
+    ``frontiers``, ``weights`` and ``alpha`` follow the
+    :func:`frontier_mix_rank_report` contract exactly: a non-dict
+    argument raises ``TypeError``, every other violation raises
+    ``ValueError`` (including paired pick groups of more than 16
+    scenarios) and ``alpha`` is a non-boolean finite number with
+    ``0 < alpha <= 1``. The global ranks, stability flags and pairwise
+    tests are computed exactly as in :func:`frontier_mix_rank_report`.
+
+    For each budget pick and each ``(by, key)`` panel the within-group
+    weighted panel effect is ``effect = Σ(w·panel.effect)/Σw`` over the
+    scenarios sharing that pick; ``support`` is unchanged at the pick's
+    summed weight over ``W``. The pick's panel ``rank`` comes from
+    sorting the picks at that panel by descending ``support``, then
+    descending ``effect``, then ascending pick. ``delta`` is the panel
+    rank minus the global rank and ``direction`` is ``rise`` for a
+    negative ``delta``, ``fall`` for a positive one and ``same`` for
+    zero; ``contribution`` is the panel effect minus the pick's global
+    effect. The ``driver`` panel has the largest absolute ``delta``;
+    ties fall to the largest absolute ``contribution``, then region
+    panels before window panels, then ascending key.
+
+    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
+    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, points`` and
+    each point uses the key order ``budget, ranks, tests`` with ranks
+    using ``pick, n, support, effect, rank, stable, driver, panels``
+    and tests using ``a, b, n_a, n_b, diff, p, q, reject``. Points are
+    in ascending budget order, ranks in ascending global rank order,
+    tests in ascending ``(a, b)`` order and panels with region panels
+    before window panels and ascending key within each. ``driver`` uses
+    the key order ``by, key`` and each panel uses ``by, key, effect,
+    rank, delta, direction, contribution``. ``pick``, ``a`` and ``b``
+    are ascending string arrays, ``n``, ``n_a``, ``n_b``, ``rank`` and
+    ``delta`` are integers, ``stable`` and ``reject`` are booleans and
+    every other number renders with six decimals, negative zero
+    normalized to ``0.000000``.
+    """
+    alpha_value, point_data, all_tests, q_values = (
+        _frontier_mix_rank_core(frontiers, weights, alpha)
+    )
+    tests_by_point = _frontier_mix_rank_tests(
+        point_data, all_tests, q_values, alpha_value
+    )
+
+    rendered_points: list[str] = []
+    for point_index, (
+        budget, rank_rows, panel_rows, _pairs
+    ) in enumerate(point_data):
+        rank_strings: list[str] = []
+        for pick, n, support, effect, rank, stable in rank_rows:
+            # Panels are visited in canonical order (region before
+            # window, ascending key), so keeping the first panel with
+            # the best (|delta|, |contribution|) pair applies the
+            # region-then-key tie-breaks for free.
+            driver_by: str | None = None
+            driver_key: str | None = None
+            driver_magnitude: tuple | None = None
+            panel_strings: list[str] = []
+            for by, panel_key, panel_effects, rank_of in panel_rows:
+                panel_rank = rank_of[pick]
+                delta = panel_rank - rank
+                contribution = panel_effects[pick] - effect
+                magnitude = (abs(delta), abs(contribution))
+                if driver_magnitude is None or magnitude > driver_magnitude:
+                    driver_magnitude = magnitude
+                    driver_by = by
+                    driver_key = panel_key
+                if delta < 0:
+                    direction = "rise"
+                elif delta > 0:
+                    direction = "fall"
+                else:
+                    direction = "same"
+                panel_strings.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"key":' + json.dumps(panel_key, ensure_ascii=False)
+                    + ',"effect":' + _format6(panel_effects[pick])
+                    + ',"rank":' + str(panel_rank)
+                    + ',"delta":' + str(delta)
+                    + ',"direction":' + json.dumps(direction)
+                    + ',"contribution":' + _format6(contribution)
                     + "}"
                 )
-            rendered_points.append(
-                '{"budget":' + _format6(budget)
-                + ',"ranks":[' + ",".join(rank_strings) + "]"
-                + ',"tests":[' + ",".join(test_strings) + "]}"
+            assert driver_by is not None and driver_key is not None
+            rank_strings.append(
+                '{"pick":'
+                + json.dumps(
+                    list(pick), ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + ',"n":' + str(n)
+                + ',"support":' + _format6(support)
+                + ',"effect":' + _format6(effect)
+                + ',"rank":' + str(rank)
+                + ',"stable":' + ("true" if stable else "false")
+                + ',"driver":{"by":'
+                + json.dumps(driver_by, ensure_ascii=False)
+                + ',"key":' + json.dumps(driver_key, ensure_ascii=False)
+                + "},"
+                + '"panels":[' + ",".join(panel_strings) + "]}"
             )
+        rendered_points.append(
+            '{"budget":' + _format6(budget)
+            + ',"ranks":[' + ",".join(rank_strings) + "]"
+            + ',"tests":[' + ",".join(tests_by_point[point_index]) + "]}"
+        )
 
     return (
         '{"alpha":' + _format6(alpha_value)
