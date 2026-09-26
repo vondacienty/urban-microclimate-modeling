@@ -87,6 +87,8 @@ __all__ = [
     "frontier_joint",
     "frontier_interval_attribution",
     "interval_sig",
+    "intervention_sig",
+    "intervention_portfolio",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -12785,6 +12787,390 @@ def intervention_sig(
     return (
         '{"alpha":' + _format6(alpha_value)
         + ',"intervals":[' + ",".join(interval_strings) + "]}\n"
+    )
+
+
+_INTERVENTION_SIG_ERROR = "report must be an intervention_sig JSON output"
+
+
+class _InterventionSigNumber(Decimal):
+    """Marker for a canonical fixed-six-decimal number token."""
+
+
+def _intervention_sig_parse_int(value: str) -> int:
+    return int(value)
+
+
+def _intervention_sig_parse_constant(value: str) -> Decimal:
+    raise ValueError(_INTERVENTION_SIG_ERROR)
+
+
+def _intervention_sig_pool(
+    raw: object,
+) -> dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]]:
+    """Parse one :func:`intervention_sig` JSON output, pooling by kind.
+
+    Returns one ``(mean, lower, upper, reject)`` tuple per item with
+    ``n > 0`` for each of ``green``, ``roof`` and ``material``. The
+    input must be byte-for-byte identical to a canonical output (key
+    order, escaping, spacing, group order, ranks and the six-decimal
+    number tokens included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_INTERVENTION_SIG_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_INTERVENTION_SIG_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_INTERVENTION_SIG_ERROR)
+        number = _InterventionSigNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_INTERVENTION_SIG_ERROR)
+        return number
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_intervention_sig_parse_int,
+            parse_constant=_intervention_sig_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_INTERVENTION_SIG_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "intervals"}:
+        raise ValueError(_INTERVENTION_SIG_ERROR)
+    alpha = data["alpha"]
+    intervals = data["intervals"]
+    if (
+        not isinstance(alpha, _InterventionSigNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(intervals, list)
+        or not intervals
+    ):
+        raise ValueError(_INTERVENTION_SIG_ERROR)
+
+    pooled: dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]] = {
+        kind: [] for kind in _INTERVENTION_KINDS
+    }
+    interval_tokens: list[str] = []
+    previous_start: Decimal | None = None
+    for interval in intervals:
+        if not isinstance(interval, dict) or set(interval) != {
+            "start", "end", "groups",
+        }:
+            raise ValueError(_INTERVENTION_SIG_ERROR)
+        start = interval["start"]
+        end = interval["end"]
+        groups = interval["groups"]
+        if (
+            not isinstance(start, _InterventionSigNumber)
+            or not isinstance(end, _InterventionSigNumber)
+            or start > end
+            or (previous_start is not None and start <= previous_start)
+            or not isinstance(groups, list)
+            or not groups
+        ):
+            raise ValueError(_INTERVENTION_SIG_ERROR)
+        previous_start = start
+
+        # All region groups in ascending key order, then all window
+        # groups in ascending key order.
+        group_tokens: list[str] = []
+        section = "region"
+        section_keys: dict[str, str | None] = {
+            "region": None,
+            "window": None,
+        }
+        section_counts: dict[str, int] = {"region": 0, "window": 0}
+        for group in groups:
+            if not isinstance(group, dict) or set(group) != {
+                "by", "key", "items",
+            }:
+                raise ValueError(_INTERVENTION_SIG_ERROR)
+            by = group["by"]
+            key = group["key"]
+            items = group["items"]
+            if by not in ("region", "window"):
+                raise ValueError(_INTERVENTION_SIG_ERROR)
+            if by == "region" and section == "window":
+                raise ValueError(_INTERVENTION_SIG_ERROR)
+            if by == "window":
+                section = "window"
+            if not isinstance(key, str) or not key:
+                raise ValueError(_INTERVENTION_SIG_ERROR)
+            last_key = section_keys[by]
+            if last_key is not None and key <= last_key:
+                raise ValueError(_INTERVENTION_SIG_ERROR)
+            section_keys[by] = key
+            section_counts[by] += 1
+            if not isinstance(items, list) or len(items) != len(
+                _INTERVENTION_KINDS
+            ):
+                raise ValueError(_INTERVENTION_SIG_ERROR)
+
+            item_tokens: list[str] = []
+            kinds_seen: set[str] = set()
+            previous_order: tuple[bool, Decimal, str] | None = None
+            for position, item in enumerate(items):
+                if not isinstance(item, dict) or set(item) != {
+                    "kind", "n", "mean", "se", "lower", "upper",
+                    "p", "q", "reject", "rank",
+                }:
+                    raise ValueError(_INTERVENTION_SIG_ERROR)
+                kind = item["kind"]
+                count = item["n"]
+                mean = item["mean"]
+                se = item["se"]
+                lower = item["lower"]
+                upper = item["upper"]
+                p_value = item["p"]
+                q_value = item["q"]
+                reject = item["reject"]
+                rank = item["rank"]
+                if (
+                    kind not in _INTERVENTION_KINDS
+                    or kind in kinds_seen
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or not 0 <= count <= _INTERVAL_SIG_MAX_N
+                    or not isinstance(mean, _InterventionSigNumber)
+                    or not isinstance(se, _InterventionSigNumber)
+                    or not isinstance(lower, _InterventionSigNumber)
+                    or not isinstance(upper, _InterventionSigNumber)
+                    or not isinstance(p_value, _InterventionSigNumber)
+                    or not isinstance(q_value, _InterventionSigNumber)
+                    or not isinstance(reject, bool)
+                    or isinstance(rank, bool)
+                    or not isinstance(rank, int)
+                    or rank != position + 1
+                ):
+                    raise ValueError(_INTERVENTION_SIG_ERROR)
+                kinds_seen.add(kind)
+                if se < 0 or lower > mean or mean > upper:
+                    raise ValueError(_INTERVENTION_SIG_ERROR)
+                if p_value < 0 or p_value > 1 or q_value < 0 or q_value > 1:
+                    raise ValueError(_INTERVENTION_SIG_ERROR)
+                if count == 0 and (
+                    mean != 0
+                    or se != 0
+                    or lower != 0
+                    or upper != 0
+                    or p_value != 1
+                ):
+                    raise ValueError(_INTERVENTION_SIG_ERROR)
+                # Items follow their rank: rejections first, then
+                # descending mean, then ascending kind.
+                order = (not reject, -mean, kind)
+                if previous_order is not None and order <= previous_order:
+                    raise ValueError(_INTERVENTION_SIG_ERROR)
+                previous_order = order
+
+                if count > 0:
+                    pooled[kind].append((mean, lower, upper, reject))
+                item_tokens.append(
+                    '{"kind":' + json.dumps(kind, ensure_ascii=False)
+                    + ',"n":' + str(count)
+                    + ',"mean":' + _format6(mean)
+                    + ',"se":' + _format6(se)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+            if kinds_seen != set(_INTERVENTION_KINDS):
+                raise ValueError(_INTERVENTION_SIG_ERROR)
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+        if section_counts["region"] == 0 or section_counts["window"] == 0:
+            raise ValueError(_INTERVENTION_SIG_ERROR)
+        interval_tokens.append(
+            '{"start":' + _format6(start)
+            + ',"end":' + _format6(end)
+            + ',"groups":[' + ",".join(group_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations
+    # (whitespace, escaping, key order); the payload must reproduce the
+    # canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"intervals":[' + ",".join(interval_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_INTERVENTION_SIG_ERROR)
+    return pooled
+
+
+def intervention_portfolio(report: str, cost: dict, budget: float) -> str:
+    """Select a robust intervention portfolio from an intervention report.
+
+    ``report`` must be byte-for-byte identical to an
+    :func:`intervention_sig` JSON output; ``cost`` is a dict whose key
+    set is exactly ``{"green", "roof", "material"}`` with strictly
+    positive finite non-boolean int/float values; ``budget`` is a
+    non-negative finite non-boolean int/float. A non-string ``report``
+    or a non-dict ``cost`` raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+
+    Items (across every interval and group) are pooled by kind, keeping
+    only items with ``n > 0``; the pooled ``n`` is the number of such
+    items and the pooled ``effect``, ``lower`` and ``upper`` are the
+    arithmetic means of their ``mean``, ``lower`` and ``upper`` values.
+    A kind without items gets all three values at zero and
+    ``robust = false``; otherwise ``robust`` holds when every pooled
+    item rejects and every pooled item has ``lower > 0``.
+
+    The subsets of the robust kinds are enumerated exhaustively and
+    those whose total cost exceeds ``budget`` are discarded; the empty
+    subset is always feasible. The winner ranks by descending total
+    pooled lower bound, then descending total effect, then ascending
+    total cost, then lexicographically ascending picked kinds. Its
+    ``effect``, ``lower`` and ``upper`` are the sums of the selected
+    members.
+
+    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
+    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is
+    ``budget, cost, effect, lower, upper, pick, items`` and ``items``
+    lists ``green``, ``roof`` and ``material`` in that order, each using
+    ``kind, n, effect, lower, upper, robust, selected``. ``n`` is an
+    integer, ``pick`` an ascending string array, ``robust`` and
+    ``selected`` booleans and every other number renders with six
+    decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+    pooled = _intervention_sig_pool(report)
+    if set(cost) != set(_INTERVENTION_KINDS):
+        raise ValueError(
+            "cost keys must be exactly 'green', 'roof' and 'material'"
+        )
+    cost_values: dict[str, Decimal] = {}
+    for kind in _INTERVENTION_KINDS:
+        cost_value = _portfolio_number(cost[kind], "cost")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        cost_values[kind] = cost_value
+    budget_value = _portfolio_number(budget, "budget")
+    if budget_value < 0:
+        raise ValueError("budget must be non-negative")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        kind_stats: dict[str, tuple[int, Decimal, Decimal, Decimal, bool]] = {}
+        robust_kinds: list[str] = []
+        for kind in _INTERVENTION_KINDS:
+            members = pooled[kind]
+            count = len(members)
+            if count == 0:
+                kind_stats[kind] = (
+                    0, Decimal(0), Decimal(0), Decimal(0), False,
+                )
+                continue
+            effect = sum(
+                (member[0] for member in members), Decimal(0)
+            ) / Decimal(count)
+            lower = sum(
+                (member[1] for member in members), Decimal(0)
+            ) / Decimal(count)
+            upper = sum(
+                (member[2] for member in members), Decimal(0)
+            ) / Decimal(count)
+            robust = all(
+                member[3] and member[1] > 0 for member in members
+            )
+            kind_stats[kind] = (count, effect, lower, upper, robust)
+            if robust:
+                robust_kinds.append(kind)
+        robust_kinds.sort()
+
+        best: tuple[
+            Decimal, Decimal, Decimal, tuple[str, ...]
+        ] | None = None
+        for size in range(len(robust_kinds) + 1):
+            for idxs in combinations(range(len(robust_kinds)), size):
+                pick = tuple(robust_kinds[i] for i in idxs)
+                total_cost = sum(
+                    (cost_values[kind] for kind in pick), Decimal(0)
+                )
+                if total_cost > budget_value:
+                    continue
+                total_effect = sum(
+                    (kind_stats[kind][1] for kind in pick), Decimal(0)
+                )
+                total_lower = sum(
+                    (kind_stats[kind][2] for kind in pick), Decimal(0)
+                )
+                if (
+                    best is None
+                    or total_lower > best[0]
+                    or (
+                        total_lower == best[0]
+                        and (
+                            total_effect > best[1]
+                            or (
+                                total_effect == best[1]
+                                and (
+                                    total_cost < best[2]
+                                    or (
+                                        total_cost == best[2]
+                                        and pick < best[3]
+                                    )
+                                )
+                            )
+                        )
+                    )
+                ):
+                    best = (total_lower, total_effect, total_cost, pick)
+
+        assert best is not None  # the empty subset is always feasible
+        total_lower, total_effect, total_cost, pick = best
+        total_upper = sum(
+            (kind_stats[kind][3] for kind in pick), Decimal(0)
+        )
+        pick_set = set(pick)
+
+        item_strings: list[str] = []
+        for kind in _INTERVENTION_KINDS:
+            count, effect, lower, upper, robust = kind_stats[kind]
+            item_strings.append(
+                '{"kind":' + json.dumps(kind, ensure_ascii=False)
+                + ',"n":' + str(count)
+                + ',"effect":' + _format6(effect)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + ',"robust":' + ("true" if robust else "false")
+                + ',"selected":' + ("true" if kind in pick_set else "false")
+                + "}"
+            )
+        item_payload = ",".join(item_strings)
+
+    pick_json = json.dumps(
+        list(pick), ensure_ascii=False, separators=(",", ":")
+    )
+    return (
+        '{"budget":' + _format6(budget_value)
+        + ',"cost":' + _format6(total_cost)
+        + ',"effect":' + _format6(total_effect)
+        + ',"lower":' + _format6(total_lower)
+        + ',"upper":' + _format6(total_upper)
+        + ',"pick":' + pick_json
+        + ',"items":[' + item_payload + "]}\n"
     )
 
 
