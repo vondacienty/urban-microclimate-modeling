@@ -88,7 +88,6 @@ __all__ = [
     "frontier_interval_attribution",
     "interval_sig",
     "intervention_sig",
-    "intervention_portfolio",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -12816,6 +12815,27 @@ def _intervention_sig_pool(
     order, escaping, spacing, group order, ranks and the six-decimal
     number tokens included); any deviation raises ``ValueError``.
     """
+    pooled, _ = _intervention_sig_parse(raw)
+    return pooled
+
+
+def _intervention_sig_parse(
+    raw: object,
+) -> tuple[
+    dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]],
+    dict[tuple[str, str], list[tuple[str, Decimal, Decimal, Decimal]]],
+]:
+    """Parse one :func:`intervention_sig` JSON output.
+
+    Returns ``(pooled, groups)`` where ``pooled`` holds one
+    ``(mean, lower, upper, reject)`` tuple per item with ``n > 0`` for
+    each of ``green``, ``roof`` and ``material`` and ``groups`` maps
+    each ``(by, key)`` group to one ``(kind, mean, lower, upper)`` tuple
+    per item with ``n > 0``, pooled across intervals. The input must be
+    byte-for-byte identical to a canonical output (key order, escaping,
+    spacing, group order, ranks and the six-decimal number tokens
+    included); any deviation raises ``ValueError``.
+    """
     if not isinstance(raw, str):
         raise ValueError(_INTERVENTION_SIG_ERROR)
     if not raw.endswith("\n") or raw.endswith("\n\n"):
@@ -12856,6 +12876,9 @@ def _intervention_sig_pool(
     pooled: dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]] = {
         kind: [] for kind in _INTERVENTION_KINDS
     }
+    group_items: dict[
+        tuple[str, str], list[tuple[str, Decimal, Decimal, Decimal]]
+    ] = {}
     interval_tokens: list[str] = []
     previous_start: Decimal | None = None
     for interval in intervals:
@@ -12907,6 +12930,7 @@ def _intervention_sig_pool(
                 raise ValueError(_INTERVENTION_SIG_ERROR)
             section_keys[by] = key
             section_counts[by] += 1
+            group_items.setdefault((by, key), [])
             if not isinstance(items, list) or len(items) != len(
                 _INTERVENTION_KINDS
             ):
@@ -12971,6 +12995,9 @@ def _intervention_sig_pool(
 
                 if count > 0:
                     pooled[kind].append((mean, lower, upper, reject))
+                    group_items[(by, key)].append(
+                        (kind, mean, lower, upper)
+                    )
                 item_tokens.append(
                     '{"kind":' + json.dumps(kind, ensure_ascii=False)
                     + ',"n":' + str(count)
@@ -13008,7 +13035,115 @@ def _intervention_sig_pool(
     )
     if payload != canonical:
         raise ValueError(_INTERVENTION_SIG_ERROR)
-    return pooled
+    return pooled, group_items
+
+
+def _intervention_kind_stats(
+    pooled: dict[str, list[tuple[Decimal, Decimal, Decimal, bool]]],
+) -> tuple[
+    dict[str, tuple[int, Decimal, Decimal, Decimal, bool]], list[str]
+]:
+    """Pool per-kind statistics and determine the robust kinds.
+
+    Returns ``(kind_stats, robust_kinds)`` where ``kind_stats`` maps
+    each kind to ``(n, effect, lower, upper, robust)`` — ``n`` the
+    number of pooled items, ``effect``/``lower``/``upper`` their mean
+    values (zero when the kind has no items) and ``robust`` true when
+    every pooled item rejects with ``lower > 0`` — and ``robust_kinds``
+    lists the robust kinds in ascending order. Must run under a
+    precision-1000, ROUND_HALF_EVEN local context.
+    """
+    kind_stats: dict[str, tuple[int, Decimal, Decimal, Decimal, bool]] = {}
+    robust_kinds: list[str] = []
+    for kind in _INTERVENTION_KINDS:
+        members = pooled[kind]
+        count = len(members)
+        if count == 0:
+            kind_stats[kind] = (
+                0, Decimal(0), Decimal(0), Decimal(0), False,
+            )
+            continue
+        effect = sum(
+            (member[0] for member in members), Decimal(0)
+        ) / Decimal(count)
+        lower = sum(
+            (member[1] for member in members), Decimal(0)
+        ) / Decimal(count)
+        upper = sum(
+            (member[2] for member in members), Decimal(0)
+        ) / Decimal(count)
+        robust = all(
+            member[3] and member[1] > 0 for member in members
+        )
+        kind_stats[kind] = (count, effect, lower, upper, robust)
+        if robust:
+            robust_kinds.append(kind)
+    robust_kinds.sort()
+    return kind_stats, robust_kinds
+
+
+def _intervention_best_pick(
+    kind_stats: dict[str, tuple[int, Decimal, Decimal, Decimal, bool]],
+    cost_values: dict[str, Decimal],
+    robust_kinds: list[str],
+    budget_value: Decimal,
+) -> tuple[Decimal, Decimal, Decimal, Decimal, tuple[str, ...]]:
+    """Select the best feasible robust-kind subset under ``budget_value``.
+
+    The subsets of the robust kinds are enumerated exhaustively and
+    those whose total cost exceeds ``budget_value`` are discarded; the
+    empty subset is always feasible. The winner ranks by descending
+    total pooled lower bound, then descending total effect, then
+    ascending total cost, then lexicographically ascending picked
+    kinds. Returns ``(cost, effect, lower, upper, pick)`` with the
+    totals summed over the selected members. Must run under a
+    precision-1000, ROUND_HALF_EVEN local context.
+    """
+    best: tuple[
+        Decimal, Decimal, Decimal, tuple[str, ...]
+    ] | None = None
+    for size in range(len(robust_kinds) + 1):
+        for idxs in combinations(range(len(robust_kinds)), size):
+            pick = tuple(robust_kinds[i] for i in idxs)
+            total_cost = sum(
+                (cost_values[kind] for kind in pick), Decimal(0)
+            )
+            if total_cost > budget_value:
+                continue
+            total_effect = sum(
+                (kind_stats[kind][1] for kind in pick), Decimal(0)
+            )
+            total_lower = sum(
+                (kind_stats[kind][2] for kind in pick), Decimal(0)
+            )
+            if (
+                best is None
+                or total_lower > best[0]
+                or (
+                    total_lower == best[0]
+                    and (
+                        total_effect > best[1]
+                        or (
+                            total_effect == best[1]
+                            and (
+                                total_cost < best[2]
+                                or (
+                                    total_cost == best[2]
+                                    and pick < best[3]
+                                )
+                            )
+                        )
+                    )
+                )
+            ):
+                best = (total_lower, total_effect, total_cost, pick)
+
+    assert best is not None  # the empty subset is always feasible
+    total_lower, total_effect, total_cost, pick = best
+    total_upper = sum(
+        (kind_stats[kind][3] for kind in pick), Decimal(0)
+    )
+    return total_cost, total_effect, total_lower, total_upper, pick
 
 
 def intervention_portfolio(report: str, cost: dict, budget: float) -> str:
@@ -13072,76 +13207,11 @@ def intervention_portfolio(report: str, cost: dict, budget: float) -> str:
         ctx.prec = _MODEL_PRECISION
         ctx.rounding = ROUND_HALF_EVEN
 
-        kind_stats: dict[str, tuple[int, Decimal, Decimal, Decimal, bool]] = {}
-        robust_kinds: list[str] = []
-        for kind in _INTERVENTION_KINDS:
-            members = pooled[kind]
-            count = len(members)
-            if count == 0:
-                kind_stats[kind] = (
-                    0, Decimal(0), Decimal(0), Decimal(0), False,
-                )
-                continue
-            effect = sum(
-                (member[0] for member in members), Decimal(0)
-            ) / Decimal(count)
-            lower = sum(
-                (member[1] for member in members), Decimal(0)
-            ) / Decimal(count)
-            upper = sum(
-                (member[2] for member in members), Decimal(0)
-            ) / Decimal(count)
-            robust = all(
-                member[3] and member[1] > 0 for member in members
+        kind_stats, robust_kinds = _intervention_kind_stats(pooled)
+        total_cost, total_effect, total_lower, total_upper, pick = (
+            _intervention_best_pick(
+                kind_stats, cost_values, robust_kinds, budget_value
             )
-            kind_stats[kind] = (count, effect, lower, upper, robust)
-            if robust:
-                robust_kinds.append(kind)
-        robust_kinds.sort()
-
-        best: tuple[
-            Decimal, Decimal, Decimal, tuple[str, ...]
-        ] | None = None
-        for size in range(len(robust_kinds) + 1):
-            for idxs in combinations(range(len(robust_kinds)), size):
-                pick = tuple(robust_kinds[i] for i in idxs)
-                total_cost = sum(
-                    (cost_values[kind] for kind in pick), Decimal(0)
-                )
-                if total_cost > budget_value:
-                    continue
-                total_effect = sum(
-                    (kind_stats[kind][1] for kind in pick), Decimal(0)
-                )
-                total_lower = sum(
-                    (kind_stats[kind][2] for kind in pick), Decimal(0)
-                )
-                if (
-                    best is None
-                    or total_lower > best[0]
-                    or (
-                        total_lower == best[0]
-                        and (
-                            total_effect > best[1]
-                            or (
-                                total_effect == best[1]
-                                and (
-                                    total_cost < best[2]
-                                    or (
-                                        total_cost == best[2]
-                                        and pick < best[3]
-                                    )
-                                )
-                            )
-                        )
-                    )
-                ):
-                    best = (total_lower, total_effect, total_cost, pick)
-
-        assert best is not None  # the empty subset is always feasible
-        total_lower, total_effect, total_cost, pick = best
-        total_upper = sum(
-            (kind_stats[kind][3] for kind in pick), Decimal(0)
         )
         pick_set = set(pick)
 
@@ -13172,6 +13242,153 @@ def intervention_portfolio(report: str, cost: dict, budget: float) -> str:
         + ',"pick":' + pick_json
         + ',"items":[' + item_payload + "]}\n"
     )
+
+
+def budget_frontier(report: str, cost: dict, budgets: list) -> str:
+    """Trace the optimal intervention portfolio across a budget frontier.
+
+    ``report`` must be byte-for-byte identical to an
+    :func:`intervention_sig` JSON output; ``cost`` is a dict whose key
+    set is exactly ``{"green", "roof", "material"}`` with strictly
+    positive finite non-boolean int/float values; ``budgets`` is a
+    non-empty list of pairwise distinct non-negative finite non-boolean
+    int/float values. A non-string ``report``, a non-dict ``cost`` or a
+    non-list ``budgets`` raises ``TypeError``; every other contract
+    violation raises ``ValueError``.
+
+    Items (across every interval and group) are pooled by kind, keeping
+    only items with ``n > 0``; the pooled ``n`` is the number of such
+    items and the pooled ``effect``, ``lower`` and ``upper`` are the
+    arithmetic means of their ``mean``, ``lower`` and ``upper`` values.
+    A kind without items gets all three values at zero and
+    ``robust = false``; otherwise ``robust`` holds when every pooled
+    item rejects and every pooled item has ``lower > 0``.
+
+    The budgets are processed in ascending order. For each budget the
+    subsets of the robust kinds are enumerated exhaustively and those
+    whose total cost exceeds the budget are discarded; the empty subset
+    is always feasible. The winner ranks by descending total pooled
+    lower bound, then descending total effect, then ascending total
+    cost, then lexicographically ascending picked kinds. Its ``effect``,
+    ``lower`` and ``upper`` are the sums of the selected members.
+    ``switch`` is true when the pick differs from the previous point's
+    pick and false on the first point.
+
+    Each point also carries one panel per ``(by, key)`` group of the
+    report, region groups before window groups and ascending key within
+    each. A panel pools, across every interval, the items with ``n > 0``
+    whose kind is picked at that point: ``n`` is the number of such
+    items and ``effect``, ``lower`` and ``upper`` are the arithmetic
+    means of their ``mean``, ``lower`` and ``upper`` values, all zero
+    when the panel has no items.
+
+    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
+    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key is ``points`` and each point
+    uses the key order ``budget, cost, effect, lower, upper, pick,
+    switch, panels`` with panels using ``by, key, n, effect, lower,
+    upper``. ``n`` is an integer, ``pick`` an ascending string array,
+    ``switch`` a boolean and every other number renders with six
+    decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+    if not isinstance(budgets, list):
+        raise TypeError("budgets must be a list")
+    pooled, group_items = _intervention_sig_parse(report)
+    if set(cost) != set(_INTERVENTION_KINDS):
+        raise ValueError(
+            "cost keys must be exactly 'green', 'roof' and 'material'"
+        )
+    cost_values: dict[str, Decimal] = {}
+    for kind in _INTERVENTION_KINDS:
+        cost_value = _portfolio_number(cost[kind], "cost")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        cost_values[kind] = cost_value
+    if not budgets:
+        raise ValueError("budgets must be a non-empty list")
+    budget_values: list[Decimal] = []
+    seen_budgets: set[Decimal] = set()
+    for budget in budgets:
+        budget_value = _portfolio_number(budget, "budget")
+        if budget_value < 0:
+            raise ValueError("each budget must be non-negative")
+        if budget_value in seen_budgets:
+            raise ValueError("budgets must be pairwise distinct")
+        seen_budgets.add(budget_value)
+        budget_values.append(budget_value)
+    budget_values.sort()
+
+    panel_keys = sorted(
+        group_items, key=lambda by_key: (by_key[0] != "region", by_key[1])
+    )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        kind_stats, robust_kinds = _intervention_kind_stats(pooled)
+        point_strings: list[str] = []
+        previous_pick: tuple[str, ...] | None = None
+        for budget_value in budget_values:
+            total_cost, total_effect, total_lower, total_upper, pick = (
+                _intervention_best_pick(
+                    kind_stats, cost_values, robust_kinds, budget_value
+                )
+            )
+            switch = previous_pick is not None and pick != previous_pick
+            previous_pick = pick
+            pick_set = set(pick)
+
+            panel_strings: list[str] = []
+            for by, key in panel_keys:
+                items = [
+                    item
+                    for item in group_items[(by, key)]
+                    if item[0] in pick_set
+                ]
+                count = len(items)
+                if count:
+                    effect = sum(
+                        (item[1] for item in items), Decimal(0)
+                    ) / Decimal(count)
+                    lower = sum(
+                        (item[2] for item in items), Decimal(0)
+                    ) / Decimal(count)
+                    upper = sum(
+                        (item[3] for item in items), Decimal(0)
+                    ) / Decimal(count)
+                else:
+                    effect = lower = upper = Decimal(0)
+                panel_strings.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"key":' + json.dumps(key, ensure_ascii=False)
+                    + ',"n":' + str(count)
+                    + ',"effect":' + _format6(effect)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + "}"
+                )
+
+            pick_json = json.dumps(
+                list(pick), ensure_ascii=False, separators=(",", ":")
+            )
+            point_strings.append(
+                '{"budget":' + _format6(budget_value)
+                + ',"cost":' + _format6(total_cost)
+                + ',"effect":' + _format6(total_effect)
+                + ',"lower":' + _format6(total_lower)
+                + ',"upper":' + _format6(total_upper)
+                + ',"pick":' + pick_json
+                + ',"switch":' + ("true" if switch else "false")
+                + ',"panels":[' + ",".join(panel_strings) + "]}"
+            )
+
+    return '{"points":[' + ",".join(point_strings) + "]}\n"
 
 
 _TEMPORAL_LAG_MAX_N = 8
