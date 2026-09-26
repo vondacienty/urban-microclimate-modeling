@@ -81,6 +81,7 @@ __all__ = [
     "portfolio",
     "portfolio_robustness",
     "portfolio_attribution",
+    "panel_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -10296,6 +10297,287 @@ def portfolio_attribution(
         '{"alpha":' + _format6(alpha_value)
         + ',"total_weight":' + _format6(total_weight)
         + ',"items":[' + ",".join(items) + "]}\n"
+    )
+
+
+_PANEL_REPORT_TOP_KEYS = frozenset({"alpha", "total_weight", "items"})
+_PANEL_REPORT_ITEM_KEYS = frozenset(
+    {"key", "n", "expected", "worst", "sensitivity", "p", "q", "reject"}
+)
+
+
+def _parse_panel_attribution(value: object) -> dict:
+    """Validate a canonical :func:`portfolio_attribution` JSON string and
+    return a mapping of candidate key to ``(expected, reject)`` with
+    ``expected`` as a ``Decimal``."""
+    if not isinstance(value, str):
+        raise ValueError(
+            "each reports value must be a portfolio_attribution JSON string"
+        )
+    try:
+        document = json.loads(value)
+    except json.JSONDecodeError:
+        raise ValueError(
+            "each reports value must be a portfolio_attribution JSON string"
+        ) from None
+    if not isinstance(document, dict) or (
+        set(document) != _PANEL_REPORT_TOP_KEYS
+    ):
+        raise ValueError(
+            "each reports value must be a canonical portfolio_attribution"
+            " JSON object"
+        )
+
+    def check_number(field: object, name: str) -> None:
+        if isinstance(field, bool) or not isinstance(field, (int, float)):
+            raise ValueError(f"{name} must be a finite number")
+        if isinstance(field, float) and not math.isfinite(field):
+            raise ValueError(f"{name} must be finite")
+
+    check_number(document["alpha"], "alpha")
+    check_number(document["total_weight"], "total_weight")
+    items = document["items"]
+    if not isinstance(items, list):
+        raise ValueError("items must be a list")
+
+    candidates: dict = {}
+    for item in items:
+        if not isinstance(item, dict) or set(item) != _PANEL_REPORT_ITEM_KEYS:
+            raise ValueError(
+                "each item must be a canonical portfolio_attribution item"
+            )
+        key = item["key"]
+        if not isinstance(key, str) or not key:
+            raise ValueError("each item key must be a non-empty string")
+        if key in candidates:
+            raise ValueError("item keys must not repeat")
+        item_n = item["n"]
+        if isinstance(item_n, bool) or not isinstance(item_n, int) or item_n < 1:
+            raise ValueError("each item n must be a positive integer")
+        for name in ("expected", "worst", "sensitivity", "p", "q"):
+            check_number(item[name], name)
+        if not isinstance(item["reject"], bool):
+            raise ValueError("each item reject must be a boolean")
+        candidates[key] = (
+            Decimal(str(item["expected"])),
+            item["reject"],
+        )
+    return candidates
+
+
+def panel_report(reports: dict, weights: dict, *, alpha: float = 0.05) -> str:
+    """Panel a candidate across weighted ``portfolio_attribution`` reports.
+
+    ``reports`` maps ``(region, window)`` two-tuples of non-empty strings to
+    canonical :func:`portfolio_attribution` JSON strings and must hold at
+    least two entries, all sharing the same candidate set. ``weights`` maps
+    the same keys to positive finite non-boolean numbers. ``alpha`` must be
+    a finite non-boolean number with ``0 < alpha <= 1``.
+
+    Entries are grouped by ``region``, by ``window`` and overall. For each
+    group and candidate the sources contribute ``v = expected`` with weight
+    ``w``; the group size ``n`` must be at most 16. With ``W = sum(w)`` the
+    statistics are ``mean = sum(w * v) / W``, ``range = max(v) - min(v)``
+    and ``stable = sum(w * reject) / W``. The p-value enumerates all
+    ``2**n`` sign vectors: ``p`` is the proportion of vectors with
+    ``|sum_s sign_s * w_s * v_s / W| >= |mean|``. All ``(group, candidate)``
+    items across every group are ranked ascending by ``(p, dimension,
+    group key, candidate)`` — dimension ordered region, window, overall —
+    and each rank ``j`` (1-based, of ``N``) gets the Benjamini-Hochberg
+    q-value ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha``, compared on the unquantized values. All arithmetic is
+    ``Decimal(str(x))`` under a precision-1000, ROUND_HALF_EVEN context.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups``. Groups
+    use the key order ``by, key, items`` and are ordered by dimension
+    (``region``, ``window``, ``overall``) then key ascending, the overall
+    group keyed ``"all"``. Items use the key order
+    ``key, n, mean, range, stable, p, q, reject`` sorted by candidate key
+    ascending; ``n`` is the integer group size, ``reject`` a boolean and
+    every other numeric value renders with six decimals, negative zero
+    normalized to ``0.000000``. A non-dict ``reports`` or ``weights``
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if len(reports) < 2:
+        raise ValueError("reports must contain at least two entries")
+    if len(reports) > 16:
+        raise ValueError("reports must contain at most sixteen entries")
+
+    parsed: dict = {}
+    candidate_set: set[str] | None = None
+    for key, value in reports.items():
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise ValueError(
+                "each reports key must be a (region, window) two-tuple"
+            )
+        region, window = key
+        if (
+            not isinstance(region, str)
+            or not region
+            or not isinstance(window, str)
+            or not window
+        ):
+            raise ValueError("region and window must be non-empty strings")
+        candidates = _parse_panel_attribution(value)
+        if candidate_set is None:
+            candidate_set = set(candidates)
+        elif set(candidates) != candidate_set:
+            raise ValueError("all reports must share the same candidate set")
+        parsed[key] = candidates
+
+    if set(weights) != set(reports):
+        raise ValueError("weights must have the same keys as reports")
+    weight_values: dict = {}
+    for key in reports:
+        weight = weights[key]
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise ValueError("each weight must be a positive finite number")
+        if isinstance(weight, float) and not math.isfinite(weight):
+            raise ValueError("each weight must be finite")
+        weight_decimal = Decimal(str(weight))
+        if weight_decimal <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values[key] = weight_decimal
+
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    # Groups ordered by dimension (region, window, overall) then key
+    # ascending; the overall group is keyed "all".
+    groups: list[tuple[int, str, str, list]] = []
+    for region in sorted({key[0] for key in reports}):
+        groups.append(
+            (0, "region", region, [key for key in reports if key[0] == region])
+        )
+    for window in sorted({key[1] for key in reports}):
+        groups.append(
+            (1, "window", window, [key for key in reports if key[1] == window])
+        )
+    groups.append((2, "overall", "all", list(reports)))
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # One record per (group, candidate): ``[dimension, group_key,
+        # candidate, n, mean, range, stable, p, q]`` with q filled in below.
+        group_records: list[list[list]] = []
+        for dimension, _by, group_key, members in groups:
+            n = len(members)
+            if n > 16:
+                raise ValueError("each group must contain at most sixteen sources")
+            member_weights = [weight_values[key] for key in members]
+            total_weight = sum(member_weights, Decimal(0))
+            sign_count = 1 << n
+            records: list[list] = []
+            for candidate in sorted(candidate_set):
+                values = [parsed[key][candidate][0] for key in members]
+                terms = [
+                    member_weights[s] * values[s] for s in range(n)
+                ]
+                mean = sum(terms, Decimal(0)) / total_weight
+                value_range = max(values) - min(values)
+                stable = sum(
+                    (
+                        member_weights[s]
+                        if parsed[members[s]][candidate][1]
+                        else Decimal(0)
+                    )
+                    for s in range(n)
+                ) / total_weight
+                threshold = abs(sum(terms, Decimal(0)))
+                hits = 0
+                for mask in range(sign_count):
+                    statistic = Decimal(0)
+                    for s in range(n):
+                        if mask >> s & 1:
+                            statistic += terms[s]
+                        else:
+                            statistic -= terms[s]
+                    if abs(statistic) >= threshold:
+                        hits += 1
+                p_value = Decimal(hits) / Decimal(sign_count)
+                records.append(
+                    [
+                        dimension,
+                        group_key,
+                        candidate,
+                        n,
+                        mean,
+                        value_range,
+                        stable,
+                        p_value,
+                        None,
+                    ]
+                )
+            group_records.append(records)
+
+        # Benjamini-Hochberg q-values across every (group, candidate) item:
+        # rank ascending by (p, dimension, group key, candidate), then
+        # accumulate the running minimum of N * p_l / l from the top down.
+        flat = [record for records in group_records for record in records]
+        count = len(flat)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (
+                flat[idx][7],
+                flat[idx][0],
+                flat[idx][1],
+                flat[idx][2],
+            ),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate_q = Decimal(count) * flat[idx][7] / rank
+            if candidate_q < running:
+                running = candidate_q
+            flat[idx][8] = running
+
+        group_parts: list[str] = []
+        for (_dimension, by, group_key, _members), records in zip(
+            groups, group_records
+        ):
+            items: list[str] = []
+            for (
+                _dim,
+                _gkey,
+                candidate,
+                n,
+                mean,
+                value_range,
+                stable,
+                p_value,
+                q_value,
+            ) in records:
+                items.append(
+                    '{"key":' + json.dumps(candidate, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"mean":' + _format6(mean)
+                    + ',"range":' + _format6(value_range)
+                    + ',"stable":' + _format6(stable)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":'
+                    + ("true" if q_value <= alpha_value else "false")
+                    + "}"
+                )
+            group_parts.append(
+                '{"by":' + json.dumps(by)
+                + ',"key":' + json.dumps(group_key, ensure_ascii=False)
+                + ',"items":[' + ",".join(items) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"groups":[' + ",".join(group_parts) + "]}\n"
     )
 
 
