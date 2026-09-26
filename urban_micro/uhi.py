@@ -78,6 +78,7 @@ __all__ = [
     "surface_thermal_zone_scenario_report",
     "decision_priority_shift",
     "decision_priority_consensus",
+    "portfolio",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -9460,6 +9461,321 @@ def decision_priority_consensus(
         + ',"recommend":'
         + json.dumps(recommended, ensure_ascii=False, separators=(",", ":"))
         + "}\n"
+    )
+
+
+_CONSENSUS_ERROR = "report must be a decision_priority_consensus JSON output"
+_CONSENSUS_SUPPORT_RE = re.compile(r"(?:0|[1-9][0-9]*)\.[0-9]{6}")
+
+
+class _ConsensusSupport(Decimal):
+    """Marker for a canonical fixed-six-decimal support token."""
+
+
+def _consensus_parse_int(value: str) -> Decimal:
+    raise ValueError(_CONSENSUS_ERROR)
+
+
+def _consensus_parse_constant(value: str) -> Decimal:
+    raise ValueError(_CONSENSUS_ERROR)
+
+
+def _consensus_candidates(raw: object) -> list[tuple[str, Decimal]]:
+    """Parse one :func:`decision_priority_consensus` JSON output.
+
+    Returns ``(key, support)`` pairs in ascending key order. Any
+    structural deviation from the canonical output raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_CONSENSUS_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_CONSENSUS_ERROR)
+    payload = raw[:-1]
+
+    def _parse_support(value: str) -> Decimal:
+        if not _CONSENSUS_SUPPORT_RE.fullmatch(value):
+            raise ValueError(_CONSENSUS_ERROR)
+        return _ConsensusSupport(value)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_support,
+            parse_int=_consensus_parse_int,
+            parse_constant=_consensus_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_CONSENSUS_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"candidates", "recommend"}:
+        raise ValueError(_CONSENSUS_ERROR)
+    candidates_raw = data["candidates"]
+    recommended_raw = data["recommend"]
+    if not isinstance(candidates_raw, list) or not isinstance(
+        recommended_raw, list
+    ):
+        raise ValueError(_CONSENSUS_ERROR)
+
+    pairs: list[tuple[str, Decimal]] = []
+    seen: set[str] = set()
+    candidate_recommend: set[str] = set()
+    last_key: str | None = None
+    for item in candidates_raw:
+        if not isinstance(item, dict) or set(item) != {
+            "key", "direction", "support", "stable", "recommend",
+        }:
+            raise ValueError(_CONSENSUS_ERROR)
+        key = item["key"]
+        direction = item["direction"]
+        support = item["support"]
+        stable = item["stable"]
+        recommend = item["recommend"]
+        if (
+            not isinstance(key, str)
+            or not key
+            or direction not in ("rise", "fall", "same", "mixed")
+            or not isinstance(support, _ConsensusSupport)
+            or not isinstance(stable, bool)
+            or not isinstance(recommend, bool)
+        ):
+            raise ValueError(_CONSENSUS_ERROR)
+        if key in seen or (last_key is not None and key <= last_key):
+            raise ValueError(_CONSENSUS_ERROR)
+        seen.add(key)
+        last_key = key
+        if recommend:
+            candidate_recommend.add(key)
+        # Support is a proportion in [0, 1]; negative zero never serializes.
+        if support < 0 or support > 1:
+            raise ValueError(_CONSENSUS_ERROR)
+        pairs.append((key, support))
+
+    recommended: set[str] = set()
+    last_recommended: str | None = None
+    for key in recommended_raw:
+        if not isinstance(key, str) or not key or key not in seen:
+            raise ValueError(_CONSENSUS_ERROR)
+        if key in recommended or (
+            last_recommended is not None and key <= last_recommended
+        ):
+            raise ValueError(_CONSENSUS_ERROR)
+        recommended.add(key)
+        last_recommended = key
+    # The top-level list must match the per-candidate recommend flags.
+    if recommended != candidate_recommend:
+        raise ValueError(_CONSENSUS_ERROR)
+    return pairs
+
+
+def _portfolio_number(value: object, name: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite int or float")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return Decimal(str(value))
+
+
+def portfolio(
+    report: str, cost: dict, gain: dict, limit: float, rules: dict
+) -> str:
+    """Select the best candidate subset from a consensus report.
+
+    ``report`` must be a :func:`decision_priority_consensus` JSON output;
+    ``cost`` and ``gain`` are dicts whose key sets are exactly the
+    report's candidate keys, with finite non-boolean int/float values
+    (strictly positive costs, non-negative gains); ``limit`` is a
+    non-negative finite non-boolean int/float; and ``rules`` has exactly
+    the keys ``"mutex"`` and ``"requires"``, each a list of two-tuples of
+    distinct candidate keys. Mutex pairs are undirected and
+    deduplicated; a ``requires`` pair ``(a, b)`` means selecting ``a``
+    forces ``b`` to be selected and pairs are deduplicated in order. A
+    non-string ``report`` or a non-dict ``cost``, ``gain`` or ``rules``
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``.
+
+    Each candidate's score is ``gain * support`` where ``support`` is
+    the report value, computed as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN context. Subsets are enumerated
+    exhaustively, keeping those whose total cost is at most ``limit``,
+    which never select both ends of a mutex pair and which are closed
+    under every ``requires`` edge. The winner maximizes total score,
+    then minimizes total cost, then minimizes the lexicographically
+    ascending selected-key list.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the key order is ``cost, score, pick, skip``.
+    ``cost`` and ``score`` are the selected totals rendered with six
+    decimals (negative zero normalized to ``0.000000``); ``pick`` is the
+    ascending selected-key array and ``skip`` is an ascending
+    ``[key, reason]`` array. Each unselected candidate is tagged, in
+    priority order, ``"requires"`` (a required candidate is absent),
+    ``"mutex"`` (it conflicts with a selection), ``"budget"`` (adding
+    it exceeds the limit) or ``"dominated"`` (otherwise).
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+    if not isinstance(gain, dict):
+        raise TypeError("gain must be a dict")
+    if not isinstance(rules, dict):
+        raise TypeError("rules must be a dict")
+
+    pairs = _consensus_candidates(report)
+    keys = [key for key, _ in pairs]
+    supports = [support for _, support in pairs]
+    candidate_set = set(keys)
+    if set(cost) != candidate_set:
+        raise ValueError("cost keys must be exactly the candidate keys")
+    if set(gain) != candidate_set:
+        raise ValueError("gain keys must be exactly the candidate keys")
+    limit_value = _portfolio_number(limit, "limit")
+    if limit_value < 0:
+        raise ValueError("limit must be non-negative")
+    if set(rules) != {"mutex", "requires"}:
+        raise ValueError("rules keys must be exactly 'mutex' and 'requires'")
+    mutex_raw = rules["mutex"]
+    requires_raw = rules["requires"]
+    if not isinstance(mutex_raw, list) or not isinstance(requires_raw, list):
+        raise ValueError("rules values must be lists")
+
+    index = {key: i for i, key in enumerate(keys)}
+    costs: list[Decimal] = []
+    gains: list[Decimal] = []
+    for key in keys:
+        cost_value = _portfolio_number(cost[key], "cost")
+        gain_value = _portfolio_number(gain[key], "gain")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        if gain_value < 0:
+            raise ValueError("each gain must be non-negative")
+        costs.append(cost_value)
+        gains.append(gain_value)
+
+    def _rule_pair(item: object) -> tuple[int, int]:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError("each rule must be a two-tuple of candidate keys")
+        left, right = item
+        if (
+            not isinstance(left, str)
+            or not isinstance(right, str)
+            or left not in candidate_set
+            or right not in candidate_set
+            or left == right
+        ):
+            raise ValueError(
+                "each rule must pair two distinct candidate keys"
+            )
+        return index[left], index[right]
+
+    mutex_edges: set[frozenset[int]] = set()
+    for item in mutex_raw:
+        edge = frozenset(_rule_pair(item))
+        if edge in mutex_edges:
+            raise ValueError("mutex pairs must not repeat")
+        mutex_edges.add(edge)
+
+    requires_edges: set[tuple[int, int]] = set()
+    for item in requires_raw:
+        pair = _rule_pair(item)
+        if pair in requires_edges:
+            raise ValueError("requires pairs must not repeat")
+        requires_edges.add(pair)
+
+    n = len(keys)
+    requires_by_key: list[list[int]] = [[] for _ in range(n)]
+    for left, right in requires_edges:
+        requires_by_key[left].append(right)
+    mutex_neighbors: list[set[int]] = [set() for _ in range(n)]
+    for edge in mutex_edges:
+        left, right = tuple(edge)
+        mutex_neighbors[left].add(right)
+        mutex_neighbors[right].add(left)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+        scores = [gains[i] * supports[i] for i in range(n)]
+
+        def _closure(chosen: frozenset) -> frozenset | None:
+            closure = set(chosen)
+            while True:
+                added = {
+                    required
+                    for member in closure
+                    for required in requires_by_key[member]
+                    if required not in closure
+                }
+                if not added:
+                    break
+                closure |= added
+            if sum((costs[i] for i in closure), Decimal(0)) > limit_value:
+                return None
+            for edge in mutex_edges:
+                left, right = tuple(edge)
+                if left in closure and right in closure:
+                    return None
+            return frozenset(closure)
+
+        best: tuple[Decimal, Decimal, tuple[str, ...], frozenset] | None = None
+        for size in range(n + 1):
+            for idxs in combinations(range(n), size):
+                closure = _closure(frozenset(idxs))
+                if closure is None:
+                    continue
+                total_score = sum((scores[i] for i in closure), Decimal(0))
+                total_cost = sum((costs[i] for i in closure), Decimal(0))
+                chosen_keys = tuple(keys[i] for i in sorted(closure))
+                if (
+                    best is None
+                    or total_score > best[0]
+                    or (
+                        total_score == best[0]
+                        and (
+                            total_cost < best[1]
+                            or (
+                                total_cost == best[1]
+                                and chosen_keys < best[2]
+                            )
+                        )
+                    )
+                ):
+                    best = (total_score, total_cost, chosen_keys, closure)
+
+        assert best is not None  # the empty subset is always feasible
+        total_score, total_cost, chosen_keys, chosen = best
+        chosen_indexes = set(chosen)
+
+        skip_items: list[str] = []
+        for i, key in enumerate(keys):
+            if i in chosen_indexes:
+                continue
+            if any(
+                required not in chosen_indexes
+                for required in requires_by_key[i]
+            ):
+                reason = "requires"
+            elif mutex_neighbors[i] & chosen_indexes:
+                reason = "mutex"
+            elif total_cost + costs[i] > limit_value:
+                reason = "budget"
+            else:
+                reason = "dominated"
+            skip_items.append(
+                "["
+                + json.dumps(key, ensure_ascii=False)
+                + ","
+                + json.dumps(reason, ensure_ascii=False)
+                + "]"
+            )
+
+    pick_json = json.dumps(
+        list(chosen_keys), ensure_ascii=False, separators=(",", ":")
+    )
+    return (
+        '{"cost":' + _format6(total_cost)
+        + ',"score":' + _format6(total_score)
+        + ',"pick":' + pick_json
+        + ',"skip":[' + ",".join(skip_items) + "]}\n"
     )
 
 
