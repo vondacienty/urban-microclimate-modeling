@@ -38,6 +38,7 @@ __all__ = [
     "effect_matrix_lags_group_compare_report",
     "window_compare",
     "window_shift",
+    "scenario_rank",
     "effect_matrix_permutation_report",
     "effect_matrix_trimmed_report",
     "effect_matrix_robust_report",
@@ -6768,6 +6769,323 @@ def scenario_shift(
         parsed_before, emap, windows, minutes, lag_list, alpha_value,
         "scenario shift",
     )
+
+
+def scenario_rank(
+    base: list,
+    sets: dict,
+    neighbors: list,
+    lags: list,
+    labels: dict,
+    windows: dict,
+    *,
+    minutes: int = 60,
+    alpha: float = 0.05,
+) -> str:
+    """Rank scenario after-minus-base samples per label/window/lag and test
+    every set pair.
+
+    ``base`` and each table in ``sets`` follow the ``details`` contract of
+    :func:`scenario_shift`, and all tables must share exactly the same set
+    of ``(timestamp, cell_id)`` pairs; ``base`` not being a list raises
+    ``TypeError`` and a key-set mismatch raises ``ValueError``. ``sets``
+    must be a dict with at least two entries, each key a non-empty string
+    naming the set and each value a details list; a non-dict raises
+    ``TypeError`` and every other malformation raises ``ValueError``.
+    ``neighbors``, ``lags``, ``labels``, ``windows``, ``minutes`` and
+    ``alpha`` follow exactly the same validation, bucketing, same-label edge
+    pairing, edge order and exception rules as :func:`scenario_shift`.
+
+    For each set the same ``x`` values as in :func:`scenario_shift` are
+    computed per ``(label, lag, B)`` triple and paired element-wise with the
+    base values (the identical key sets guarantee identical pairings); the
+    set sample is ``e = x_set - x_base``. The ``e`` values are concatenated
+    per ``(label, window, lag)`` triple exactly as the shift samples are in
+    :func:`scenario_shift`. Only triples with non-empty samples for at least
+    two sets form a group; within one group the participating sets are
+    ranked ascending by ``(mean, key)`` on the unquantized means and
+    assigned ``rank = 1..k``.
+
+    Two distinct participating sets with names ``a < b`` are compared; with
+    ``n_a``/``n_b`` the two sample sizes, a comparison with
+    ``n_a + n_b > 16`` raises ``ValueError``. The statistic is
+    ``diff = mean(a) - mean(b)`` and ``p`` is the exact two-sided
+    permutation p-value, enumerated exactly as in :func:`scenario_shift`:
+    the pooled sample is enumerated over all
+    ``C(n_a + n_b, n_a)`` equal-size position assignments and
+    ``p = #{|diff'| >= |diff|} / C(n_a + n_b, n_a)``.
+
+    With ``N`` the total number of ``(label, window, lag, a, b)``
+    comparisons, all comparisons are ranked ascending by
+    ``(p, label, window, lag, a, b)`` and each rank ``j`` (1-based) gets the
+    Benjamini-Hochberg q-value
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``, mapped back to its
+    comparison; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All numbers enter the computation as ``Decimal(str(x))`` under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``minutes, alpha, groups``, each group object
+    uses the key order ``label, window, lag, ranks, tests``, each rank
+    object the key order ``key, mean, rank`` and each test object the key
+    order ``a, b, diff, p, q, reject``. Groups, rank objects and test
+    objects are in ascending ``(label, window, lag)``, ``(rank, key)`` and
+    ``(a, b)`` order respectively; triples without any comparison are
+    omitted and no comparisons at all yields ``groups`` empty. Set names,
+    labels and window names render as JSON strings, lags and ranks as
+    integers, ``reject`` as a boolean and ``alpha``, ``mean``, ``diff``,
+    ``p`` and ``q`` with exactly six decimals, negative zero normalized to
+    ``0.000000``.
+    """
+    if not isinstance(base, list):
+        raise TypeError("base must be a list")
+    if not isinstance(sets, dict):
+        raise TypeError("sets must be a dict")
+    if len(sets) < 2:
+        raise ValueError("sets must contain at least two entries")
+    for name, table in sets.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("each set key must be a non-empty string")
+        if not isinstance(table, list):
+            raise ValueError("each set value must be a list")
+
+    minutes, lag_list, alpha_value, parsed_base, xmap_base = (
+        _lags_group_x_values(base, neighbors, lags, labels, minutes, alpha)
+    )
+    base_keys = {(row[0], row[1]) for row in parsed_base}
+
+    # set name -> label -> lag -> bucket start -> [e, ...]
+    emaps: dict[str, dict[str, dict[int, dict[int, list[Decimal]]]]] = {}
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        for name in sorted(sets):
+            _, _, _, parsed_set, xmap_set = _lags_group_x_values(
+                sets[name], neighbors, lags, labels, minutes, alpha
+            )
+            set_keys = {(row[0], row[1]) for row in parsed_set}
+            if set_keys != base_keys:
+                raise ValueError(
+                    "base and each set table must share the same "
+                    "(timestamp, cell_id) pairs"
+                )
+
+            # Identical (timestamp, cell_id) key sets make the two xmaps
+            # structurally identical, so the per-(label, lag, B) value lists
+            # pair up element-wise in the same ascending edge order.
+            emap: dict[str, dict[int, dict[int, list[Decimal]]]] = {}
+            for label in sorted(xmap_base):
+                lag_map: dict[int, dict[int, list[Decimal]]] = {}
+                for lag in lag_list:
+                    base_buckets = xmap_base[label].get(lag, {})
+                    set_buckets = xmap_set[label].get(lag, {})
+                    bucket_map: dict[int, list[Decimal]] = {}
+                    for bucket in sorted(base_buckets):
+                        base_values = base_buckets[bucket]
+                        set_values = set_buckets[bucket]
+                        bucket_map[bucket] = [
+                            set_value - base_value
+                            for set_value, base_value in zip(
+                                set_values, base_values
+                            )
+                        ]
+                    lag_map[lag] = bucket_map
+                emap[label] = lag_map
+            emaps[name] = emap
+
+    # Windows follow the window_shift contract and are validated after the
+    # tables are parsed and key-matched, exactly as in scenario_shift.
+    if not isinstance(windows, dict):
+        raise TypeError("windows must be a dict")
+    all_buckets: set[int] = set()
+    if parsed_base:
+        bucket_seconds = minutes * 60
+        for validated in parsed_base:
+            timestamp = validated[0]
+            all_buckets.add((timestamp // bucket_seconds) * bucket_seconds)
+    if set(windows) != all_buckets:
+        raise ValueError(
+            "windows keys must be exactly the details-derived bucket starts"
+        )
+    for bucket, name in windows.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("each window name must be a non-empty string")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (label, window, lag) -> set name -> concatenated [e, ...] over the
+        # window's buckets in ascending B order (each bucket's values
+        # already in ascending edge order).
+        group_samples: dict[
+            tuple[str, str, int], dict[str, list[Decimal]]
+        ] = {}
+        for name in sorted(emaps):
+            emap = emaps[name]
+            for label in sorted(emap):
+                for lag in lag_list:
+                    for bucket in sorted(emap[label].get(lag, {})):
+                        window = windows[bucket]
+                        samples = group_samples.setdefault(
+                            (label, window, lag), {}
+                        )
+                        samples.setdefault(name, []).extend(
+                            emap[label][lag][bucket]
+                        )
+
+        # One record per emitted (label, window, lag, a, b) comparison:
+        # ``[label, window, lag, a, b, n_a, n_b, diff, p, q]`` with q filled
+        # in below; ``ranks`` holds the ``(name, mean, rank)`` triples per
+        # group in ascending (rank, key) order.
+        records: list[list] = []
+        group_records: dict[tuple[str, str, int], list[list]] = {}
+        ranks: dict[tuple[str, str, int], list[tuple[str, Decimal, int]]] = {}
+        for group_key in sorted(group_samples):
+            samples = group_samples[group_key]
+            if len(samples) < 2:
+                continue
+            label, window, lag = group_key
+            totals: dict[str, Decimal] = {}
+            means: dict[str, Decimal] = {}
+            for name in sorted(samples):
+                total = Decimal(0)
+                for value in samples[name]:
+                    total += value
+                totals[name] = total
+                means[name] = total / len(samples[name])
+            ordered = sorted(means, key=lambda name: (means[name], name))
+            ranks[group_key] = [
+                (name, means[name], rank)
+                for rank, name in enumerate(ordered, 1)
+            ]
+
+            pair_records: list[list] = []
+            names = sorted(samples)
+            for index_a, name_a in enumerate(names):
+                for name_b in names[index_a + 1:]:
+                    sample_a = samples[name_a]
+                    sample_b = samples[name_b]
+                    n_a = len(sample_a)
+                    n_b = len(sample_b)
+                    if n_a + n_b > _SPATIOTEMPORAL_MAX_N:
+                        raise ValueError(
+                            f"label {label!r} window {window!r} lag {lag} "
+                            f"sets {name_a!r}/{name_b!r} have {n_a}+{n_b} "
+                            f"values; scenario rank requires at most "
+                            f"{_SPATIOTEMPORAL_MAX_N} combined values per "
+                            f"comparison"
+                        )
+                    sum_a = totals[name_a]
+                    sum_b = totals[name_b]
+                    diff = means[name_a] - means[name_b]
+
+                    # |s_a'/n_a - s_b'/n_b| >= |diff| is equivalent
+                    # (n_a, n_b > 0) to
+                    # |s_a'*n_b - s_b'*n_a| >= |sum_a*n_b - sum_b*n_a|;
+                    # compare the scaled sums so exact ties are decided
+                    # without any division rounding.
+                    threshold = abs(sum_a * n_b - sum_b * n_a)
+                    pooled = sample_a + sample_b
+                    pooled_sum = sum_a + sum_b
+                    assignments = math.comb(n_a + n_b, n_a)
+                    hits = 0
+                    for combo in combinations(range(n_a + n_b), n_a):
+                        perm_a = Decimal(0)
+                        for position in combo:
+                            perm_a += pooled[position]
+                        perm_b = pooled_sum - perm_a
+                        if abs(perm_a * n_b - perm_b * n_a) >= threshold:
+                            hits += 1
+                    p_value = Decimal(hits) / Decimal(assignments)
+
+                    record = [
+                        label, window, lag, name_a, name_b,
+                        n_a, n_b, diff, p_value, None,
+                    ]
+                    pair_records.append(record)
+                    records.append(record)
+            if pair_records:
+                group_records[group_key] = pair_records
+
+        # Benjamini-Hochberg q-values across ALL (label, window, lag, a, b)
+        # comparisons: rank ascending by (p, label, window, lag, a, b), then
+        # accumulate the running minimum of N * p_l / l from the top rank
+        # down, mapping q back.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (
+                records[idx][8],
+                records[idx][0],
+                records[idx][1],
+                records[idx][2],
+                records[idx][3],
+                records[idx][4],
+            ),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate = Decimal(count) * records[idx][8] / rank
+            if candidate < running:
+                running = candidate
+            records[idx][9] = running
+
+        groups = []
+        for group_key in sorted(ranks):
+            if group_key not in group_records:
+                continue
+            label, window, lag = group_key
+            rank_items = []
+            for name, mean, rank_value in ranks[group_key]:
+                rank_items.append(
+                    '{"key":' + json.dumps(name, ensure_ascii=False)
+                    + ',"mean":' + _format6(mean)
+                    + ',"rank":' + str(rank_value)
+                    + '}'
+                )
+            test_items = []
+            for record in group_records[group_key]:
+                (
+                    _,
+                    _,
+                    _,
+                    name_a,
+                    name_b,
+                    _,
+                    _,
+                    diff,
+                    p_value,
+                    q_value,
+                ) = record
+                reject = q_value <= alpha_value
+                test_items.append(
+                    '{"a":' + json.dumps(name_a, ensure_ascii=False)
+                    + ',"b":' + json.dumps(name_b, ensure_ascii=False)
+                    + ',"diff":' + _format6(diff)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + '}'
+                )
+            groups.append(
+                '{"label":' + json.dumps(label, ensure_ascii=False)
+                + ',"window":' + json.dumps(window, ensure_ascii=False)
+                + ',"lag":' + str(lag)
+                + ',"ranks":[' + ",".join(rank_items)
+                + '],"tests":[' + ",".join(test_items)
+                + ']}'
+            )
+
+        return (
+            '{"minutes":' + str(minutes)
+            + ',"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(groups) + ']}'
+            + "\n"
+        )
 
 
 _TEMPORAL_LAG_MAX_N = 8
