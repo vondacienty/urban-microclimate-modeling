@@ -9,6 +9,7 @@ from fractions import Fraction
 from itertools import combinations, permutations
 import json
 import math
+import re
 
 __all__ = [
     "compute_uhi",
@@ -76,6 +77,7 @@ __all__ = [
     "surface_morphology_report",
     "surface_thermal_zone_scenario_report",
     "decision_priority_shift",
+    "decision_priority_consensus",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -8981,6 +8983,22 @@ def decision_priority_matrix(reports: dict, weights: dict) -> str:
 _PRIORITY_MATRIX_ERROR = (
     "each value must be a decision_priority_matrix JSON output"
 )
+_PRIORITY_MATRIX_INT_RE = re.compile(r"(?:0|[1-9][0-9]*)")
+_PRIORITY_MATRIX_DECIMAL_RE = re.compile(
+    r"-?(?:0|[1-9][0-9]*)\.[0-9]{6}"
+)
+
+
+class _PriorityMatrixInt(Decimal):
+    """Marker for a canonical unsigned JSON integer token."""
+
+
+class _PriorityMatrixDecimal(Decimal):
+    """Marker for a canonical fixed-six-decimal JSON number token."""
+
+
+def _priority_matrix_signed_zero(value: Decimal) -> bool:
+    return value == 0 and value.is_signed()
 
 
 def _decision_priority_matrix_parse_constant(value: str) -> Decimal:
@@ -8996,11 +9014,25 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
     """
     if not isinstance(raw, str):
         raise ValueError(_PRIORITY_MATRIX_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_PRIORITY_MATRIX_ERROR)
+    payload = raw[:-1]
+
+    def _parse_integer(value: str) -> Decimal:
+        if not _PRIORITY_MATRIX_INT_RE.fullmatch(value):
+            raise ValueError(_PRIORITY_MATRIX_ERROR)
+        return _PriorityMatrixInt(value)
+
+    def _parse_decimal(value: str) -> Decimal:
+        if not _PRIORITY_MATRIX_DECIMAL_RE.fullmatch(value):
+            raise ValueError(_PRIORITY_MATRIX_ERROR)
+        return _PriorityMatrixDecimal(value)
+
     try:
         data = json.loads(
-            raw,
-            parse_float=Decimal,
-            parse_int=Decimal,
+            payload,
+            parse_float=_parse_decimal,
+            parse_int=_parse_integer,
             parse_constant=_decision_priority_matrix_parse_constant,
         )
     except ValueError:
@@ -9013,9 +9045,9 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
     groups_raw = data["groups"]
     spreads_raw = data["spreads"]
     if (
-        not isinstance(total_weight, Decimal)
-        or not total_weight.is_finite()
+        not isinstance(total_weight, _PriorityMatrixDecimal)
         or total_weight < 0
+        or _priority_matrix_signed_zero(total_weight)
         or not isinstance(groups_raw, list)
         or not isinstance(spreads_raw, list)
     ):
@@ -9023,8 +9055,7 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
 
     def _valid_rank(value: object) -> bool:
         return (
-            isinstance(value, Decimal)
-            and value.is_finite()
+            isinstance(value, _PriorityMatrixInt)
             and value == value.to_integral_value()
             and value >= 1
         )
@@ -9073,8 +9104,8 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
             if (
                 not isinstance(candidate_key, str)
                 or not candidate_key
-                or not isinstance(priority, Decimal)
-                or not priority.is_finite()
+                or not isinstance(priority, _PriorityMatrixDecimal)
+                or _priority_matrix_signed_zero(priority)
                 or not _valid_rank(rank)
             ):
                 raise ValueError(_PRIORITY_MATRIX_ERROR)
@@ -9106,8 +9137,7 @@ def _decision_priority_matrix_groups(raw: object) -> dict:
             or not key
             or not _valid_rank(min_rank)
             or not _valid_rank(max_rank)
-            or not isinstance(gap, Decimal)
-            or not gap.is_finite()
+            or not isinstance(gap, _PriorityMatrixInt)
             or gap != gap.to_integral_value()
             or gap < 0
         ):
@@ -9278,6 +9308,158 @@ def decision_priority_shift(base: str, snapshots: dict) -> str:
         '{"changes":[' + ",".join(change_items) + ']'
         + ',"summary":[' + ",".join(summary_items) + ']}'
         + "\n"
+    )
+
+
+def decision_priority_consensus(
+    base: str, snapshots: dict, evidence: dict
+) -> str:
+    """Aggregate snapshot rank shifts with supporting evidence.
+
+    ``base`` must be a :func:`decision_priority_matrix` JSON output and
+    ``snapshots`` a non-empty dict mapping non-empty string snapshot
+    names to :func:`decision_priority_matrix` JSON outputs whose groups
+    and candidate sets match the baseline's. ``evidence`` must be a dict
+    whose keys are exactly the full set of
+    ``(snapshot, by, group, candidate)`` four-tuples covered by the
+    snapshots and whose values are booleans. A non-string ``base`` or a
+    non-dict ``snapshots`` or ``evidence`` raises ``TypeError``; every
+    other contract violation raises ``ValueError``.
+
+    For each candidate, ``delta`` is the snapshot rank minus the
+    baseline rank at every ``(snapshot, by, group)`` observation:
+    ``direction`` is ``"rise"`` when every delta is non-positive and at
+    least one is negative, ``"fall"`` when every delta is non-negative
+    and at least one is positive, ``"same"`` when every delta is zero
+    and ``"mixed"`` otherwise. ``support`` is the number of true
+    evidence values divided by the number of observations, quantized to
+    six decimals under precision 1000 with ROUND_HALF_EVEN (negative
+    zero normalized to ``0.000000``). ``stable`` is true exactly when
+    every delta is zero and ``recommend`` is true exactly when the
+    candidate ranks first in every snapshot observation and every
+    evidence value is true.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``candidates,
+    recommend``. Candidates are in ascending key order and each object
+    uses the key order ``key, direction, support, stable, recommend``;
+    ``stable`` and ``recommend`` render as JSON booleans. The top-level
+    ``recommend`` is the ascending list of recommended candidate keys.
+    """
+    if not isinstance(base, str):
+        raise TypeError("base must be a str")
+    if not isinstance(snapshots, dict):
+        raise TypeError("snapshots must be a dict")
+    if not isinstance(evidence, dict):
+        raise TypeError("evidence must be a dict")
+    if not snapshots:
+        raise ValueError("snapshots must be a non-empty dict")
+    for name in snapshots:
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                "each snapshots key must be a non-empty string"
+            )
+
+    base_groups = _decision_priority_matrix_groups(base)
+    snapshot_groups: dict[str, dict] = {}
+    candidate_keys: set[str] = set()
+    if base_groups:
+        candidate_keys = set(next(iter(base_groups.values())))
+    for name in sorted(snapshots):
+        groups = _decision_priority_matrix_groups(snapshots[name])
+        if set(groups) != set(base_groups):
+            raise ValueError(
+                "each snapshot must share the baseline's (by, key) groups"
+            )
+        for group_key, ranks in groups.items():
+            if set(ranks) != set(base_groups[group_key]):
+                raise ValueError(
+                    "each snapshot group must share the baseline's "
+                    "candidate keys"
+                )
+        snapshot_groups[name] = groups
+
+    expected_evidence = {
+        (name, by, group_key, candidate_key)
+        for name in snapshot_groups
+        for by, group_key in base_groups
+        for candidate_key in candidate_keys
+    }
+    if set(evidence) != expected_evidence:
+        raise ValueError(
+            "evidence keys must be the full (snapshot, by, group, "
+            "candidate) set with no missing or extra tuples"
+        )
+    for value in evidence.values():
+        if not isinstance(value, bool):
+            raise ValueError("each evidence value must be a bool")
+
+    observations = len(snapshot_groups) * len(base_groups)
+    candidate_items: list[str] = []
+    recommended: list[str] = []
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+        for candidate_key in sorted(candidate_keys):
+            negative = 0
+            positive = 0
+            all_zero = True
+            all_first = True
+            true_evidence = 0
+            all_evidence = True
+            for name in sorted(snapshot_groups):
+                groups = snapshot_groups[name]
+                for group_id in sorted(groups):
+                    by, group_key = group_id
+                    delta = (
+                        groups[group_id][candidate_key]
+                        - base_groups[group_id][candidate_key]
+                    )
+                    if delta < 0:
+                        negative += 1
+                        all_zero = False
+                    elif delta > 0:
+                        positive += 1
+                        all_zero = False
+                    if groups[group_id][candidate_key] != 1:
+                        all_first = False
+                    if evidence[(name, by, group_key, candidate_key)]:
+                        true_evidence += 1
+                    else:
+                        all_evidence = False
+            if negative and not positive:
+                direction = "rise"
+            elif positive and not negative:
+                direction = "fall"
+            elif all_zero:
+                direction = "same"
+            else:
+                direction = "mixed"
+            stable = all_zero
+            is_recommended = observations > 0 and all_first and all_evidence
+            if is_recommended:
+                recommended.append(candidate_key)
+            support = (
+                Decimal(true_evidence) / Decimal(observations)
+                if observations
+                else Decimal(0)
+            )
+            candidate_items.append(
+                '{"key":'
+                + json.dumps(candidate_key, ensure_ascii=False)
+                + ',"direction":' + json.dumps(direction)
+                + ',"support":' + _format6(support)
+                + ',"stable":' + ("true" if stable else "false")
+                + ',"recommend":'
+                + ("true" if is_recommended else "false")
+                + '}'
+            )
+
+    return (
+        '{"candidates":[' + ",".join(candidate_items) + ']'
+        + ',"recommend":'
+        + json.dumps(recommended, ensure_ascii=False, separators=(",", ":"))
+        + "}\n"
     )
 
 
