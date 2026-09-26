@@ -11576,6 +11576,317 @@ def frontier_joint(
     )
 
 
+def frontier_joint_intervals(
+    reports: dict,
+    weights: dict,
+    cost: dict,
+    limits: list,
+    cases: dict,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Merge adjacent frontier_joint limits sharing a modal pick.
+
+    ``reports``, ``weights``, ``cost``, ``limits``, ``cases`` and ``alpha``
+    follow the :func:`frontier_joint` contract exactly: the same parameter
+    types, the same ``TypeError``/``ValueError`` split and the same
+    per-case, per-limit winning subset computation — for each case the
+    effective cost of a candidate is its ``cost`` times the case cost
+    multiplier, its effective gain is the panel ``score`` times the case
+    gain multiplier, and at each limit the winner over all subsets of the
+    significant candidates with total effective cost at most the limit
+    maximizes total gain, then minimizes total cost, then minimizes the
+    lexicographically ascending selected-key list.
+
+    Limits are processed in ascending numeric order. At each limit the
+    winning picks of every case vote: the point's modal pick is the most
+    frequent winning pick with ties broken by the lexicographically
+    ascending selected-key list. Adjacent limits whose modal picks are
+    equal are merged into one interval. For each interval ``start`` and
+    ``end`` are the first and last limit it spans, ``threshold`` is
+    ``null`` for the first interval and the interval's ``start`` for every
+    later one, ``n`` is the number of limits merged into it and
+    ``stability`` is the minimum over its limits of the modal pick's
+    frequency divided by the number of cases. For each case ``cost`` and
+    ``gain`` are the means of its winning subset's total effective cost
+    and total effective gain over the interval's limits and ``support``
+    is the share of the interval's limits where the case's winning pick
+    equals the interval's modal pick. ``worst`` is the key of the case
+    with the minimum ``gain``, ties broken by the ascending case key. All
+    arithmetic is ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context and comparisons use the unquantized values.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, intervals``.
+    Each interval uses the key order ``start, end, threshold, pick, n,
+    stability, worst, cases`` and each case entry the key order ``key,
+    cost, gain, support``; intervals are sorted by ascending ``start``
+    and case entries by ascending ``key``. ``pick`` is an ascending
+    string array, ``n`` is an integer, ``worst`` and ``key`` are strings,
+    ``threshold`` is ``null`` or a number and every numeric value renders
+    with six decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+    if not isinstance(limits, list):
+        raise TypeError("limits must be a list")
+    if not isinstance(cases, dict):
+        raise TypeError("cases must be a dict")
+    if not limits:
+        raise ValueError("limits must be a non-empty list")
+    if not cases:
+        raise ValueError("cases must be a non-empty dict")
+
+    alpha_value, _groups_spec, records = _panel_report_data(
+        reports, weights, alpha
+    )
+
+    overall_mean: dict[str, Decimal] = {}
+    min_stable: dict[str, Decimal] = {}
+    significant: dict[str, bool] = {}
+    for by, _group_key, candidate, _n, mean, _range, stable, _p, q in records:
+        if candidate not in min_stable or stable < min_stable[candidate]:
+            min_stable[candidate] = stable
+        if by == "overall":
+            overall_mean[candidate] = mean
+        reject = q <= alpha_value
+        if candidate in significant:
+            significant[candidate] = significant[candidate] and reject
+        else:
+            significant[candidate] = reject
+
+    candidates = sorted(overall_mean)
+    if set(cost) != set(candidates):
+        raise ValueError("cost keys must be exactly the candidate keys")
+    costs: dict[str, Decimal] = {}
+    for key in candidates:
+        cost_value = _portfolio_number(cost[key], "cost")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        costs[key] = cost_value
+
+    limit_values: list[Decimal] = []
+    seen_limits: set[Decimal] = set()
+    for limit in limits:
+        limit_value = _portfolio_number(limit, "limits")
+        if limit_value < 0:
+            raise ValueError("each limit must be non-negative")
+        if limit_value in seen_limits:
+            raise ValueError("limits must be distinct")
+        seen_limits.add(limit_value)
+        limit_values.append(limit_value)
+    limit_values.sort()
+
+    case_keys: list[str] = []
+    cost_multipliers: dict[str, dict[str, Decimal]] = {}
+    gain_multipliers: dict[str, dict[str, Decimal]] = {}
+    for case_key, mapping in cases.items():
+        if not isinstance(case_key, str) or not case_key:
+            raise ValueError("each cases key must be a non-empty string")
+        if not isinstance(mapping, dict):
+            raise TypeError("each cases value must be a dict")
+        if set(mapping) != {"cost", "gain"}:
+            raise ValueError(
+                'each cases value must contain exactly the keys "cost" '
+                'and "gain"'
+            )
+        case_costs = mapping["cost"]
+        case_gains = mapping["gain"]
+        if not isinstance(case_costs, dict) or not isinstance(
+            case_gains, dict
+        ):
+            raise TypeError(
+                "each cases cost and gain value must be a dict"
+            )
+        if set(case_costs) != set(candidates) or set(case_gains) != set(
+            candidates
+        ):
+            raise ValueError(
+                "each cases cost and gain dict must be keyed by exactly "
+                "the candidate keys"
+            )
+        case_cost_multipliers: dict[str, Decimal] = {}
+        case_gain_multipliers: dict[str, Decimal] = {}
+        for key in candidates:
+            multiplier = _portfolio_number(
+                case_costs[key], "cost multiplier"
+            )
+            if multiplier <= 0:
+                raise ValueError("each cost multiplier must be positive")
+            case_cost_multipliers[key] = multiplier
+            multiplier = _portfolio_number(
+                case_gains[key], "gain multiplier"
+            )
+            if multiplier <= 0:
+                raise ValueError("each gain multiplier must be positive")
+            case_gain_multipliers[key] = multiplier
+        case_keys.append(case_key)
+        cost_multipliers[case_key] = case_cost_multipliers
+        gain_multipliers[case_key] = case_gain_multipliers
+    case_keys.sort()
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        scores = {
+            key: overall_mean[key] * min_stable[key] for key in candidates
+        }
+        sig_keys = [key for key in candidates if significant[key]]
+        sig_count = len(sig_keys)
+
+        # case key -> per-limit winning (gain, cost, keys) triples
+        case_winners: dict[
+            str, list[tuple[Decimal, Decimal, tuple[str, ...]]]
+        ] = {}
+        for case_key in case_keys:
+            case_costs = {
+                key: costs[key] * cost_multipliers[case_key][key]
+                for key in sig_keys
+            }
+            case_gains = {
+                key: scores[key] * gain_multipliers[case_key][key]
+                for key in sig_keys
+            }
+            subsets: list[tuple[Decimal, Decimal, tuple[str, ...]]] = []
+            for size in range(sig_count + 1):
+                for idxs in combinations(range(sig_count), size):
+                    total_cost = sum(
+                        (case_costs[sig_keys[i]] for i in idxs), Decimal(0)
+                    )
+                    total_gain = sum(
+                        (case_gains[sig_keys[i]] for i in idxs), Decimal(0)
+                    )
+                    subsets.append(
+                        (
+                            total_gain,
+                            total_cost,
+                            tuple(sig_keys[i] for i in idxs),
+                        )
+                    )
+            winners: list[tuple[Decimal, Decimal, tuple[str, ...]]] = []
+            for limit_value in limit_values:
+                best: tuple[Decimal, Decimal, tuple[str, ...]] | None = None
+                for total_gain, total_cost, chosen_keys in subsets:
+                    if total_cost > limit_value:
+                        continue
+                    if (
+                        best is None
+                        or total_gain > best[0]
+                        or (
+                            total_gain == best[0]
+                            and (
+                                total_cost < best[1]
+                                or (
+                                    total_cost == best[1]
+                                    and chosen_keys < best[2]
+                                )
+                            )
+                        )
+                    ):
+                        best = (total_gain, total_cost, chosen_keys)
+                assert best is not None  # the empty subset is always feasible
+                winners.append(best)
+            case_winners[case_key] = winners
+
+        case_total = len(case_keys)
+
+        # per-limit modal pick and its frequency share
+        point_modals: list[tuple[str, ...]] = []
+        point_stability: list[Decimal] = []
+        for limit_index in range(len(limit_values)):
+            pick_counts: dict[tuple[str, ...], int] = {}
+            for case_key in case_keys:
+                pick = case_winners[case_key][limit_index][2]
+                pick_counts[pick] = pick_counts.get(pick, 0) + 1
+            modal_frequency = max(pick_counts.values())
+            modal_pick = min(
+                pick
+                for pick, frequency in pick_counts.items()
+                if frequency == modal_frequency
+            )
+            point_modals.append(modal_pick)
+            point_stability.append(
+                Decimal(modal_frequency) / Decimal(case_total)
+            )
+
+        # merge adjacent limits sharing the modal pick
+        segments: list[tuple[int, int]] = []
+        segment_start = 0
+        for limit_index in range(1, len(limit_values)):
+            if point_modals[limit_index] != point_modals[segment_start]:
+                segments.append((segment_start, limit_index - 1))
+                segment_start = limit_index
+        segments.append((segment_start, len(limit_values) - 1))
+
+        interval_strings: list[str] = []
+        for segment_index, (first, last) in enumerate(segments):
+            n = last - first + 1
+            modal_pick = point_modals[first]
+            stability = min(point_stability[first:last + 1])
+            if segment_index == 0:
+                threshold = "null"
+            else:
+                threshold = _format6(limit_values[first])
+
+            case_strings: list[str] = []
+            worst_key: str | None = None
+            worst_gain: Decimal | None = None
+            for case_key in case_keys:
+                mean_cost = sum(
+                    (case_winners[case_key][i][1]
+                     for i in range(first, last + 1)),
+                    Decimal(0),
+                ) / Decimal(n)
+                mean_gain = sum(
+                    (case_winners[case_key][i][0]
+                     for i in range(first, last + 1)),
+                    Decimal(0),
+                ) / Decimal(n)
+                support_count = sum(
+                    1
+                    for i in range(first, last + 1)
+                    if case_winners[case_key][i][2] == modal_pick
+                )
+                support = Decimal(support_count) / Decimal(n)
+                if worst_gain is None or mean_gain < worst_gain:
+                    worst_gain = mean_gain
+                    worst_key = case_key
+                case_strings.append(
+                    '{"key":' + json.dumps(case_key, ensure_ascii=False)
+                    + ',"cost":' + _format6(mean_cost)
+                    + ',"gain":' + _format6(mean_gain)
+                    + ',"support":' + _format6(support)
+                    + "}"
+                )
+            assert worst_key is not None  # cases is non-empty
+
+            interval_strings.append(
+                '{"start":' + _format6(limit_values[first])
+                + ',"end":' + _format6(limit_values[last])
+                + ',"threshold":' + threshold
+                + ',"pick":'
+                + json.dumps(
+                    list(modal_pick),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + ',"n":' + str(n)
+                + ',"stability":' + _format6(stability)
+                + ',"worst":' + json.dumps(worst_key, ensure_ascii=False)
+                + ',"cases":[' + ",".join(case_strings) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"intervals":[' + ",".join(interval_strings) + "]}\n"
+    )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
