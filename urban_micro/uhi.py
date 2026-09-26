@@ -6,7 +6,7 @@ from bisect import bisect_left
 from collections.abc import Mapping
 from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
 from fractions import Fraction
-from itertools import combinations, permutations
+from itertools import combinations, permutations, product
 import json
 import math
 import re
@@ -86,6 +86,7 @@ __all__ = [
     "frontier_sensitivity",
     "frontier_joint",
     "frontier_interval_attribution",
+    "interval_sig",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -12310,6 +12311,319 @@ def frontier_interval_attribution(
                 + ',"cover":' + _format6(factor_values["cover"])
                 + ',"morphology":' + _format6(factor_values["morphology"])
                 + "}}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"intervals":[' + ",".join(interval_strings) + "]}\n"
+    )
+
+
+_INTERVAL_SIG_MAX_N = 16
+_INTERVAL_SIG_FACTOR_KEYS = ("weather", "cover", "morphology")
+
+
+def _interval_sig_stats(
+    sample: list[tuple[Decimal, Decimal]],
+) -> tuple[int, Decimal, Decimal, Decimal, Decimal]:
+    """Weighted mean, 1.96-se interval and sign-flip p for one sample of
+    ``(x, w)`` pairs; an empty sample yields zeros and ``p = 1``."""
+    n = len(sample)
+    if n == 0:
+        return 0, Decimal(0), Decimal(0), Decimal(0), Decimal(1)
+    if n > _INTERVAL_SIG_MAX_N:
+        raise ValueError(
+            f"interval sig requires at most {_INTERVAL_SIG_MAX_N} "
+            "panels per sample"
+        )
+    total_weight = sum((weight for _x, weight in sample), Decimal(0))
+    weighted = [x * weight for x, weight in sample]
+    total = sum(weighted, Decimal(0))
+    mean = total / total_weight
+    if n == 1:
+        se = Decimal(0)
+    else:
+        variance = sum(
+            (weight * (x - mean) ** 2 for x, weight in sample), Decimal(0)
+        ) / (Decimal(n) * total_weight)
+        se = variance.sqrt()
+    half = Decimal("1.96") * se
+    # W > 0, so |sum(s_i w_i x_i) / W| >= |mu| exactly when the unscaled
+    # sums compare; avoiding the division keeps the test exact.
+    target = abs(total)
+    hits = 0
+    for signs in product((1, -1), repeat=n):
+        flipped = sum(
+            (sign * value for sign, value in zip(signs, weighted)),
+            Decimal(0),
+        )
+        if abs(flipped) >= target:
+            hits += 1
+    p = Decimal(hits) / Decimal(2 ** n)
+    return n, mean, mean - half, mean + half, p
+
+
+def interval_sig(
+    reports: dict,
+    weights: dict,
+    factors: dict,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Sign-flip significance intervals for the weakest attributions.
+
+    ``reports``, ``weights`` and ``factors`` follow the
+    :func:`frontier_interval_attribution` contract exactly: a non-dict
+    argument raises ``TypeError`` and every other contract violation
+    raises ``ValueError``. ``alpha`` is a non-boolean finite number with
+    ``0 < alpha <= 1``.
+
+    For each interval every panel's ``m`` is the mean of its case
+    ``gain`` values and the weakest region/window key is the one whose
+    panel group has the smallest weight-weighted mean of ``m``, ties
+    broken by the smaller key. The ``region``/``window`` samples pair
+    each panel of the weakest key's group ``(m, w)``; each factor sample
+    pairs, per panel, the mean of that panel's gains over the category's
+    cases with the panel weight, panels without a case of the category
+    contributing nothing. For a sample of ``n`` pairs ``(x, w)`` with
+    ``W = sum(w)`` the mean is ``mu = sum(w * x) / W``; ``se`` is ``0``
+    when ``n <= 1`` and ``sqrt(sum(w * (x - mu) ** 2) / (n * W))``
+    otherwise, and the interval is ``mu +/- 1.96 * se``. ``n`` above 16
+    raises ``ValueError``. ``p`` is the share of the ``2 ** n`` sign
+    flips ``s`` in ``{-1, 1} ** n`` with
+    ``|sum(s_i * w_i * x_i) / W| >= |mu|``; an empty sample yields
+    ``mean = lower = upper = 0`` and ``p = 1``.
+
+    All items of every interval are ranked ascending by ``(p, start,
+    k)`` with ``k`` ordered ``region, window, weather, cover,
+    morphology`` and each rank ``j`` (1-based) gets the
+    Benjamini-Hochberg q-value ``q_j = min(1, min(N * p_l / l for l in
+    j..N))``; ``reject`` is ``q <= alpha``, compared on the unquantized
+    values.
+
+    All arithmetic is ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context. Returns a compact UTF-8 JSON string with no
+    spaces and exactly one trailing newline; the top-level key order is
+    ``alpha, intervals``, each interval uses the key order ``start, end,
+    items`` and each item the key order ``key, n, mean, lower, upper, p,
+    q, reject``. Items follow the ``k`` order above, with ``key`` the
+    weakest key for ``region``/``window`` and the category name for the
+    factor items; intervals are sorted by ascending ``start``. ``n`` is
+    an integer, ``reject`` a boolean and every other numeric value
+    renders with six decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(factors, dict):
+        raise TypeError("factors must be a dict")
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+    if len(reports) < 2:
+        raise ValueError("reports must contain at least two entries")
+
+    panel_keys: list[tuple[str, str]] = []
+    for panel in reports:
+        if (
+            not isinstance(panel, tuple)
+            or len(panel) != 2
+            or not isinstance(panel[0], str)
+            or not panel[0]
+            or not isinstance(panel[1], str)
+            or not panel[1]
+        ):
+            raise ValueError(
+                "each reports key must be a non-empty (region, window) "
+                "string pair"
+            )
+        panel_keys.append(panel)
+    panel_keys.sort()
+
+    if set(weights) != set(panel_keys):
+        raise ValueError("weights keys must be exactly the reports keys")
+    weight_values: dict[tuple[str, str], Decimal] = {}
+    for panel in panel_keys:
+        weight_value = _portfolio_number(weights[panel], "weight")
+        if weight_value <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values[panel] = weight_value
+
+    parsed = {panel: _frontier_intervals_parse(reports[panel])
+              for panel in panel_keys}
+
+    report_alpha, reference_segments = parsed[panel_keys[0]]
+    segment_count = len(reference_segments)
+    for panel in panel_keys[1:]:
+        other_alpha, other_segments = parsed[panel]
+        if other_alpha != report_alpha:
+            raise ValueError("every report must share the same alpha")
+        if len(other_segments) != segment_count:
+            raise ValueError(
+                "every report must have the same number of intervals"
+            )
+        for index in range(segment_count):
+            reference = reference_segments[index]
+            other = other_segments[index]
+            if other[0] != reference[0] or other[1] != reference[1]:
+                raise ValueError(
+                    "corresponding intervals must share start and end"
+                )
+            if set(other[3]) != set(reference[3]):
+                raise ValueError(
+                    "corresponding intervals must share the same case keys"
+                )
+
+    common_cases: set[str] | None = None
+    for _alpha, segments in parsed.values():
+        for _start, _end, _pick, gains in segments:
+            if common_cases is None:
+                common_cases = set(gains)
+            else:
+                common_cases &= set(gains)
+    assert common_cases is not None  # reports is non-empty
+    if set(factors) != common_cases:
+        raise ValueError(
+            "factors keys must be exactly the case keys common to all "
+            "intervals"
+        )
+    for category in factors.values():
+        if category not in ("weather", "cover", "morphology"):
+            raise ValueError(
+                'each factors value must be "weather", "cover" or '
+                '"morphology"'
+            )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        intervals_items: list[list[list]] = []
+        flat: list[tuple[Decimal, Decimal, int]] = []
+        for index in range(segment_count):
+            start = reference_segments[index][0]
+            end = reference_segments[index][1]
+
+            panel_means: dict[tuple[str, str], Decimal] = {}
+            region_sums: dict[str, Decimal] = {}
+            region_weights: dict[str, Decimal] = {}
+            window_sums: dict[str, Decimal] = {}
+            window_weights: dict[str, Decimal] = {}
+            for panel in panel_keys:
+                gains = parsed[panel][1][index][3]
+                mean_gain = sum(gains.values(), Decimal(0)) / Decimal(
+                    len(gains)
+                )
+                panel_means[panel] = mean_gain
+                weight = weight_values[panel]
+                region, window = panel
+                region_sums[region] = (
+                    region_sums.get(region, Decimal(0)) + weight * mean_gain
+                )
+                region_weights[region] = (
+                    region_weights.get(region, Decimal(0)) + weight
+                )
+                window_sums[window] = (
+                    window_sums.get(window, Decimal(0)) + weight * mean_gain
+                )
+                window_weights[window] = (
+                    window_weights.get(window, Decimal(0)) + weight
+                )
+
+            weakest_region = min(
+                region_sums,
+                key=lambda key: (
+                    region_sums[key] / region_weights[key], key,
+                ),
+            )
+            weakest_window = min(
+                window_sums,
+                key=lambda key: (
+                    window_sums[key] / window_weights[key], key,
+                ),
+            )
+
+            samples: list[tuple[str, list[tuple[Decimal, Decimal]]]] = [
+                (
+                    weakest_region,
+                    [
+                        (panel_means[panel], weight_values[panel])
+                        for panel in panel_keys
+                        if panel[0] == weakest_region
+                    ],
+                ),
+                (
+                    weakest_window,
+                    [
+                        (panel_means[panel], weight_values[panel])
+                        for panel in panel_keys
+                        if panel[1] == weakest_window
+                    ],
+                ),
+            ]
+            for category in _INTERVAL_SIG_FACTOR_KEYS:
+                sample: list[tuple[Decimal, Decimal]] = []
+                for panel in panel_keys:
+                    gains = parsed[panel][1][index][3]
+                    member = [
+                        gain
+                        for case_key, gain in gains.items()
+                        if factors.get(case_key) == category
+                    ]
+                    if member:
+                        sample.append((
+                            sum(member, Decimal(0)) / Decimal(len(member)),
+                            weight_values[panel],
+                        ))
+                samples.append((category, sample))
+
+            items: list[list] = []
+            for k_index, (key, sample) in enumerate(samples):
+                n, mean, lower, upper, p = _interval_sig_stats(sample)
+                items.append([key, n, mean, lower, upper, p])
+                flat.append((p, start, k_index))
+            intervals_items.append(items)
+
+        # Benjamini-Hochberg q-values over every item of every interval,
+        # ranked ascending by (p, start, k); accumulate the running
+        # minimum of N * p_l / l from the top rank down.
+        count = len(flat)
+        order = sorted(range(count), key=lambda position: flat[position])
+        q_values = [Decimal(0)] * count
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            position = order[rank - 1]
+            candidate = Decimal(count) * flat[position][0] / Decimal(rank)
+            if candidate < running:
+                running = candidate
+            q_values[position] = running
+
+        interval_strings: list[str] = []
+        position = 0
+        for index in range(segment_count):
+            start = reference_segments[index][0]
+            end = reference_segments[index][1]
+            item_strings: list[str] = []
+            for key, n, mean, lower, upper, p in intervals_items[index]:
+                q_value = q_values[position]
+                position += 1
+                reject = q_value <= alpha_value
+                item_strings.append(
+                    '{"key":' + json.dumps(key, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"mean":' + _format6(mean)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + ',"p":' + _format6(p)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + "}"
+                )
+            interval_strings.append(
+                '{"start":' + _format6(start)
+                + ',"end":' + _format6(end)
+                + ',"items":[' + ",".join(item_strings) + "]}"
             )
 
     return (
