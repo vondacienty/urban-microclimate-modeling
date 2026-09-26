@@ -13489,6 +13489,7 @@ def _budget_frontier_parse(
             budget < 0
             or (previous_budget is not None and budget <= previous_budget)
             or cost < 0
+            or cost > budget
             or lower > effect
             or effect > upper
         ):
@@ -13752,6 +13753,191 @@ def frontier_mix(frontiers: dict, weights: dict) -> str:
                 + ',"switch":' + ("true" if switch else "false")
                 + ',"cases":[' + ",".join(case_strings) + "]"
                 + ',"panels":[' + ",".join(panel_strings) + "]}"
+            )
+
+    return (
+        '{"total_weight":' + _format6(total_weight)
+        + ',"points":[' + ",".join(point_strings) + "]}\n"
+    )
+
+
+def frontier_mix_robust(frontiers: dict, weights: dict) -> str:
+    """Blend several budget frontiers with per-pick robustness ranks.
+
+    ``frontiers`` and ``weights`` follow the :func:`frontier_mix`
+    contract exactly: a non-dict argument raises ``TypeError`` and every
+    other contract violation raises ``ValueError``, including frontier
+    reports whose budget sequences or ``(by, key)`` panel sets differ.
+
+    With ``W`` the total weight, each budget point's ``effect``,
+    ``lower`` and ``upper`` are the weighted means ``Σ(w·v)/W`` of the
+    same fields across the reports; ``change_lower`` and
+    ``change_upper`` are zero on the first point and the current value
+    minus the previous point's value afterwards. Every distinct pick
+    array ``p`` at the point gets one rank entry with ``support``
+    ``S = Σw/W`` and ``effect`` ``M = Σ(w·e)/Σw`` over the scenarios
+    picking ``p``; entries are ranked by descending ``support``, then
+    descending ``effect``, then the lexicographically smaller pick
+    array, with ``rank`` counting from 1. Each scenario's
+    ``contribution`` is ``w·(e − E)/W`` with ``E`` the point's weighted
+    effect, and ``driver`` is the scenario key whose contribution has
+    the largest absolute value, ties broken by the smaller key.
+
+    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
+    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``total_weight,
+    points`` and each point uses the key order ``budget, effect, lower,
+    upper, change_lower, change_upper, driver, ranks, cases`` with
+    ranks using ``pick, support, effect, rank`` and cases using ``key,
+    contribution``. Points are ordered by ascending budget, ranks by
+    ascending rank and cases by ascending key. ``pick`` is an ascending
+    string array, ``rank`` an integer, ``driver`` a string and every
+    other number renders with six decimals, negative zero normalized to
+    ``0.000000``.
+    """
+    if not isinstance(frontiers, dict):
+        raise TypeError("frontiers must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if len(frontiers) < 2:
+        raise ValueError("frontiers must have at least two items")
+    for key in frontiers:
+        if not isinstance(key, str) or not key:
+            raise ValueError("each frontiers key must be a non-empty string")
+    if set(weights) != set(frontiers):
+        raise ValueError("weights keys must be exactly the frontiers keys")
+    weight_values: dict[str, Decimal] = {}
+    for key in frontiers:
+        weight = _portfolio_number(weights[key], "weight")
+        if weight <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values[key] = weight
+
+    parsed = {
+        key: _budget_frontier_parse(frontiers[key]) for key in frontiers
+    }
+    case_keys = sorted(frontiers)
+    budgets, _, panel_keys = parsed[case_keys[0]]
+    for key in case_keys[1:]:
+        other_budgets, _, other_panel_keys = parsed[key]
+        if other_budgets != budgets:
+            raise ValueError(
+                "all frontiers must share the same budget sequence"
+            )
+        if set(other_panel_keys) != set(panel_keys):
+            raise ValueError("all frontiers must share the same panels")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = sum(
+            (weight_values[key] for key in case_keys), Decimal(0)
+        )
+        point_strings: list[str] = []
+        previous_lower: Decimal | None = None
+        previous_upper: Decimal | None = None
+        for index, budget in enumerate(budgets):
+            effect = sum(
+                (
+                    weight_values[key] * parsed[key][1][index][0]
+                    for key in case_keys
+                ),
+                Decimal(0),
+            ) / total_weight
+            lower = sum(
+                (
+                    weight_values[key] * parsed[key][1][index][1]
+                    for key in case_keys
+                ),
+                Decimal(0),
+            ) / total_weight
+            upper = sum(
+                (
+                    weight_values[key] * parsed[key][1][index][2]
+                    for key in case_keys
+                ),
+                Decimal(0),
+            ) / total_weight
+            if previous_lower is None:
+                change_lower = Decimal(0)
+                change_upper = Decimal(0)
+            else:
+                change_lower = lower - previous_lower
+                change_upper = upper - previous_upper
+            previous_lower = lower
+            previous_upper = upper
+
+            pick_weight: dict[tuple[str, ...], Decimal] = {}
+            pick_effect: dict[tuple[str, ...], Decimal] = {}
+            for key in case_keys:
+                pick = parsed[key][1][index][3]
+                pick_weight[pick] = (
+                    pick_weight.get(pick, Decimal(0)) + weight_values[key]
+                )
+                pick_effect[pick] = (
+                    pick_effect.get(pick, Decimal(0))
+                    + weight_values[key] * parsed[key][1][index][0]
+                )
+            entries = [
+                (
+                    pick,
+                    pick_weight[pick] / total_weight,
+                    pick_effect[pick] / pick_weight[pick],
+                )
+                for pick in pick_weight
+            ]
+            # Stable sorts compose: ascending pick, then descending
+            # effect, then descending support.
+            entries.sort(key=lambda entry: entry[0])
+            entries.sort(key=lambda entry: entry[2], reverse=True)
+            entries.sort(key=lambda entry: entry[1], reverse=True)
+            rank_strings: list[str] = []
+            for rank, (pick, support, mean) in enumerate(entries, 1):
+                rank_strings.append(
+                    '{"pick":'
+                    + json.dumps(
+                        list(pick), ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + ',"support":' + _format6(support)
+                    + ',"effect":' + _format6(mean)
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+
+            case_strings: list[str] = []
+            driver: str | None = None
+            driver_magnitude: Decimal | None = None
+            for key in case_keys:
+                contribution = (
+                    weight_values[key]
+                    * (parsed[key][1][index][0] - effect)
+                    / total_weight
+                )
+                case_strings.append(
+                    '{"key":' + json.dumps(key, ensure_ascii=False)
+                    + ',"contribution":' + _format6(contribution)
+                    + "}"
+                )
+                magnitude = abs(contribution)
+                # Ascending key order plus a strict comparison keeps the
+                # smaller key on ties.
+                if driver_magnitude is None or magnitude > driver_magnitude:
+                    driver = key
+                    driver_magnitude = magnitude
+
+            point_strings.append(
+                '{"budget":' + _format6(budget)
+                + ',"effect":' + _format6(effect)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + ',"change_lower":' + _format6(change_lower)
+                + ',"change_upper":' + _format6(change_upper)
+                + ',"driver":' + json.dumps(driver, ensure_ascii=False)
+                + ',"ranks":[' + ",".join(rank_strings) + "]"
+                + ',"cases":[' + ",".join(case_strings) + "]}"
             )
 
     return (
