@@ -8615,6 +8615,176 @@ def scenario_decision_attribution(reports: dict, weights: dict) -> str:
         )
 
 
+def decision_summary(reports: dict, weights: dict, *, by: str = "region") -> str:
+    """Summarize per-panel scenario decisions grouped by region or window.
+
+    Inputs, validation and ``Decimal`` computation follow
+    :func:`scenario_decision_attribution`: ``reports`` maps
+    ``(region, window)`` two-tuples of non-empty strings to
+    :func:`scenario_sensitivity` JSON outputs and ``weights`` holds one
+    positive finite non-boolean int/float weight per panel; a non-dict
+    argument raises ``TypeError`` and any other violation raises
+    ``ValueError``. ``by`` must be ``"region"`` or ``"window"`` and any
+    other value raises ``ValueError``.
+
+    Panels are grouped by their region when ``by`` is ``"region"`` and by
+    their window when ``by`` is ``"window"``; groups are rendered in
+    ascending group key order and each group lists every scenario in
+    ascending key order. The per-panel judgment follows
+    :func:`scenario_decision_attribution`: within each panel the
+    ``candidate`` is the scenario with the smallest ``(rank, key)``, its
+    ``reason`` is the first matching of ``unstable``, ``nonsignificant``,
+    ``direction`` and ``recommend``, and the panel's ``decision`` is its
+    candidate only when the reason is ``recommend``.
+
+    With ``W`` the sum of all weights across every panel and the group
+    ``weight`` the sum of its panels' weights, each scenario's numbers
+    within a group are: ``contribution`` the sum of ``weight`` times the
+    scenario's per-panel ``score`` divided by ``W``; ``support`` the sum
+    of the weights of the group's panels whose ``decision`` is the
+    scenario divided by ``W``; and ``unstable``, ``nonsignificant`` and
+    ``direction`` the sums of the weights of the group's panels whose
+    ``candidate`` is the scenario with the like-named ``reason``, each
+    divided by ``W``.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``by, total_weight,
+    groups``, each group object uses the key order ``key, weight,
+    candidates`` and each candidate object uses the key order ``key,
+    kind, share, contribution, support, unstable, nonsignificant,
+    direction``. ``groups`` and ``candidates`` are JSON arrays; ``by``
+    and each ``key`` and ``kind`` render as JSON strings; ``kind`` and
+    ``share`` carry the report values. Every number renders with exactly
+    six decimals, negative zero normalized to ``0.000000``. With no
+    panels the only valid input is ``reports={}`` and ``weights={}``,
+    yielding ``total_weight`` ``0.000000`` and an empty ``groups``
+    array.
+    """
+    if by not in ("region", "window"):
+        raise ValueError("by must be 'region' or 'window'")
+    parsed = _scenario_decision_inputs(reports, weights)
+    if parsed is None:
+        return (
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"total_weight":0.000000,"groups":[]}'
+            + "\n"
+        )
+    (
+        weight_values, panels, scenario_keys,
+        kind_values, share_values,
+    ) = parsed
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = Decimal(0)
+        for panel_key in panels:
+            total_weight += weight_values[panel_key]
+
+        # Per-panel judgment as in scenario_decision_attribution: the
+        # candidate is the smallest-(rank, key) scenario, its reason the
+        # first matching of unstable, nonsignificant, direction and
+        # recommend, and the decision the candidate only on recommend.
+        panel_candidate: dict[tuple[str, str], str] = {}
+        panel_reason: dict[tuple[str, str], str] = {}
+        panel_decision: dict[tuple[str, str], str | None] = {}
+        for panel_key in sorted(panels):
+            rank_map = panels[panel_key]["ranks"]
+            candidate = min(
+                rank_map, key=lambda name: (rank_map[name][3], name)
+            )
+            reason = "recommend"
+            if not rank_map[candidate][4]:
+                reason = "unstable"
+            else:
+                for key_a, key_b, diff, reject in panels[panel_key]["pairs"]:
+                    if candidate != key_a and candidate != key_b:
+                        continue
+                    if not reject:
+                        reason = "nonsignificant"
+                        break
+                if reason == "recommend":
+                    for key_a, key_b, diff, reject in panels[panel_key][
+                        "pairs"
+                    ]:
+                        if candidate != key_a and candidate != key_b:
+                            continue
+                        if (candidate == key_a and diff >= 0) or (
+                            candidate == key_b and diff <= 0
+                        ):
+                            reason = "direction"
+                            break
+            panel_candidate[panel_key] = candidate
+            panel_reason[panel_key] = reason
+            panel_decision[panel_key] = (
+                candidate if reason == "recommend" else None
+            )
+
+        group_index = 0 if by == "region" else 1
+        group_members: dict[str, list[tuple[str, str]]] = {}
+        for panel_key in panels:
+            group_members.setdefault(panel_key[group_index], []).append(
+                panel_key
+            )
+
+        group_items: list[str] = []
+        for group_key in sorted(group_members):
+            members = group_members[group_key]
+            group_weight = Decimal(0)
+            for panel_key in members:
+                group_weight += weight_values[panel_key]
+            candidate_items: list[str] = []
+            for scenario_key in sorted(scenario_keys):
+                contribution = Decimal(0)
+                support = Decimal(0)
+                unstable = Decimal(0)
+                nonsignificant = Decimal(0)
+                direction = Decimal(0)
+                for panel_key in members:
+                    weight = weight_values[panel_key]
+                    contribution += (
+                        weight * panels[panel_key]["ranks"][scenario_key][2]
+                    )
+                    if panel_decision[panel_key] == scenario_key:
+                        support += weight
+                    if panel_candidate[panel_key] == scenario_key:
+                        reason = panel_reason[panel_key]
+                        if reason == "unstable":
+                            unstable += weight
+                        elif reason == "nonsignificant":
+                            nonsignificant += weight
+                        elif reason == "direction":
+                            direction += weight
+                candidate_items.append(
+                    '{"key":'
+                    + json.dumps(scenario_key, ensure_ascii=False)
+                    + ',"kind":'
+                    + json.dumps(kind_values[scenario_key], ensure_ascii=False)
+                    + ',"share":' + _format6(share_values[scenario_key])
+                    + ',"contribution":'
+                    + _format6(contribution / total_weight)
+                    + ',"support":' + _format6(support / total_weight)
+                    + ',"unstable":' + _format6(unstable / total_weight)
+                    + ',"nonsignificant":'
+                    + _format6(nonsignificant / total_weight)
+                    + ',"direction":' + _format6(direction / total_weight)
+                    + '}'
+                )
+            group_items.append(
+                '{"key":' + json.dumps(group_key, ensure_ascii=False)
+                + ',"weight":' + _format6(group_weight)
+                + ',"candidates":[' + ",".join(candidate_items) + ']}'
+            )
+
+        return (
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"total_weight":' + _format6(total_weight)
+            + ',"groups":[' + ",".join(group_items) + ']}'
+            + "\n"
+        )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
