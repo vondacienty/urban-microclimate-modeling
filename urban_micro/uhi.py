@@ -85,6 +85,7 @@ __all__ = [
     "panel_report",
     "frontier_sensitivity",
     "frontier_joint",
+    "frontier_interval_attribution",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -11879,6 +11880,436 @@ def frontier_joint_intervals(
                 + ',"stability":' + _format6(stability)
                 + ',"worst":' + json.dumps(worst_key, ensure_ascii=False)
                 + ',"cases":[' + ",".join(case_strings) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"intervals":[' + ",".join(interval_strings) + "]}\n"
+    )
+
+
+_INTERVALS_ERROR = "report must be a frontier_joint_intervals JSON output"
+_INTERVALS_NUMBER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)\.[0-9]{6}")
+
+
+class _IntervalsNumber(Decimal):
+    """Marker for a canonical fixed-six-decimal number token."""
+
+
+def _intervals_parse_int(value: str) -> int:
+    return int(value)
+
+
+def _intervals_parse_constant(value: str) -> Decimal:
+    raise ValueError(_INTERVALS_ERROR)
+
+
+def _frontier_intervals_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[tuple[Decimal, Decimal, tuple[str, ...], dict[str, Decimal]]],
+]:
+    """Parse one :func:`frontier_joint_intervals` JSON output.
+
+    Returns ``(alpha, segments)`` where each segment is a ``(start, end,
+    pick, gains)`` tuple with ``pick`` the modal pick as an ascending
+    tuple of strings and ``gains`` mapping each case key to its
+    ``gain``. The input must be byte-for-byte identical to a canonical
+    output (key order, escaping, spacing and the six-decimal number
+    tokens included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_INTERVALS_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_INTERVALS_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_INTERVALS_ERROR)
+        number = _IntervalsNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_INTERVALS_ERROR)
+        return number
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_intervals_parse_int,
+            parse_constant=_intervals_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_INTERVALS_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "intervals"}:
+        raise ValueError(_INTERVALS_ERROR)
+    alpha = data["alpha"]
+    intervals = data["intervals"]
+    if (
+        not isinstance(alpha, _IntervalsNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(intervals, list)
+        or not intervals
+    ):
+        raise ValueError(_INTERVALS_ERROR)
+
+    segments: list[
+        tuple[Decimal, Decimal, tuple[str, ...], dict[str, Decimal]]
+    ] = []
+    interval_tokens: list[str] = []
+    previous_end: Decimal | None = None
+    for index, item in enumerate(intervals):
+        if not isinstance(item, dict) or set(item) != {
+            "start", "end", "threshold", "pick", "n",
+            "stability", "worst", "cases",
+        }:
+            raise ValueError(_INTERVALS_ERROR)
+        start = item["start"]
+        end = item["end"]
+        threshold = item["threshold"]
+        pick = item["pick"]
+        n = item["n"]
+        stability = item["stability"]
+        worst = item["worst"]
+        cases = item["cases"]
+        if (
+            not isinstance(start, _IntervalsNumber)
+            or not isinstance(end, _IntervalsNumber)
+            or start > end
+            or (previous_end is not None and start <= previous_end)
+        ):
+            raise ValueError(_INTERVALS_ERROR)
+        if index == 0:
+            if threshold is not None:
+                raise ValueError(_INTERVALS_ERROR)
+        elif not isinstance(threshold, _IntervalsNumber) or threshold != start:
+            raise ValueError(_INTERVALS_ERROR)
+        if (
+            not isinstance(pick, list)
+            or any(not isinstance(key, str) or not key for key in pick)
+            or any(
+                pick[position] >= pick[position + 1]
+                for position in range(len(pick) - 1)
+            )
+        ):
+            raise ValueError(_INTERVALS_ERROR)
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError(_INTERVALS_ERROR)
+        if (
+            not isinstance(stability, _IntervalsNumber)
+            or stability < 0
+            or stability > 1
+        ):
+            raise ValueError(_INTERVALS_ERROR)
+        if not isinstance(worst, str) or not worst:
+            raise ValueError(_INTERVALS_ERROR)
+        if not isinstance(cases, list) or not cases:
+            raise ValueError(_INTERVALS_ERROR)
+
+        gains: dict[str, Decimal] = {}
+        case_tokens: list[str] = []
+        previous_key: str | None = None
+        for case in cases:
+            if not isinstance(case, dict) or set(case) != {
+                "key", "cost", "gain", "support",
+            }:
+                raise ValueError(_INTERVALS_ERROR)
+            case_key = case["key"]
+            cost = case["cost"]
+            gain = case["gain"]
+            support = case["support"]
+            if (
+                not isinstance(case_key, str)
+                or not case_key
+                or case_key in gains
+                or (previous_key is not None and case_key <= previous_key)
+            ):
+                raise ValueError(_INTERVALS_ERROR)
+            if (
+                not isinstance(cost, _IntervalsNumber)
+                or not isinstance(gain, _IntervalsNumber)
+                or not isinstance(support, _IntervalsNumber)
+                or support < 0
+                or support > 1
+            ):
+                raise ValueError(_INTERVALS_ERROR)
+            previous_key = case_key
+            gains[case_key] = gain
+            case_tokens.append(
+                '{"key":' + json.dumps(case_key, ensure_ascii=False)
+                + ',"cost":' + _format6(cost)
+                + ',"gain":' + _format6(gain)
+                + ',"support":' + _format6(support)
+                + "}"
+            )
+        if worst not in gains:
+            raise ValueError(_INTERVALS_ERROR)
+
+        previous_end = end
+        segments.append((start, end, tuple(pick), gains))
+        interval_tokens.append(
+            '{"start":' + _format6(start)
+            + ',"end":' + _format6(end)
+            + ',"threshold":'
+            + ("null" if threshold is None else _format6(threshold))
+            + ',"pick":'
+            + json.dumps(pick, ensure_ascii=False, separators=(",", ":"))
+            + ',"n":' + str(n)
+            + ',"stability":' + _format6(stability)
+            + ',"worst":' + json.dumps(worst, ensure_ascii=False)
+            + ',"cases":[' + ",".join(case_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations
+    # (whitespace, escaping, key order); the payload must reproduce the
+    # canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"intervals":[' + ",".join(interval_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_INTERVALS_ERROR)
+    return alpha, segments
+
+
+def frontier_interval_attribution(
+    reports: dict,
+    weights: dict,
+    factors: dict,
+) -> str:
+    """Attribute merged frontier intervals to regions, windows and factors.
+
+    ``reports`` maps a ``(region, window)`` pair of non-empty strings to
+    a canonical :func:`frontier_joint_intervals` JSON output and must
+    contain at least two entries; ``weights`` maps the same keys to
+    positive finite non-boolean int/float weights; ``factors`` maps each
+    case key shared by every interval of every report to exactly one of
+    ``"weather"``, ``"cover"`` or ``"morphology"``. A non-dict
+    ``reports``, ``weights`` or ``factors`` raises ``TypeError``; every
+    other contract violation raises ``ValueError``. Every report must
+    share the same ``alpha``, the same number of intervals and, at each
+    interval position, the same ``start``, ``end`` and case key set.
+
+    For each interval ``W`` is the total weight and each report's
+    ``m_p`` is the mean of its case ``gain`` values. The interval's
+    ``pick`` is the report pick with the largest summed weight, ties
+    broken by the lexicographically smaller pick, and ``consistency``
+    is that summed weight divided by ``W``. ``region`` and ``window``
+    are the keys whose group of reports has the smallest
+    weight-weighted mean of ``m_p``, ties broken by the smaller key.
+    For each factor category ``f`` with a non-empty member set the value
+    is the sum over reports and member cases of ``weight * gain``
+    divided by ``W * |f|``; an empty category yields ``0``. All
+    arithmetic is ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context and comparisons use the unquantized values.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, intervals``.
+    Each interval uses the key order ``start, end, pick, consistency,
+    region, window, factors`` and each ``factors`` object the key order
+    ``weather, cover, morphology``; intervals are sorted by ascending
+    ``start``. ``pick`` is an ascending string array, ``region`` and
+    ``window`` are strings and every numeric value renders with six
+    decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(factors, dict):
+        raise TypeError("factors must be a dict")
+    if len(reports) < 2:
+        raise ValueError("reports must contain at least two entries")
+
+    panel_keys: list[tuple[str, str]] = []
+    for panel in reports:
+        if (
+            not isinstance(panel, tuple)
+            or len(panel) != 2
+            or not isinstance(panel[0], str)
+            or not panel[0]
+            or not isinstance(panel[1], str)
+            or not panel[1]
+        ):
+            raise ValueError(
+                "each reports key must be a non-empty (region, window) "
+                "string pair"
+            )
+        panel_keys.append(panel)
+    panel_keys.sort()
+
+    if set(weights) != set(panel_keys):
+        raise ValueError("weights keys must be exactly the reports keys")
+    weight_values: dict[tuple[str, str], Decimal] = {}
+    for panel in panel_keys:
+        weight_value = _portfolio_number(weights[panel], "weight")
+        if weight_value <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values[panel] = weight_value
+
+    parsed = {panel: _frontier_intervals_parse(reports[panel])
+              for panel in panel_keys}
+
+    alpha_value, reference_segments = parsed[panel_keys[0]]
+    segment_count = len(reference_segments)
+    for panel in panel_keys[1:]:
+        other_alpha, other_segments = parsed[panel]
+        if other_alpha != alpha_value:
+            raise ValueError("every report must share the same alpha")
+        if len(other_segments) != segment_count:
+            raise ValueError(
+                "every report must have the same number of intervals"
+            )
+        for index in range(segment_count):
+            reference = reference_segments[index]
+            other = other_segments[index]
+            if other[0] != reference[0] or other[1] != reference[1]:
+                raise ValueError(
+                    "corresponding intervals must share start and end"
+                )
+            if set(other[3]) != set(reference[3]):
+                raise ValueError(
+                    "corresponding intervals must share the same case keys"
+                )
+
+    common_cases: set[str] | None = None
+    for _alpha, segments in parsed.values():
+        for _start, _end, _pick, gains in segments:
+            if common_cases is None:
+                common_cases = set(gains)
+            else:
+                common_cases &= set(gains)
+    assert common_cases is not None  # reports is non-empty
+    if set(factors) != common_cases:
+        raise ValueError(
+            "factors keys must be exactly the case keys common to all "
+            "intervals"
+        )
+    for category in factors.values():
+        if category not in ("weather", "cover", "morphology"):
+            raise ValueError(
+                'each factors value must be "weather", "cover" or '
+                '"morphology"'
+            )
+    category_counts = {"weather": 0, "cover": 0, "morphology": 0}
+    for case_key in common_cases:
+        category_counts[factors[case_key]] += 1
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = sum(
+            (weight_values[panel] for panel in panel_keys), Decimal(0)
+        )
+
+        interval_strings: list[str] = []
+        for index in range(segment_count):
+            start = reference_segments[index][0]
+            end = reference_segments[index][1]
+
+            pick_weights: dict[tuple[str, ...], Decimal] = {}
+            region_sums: dict[str, Decimal] = {}
+            region_weights: dict[str, Decimal] = {}
+            window_sums: dict[str, Decimal] = {}
+            window_weights: dict[str, Decimal] = {}
+            category_sums = {
+                "weather": Decimal(0),
+                "cover": Decimal(0),
+                "morphology": Decimal(0),
+            }
+            for panel in panel_keys:
+                weight = weight_values[panel]
+                pick, gains = parsed[panel][1][index][2:4]
+                mean_gain = sum(gains.values(), Decimal(0)) / Decimal(
+                    len(gains)
+                )
+                region, window = panel
+                region_sums[region] = (
+                    region_sums.get(region, Decimal(0)) + weight * mean_gain
+                )
+                region_weights[region] = (
+                    region_weights.get(region, Decimal(0)) + weight
+                )
+                window_sums[window] = (
+                    window_sums.get(window, Decimal(0)) + weight * mean_gain
+                )
+                window_weights[window] = (
+                    window_weights.get(window, Decimal(0)) + weight
+                )
+                pick_weights[pick] = (
+                    pick_weights.get(pick, Decimal(0)) + weight
+                )
+                for case_key, gain in gains.items():
+                    category = factors.get(case_key)
+                    if category is not None:
+                        category_sums[category] += weight * gain
+
+            best_pick: tuple[str, ...] | None = None
+            best_pick_weight: Decimal | None = None
+            for pick, summed in pick_weights.items():
+                if (
+                    best_pick_weight is None
+                    or summed > best_pick_weight
+                    or (summed == best_pick_weight and pick < best_pick)
+                ):
+                    best_pick = pick
+                    best_pick_weight = summed
+            assert best_pick is not None  # reports is non-empty
+            consistency = best_pick_weight / total_weight
+
+            best_region: str | None = None
+            best_region_mean: Decimal | None = None
+            for region in region_sums:
+                mean = region_sums[region] / region_weights[region]
+                if (
+                    best_region_mean is None
+                    or mean < best_region_mean
+                    or (mean == best_region_mean and region < best_region)
+                ):
+                    best_region = region
+                    best_region_mean = mean
+            best_window: str | None = None
+            best_window_mean: Decimal | None = None
+            for window in window_sums:
+                mean = window_sums[window] / window_weights[window]
+                if (
+                    best_window_mean is None
+                    or mean < best_window_mean
+                    or (mean == best_window_mean and window < best_window)
+                ):
+                    best_window = window
+                    best_window_mean = mean
+
+            factor_values: dict[str, Decimal] = {}
+            for category in ("weather", "cover", "morphology"):
+                count = category_counts[category]
+                if count == 0:
+                    factor_values[category] = Decimal(0)
+                else:
+                    factor_values[category] = category_sums[category] / (
+                        total_weight * Decimal(count)
+                    )
+
+            interval_strings.append(
+                '{"start":' + _format6(start)
+                + ',"end":' + _format6(end)
+                + ',"pick":'
+                + json.dumps(
+                    list(best_pick), ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + ',"consistency":' + _format6(consistency)
+                + ',"region":' + json.dumps(best_region, ensure_ascii=False)
+                + ',"window":' + json.dumps(best_window, ensure_ascii=False)
+                + ',"factors":{"weather":'
+                + _format6(factor_values["weather"])
+                + ',"cover":' + _format6(factor_values["cover"])
+                + ',"morphology":' + _format6(factor_values["morphology"])
+                + "}}"
             )
 
     return (
