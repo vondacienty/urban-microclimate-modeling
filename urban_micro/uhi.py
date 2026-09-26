@@ -8785,6 +8785,180 @@ def decision_summary(reports: dict, weights: dict, *, by: str = "region") -> str
         )
 
 
+def decision_priority_matrix(reports: dict, weights: dict) -> str:
+    """Rank scenarios within region and window groups by priority.
+
+    Inputs, validation and ``Decimal`` computation follow
+    :func:`decision_summary`: ``reports`` maps ``(region, window)``
+    two-tuples of non-empty strings to :func:`scenario_sensitivity` JSON
+    outputs and ``weights`` holds one positive finite non-boolean
+    int/float weight per panel; a non-dict argument raises ``TypeError``
+    and any other violation raises ``ValueError``.
+
+    Panels are grouped both by their region and by their window. Within
+    each group every scenario carries the ``contribution``, ``support``,
+    ``unstable``, ``nonsignificant`` and ``direction`` of
+    :func:`decision_summary`, and its ``priority`` is
+    ``contribution - support + unstable + nonsignificant + direction``.
+    Scenarios are ranked ascending by ``(priority, key)`` with integer
+    ranks starting at 1. Across all groups each scenario's ``min_rank``
+    and ``max_rank`` are the smallest and largest of its ranks and
+    ``gap`` is ``max_rank - min_rank``.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``total_weight, groups,
+    spreads``, each group object uses the key order ``by, key,
+    candidates``, each candidate object uses the key order ``key,
+    priority, rank`` and each spread object uses the key order ``key,
+    min_rank, max_rank, gap``. ``groups`` lists the region groups first
+    and then the window groups, each in ascending key order; candidates
+    are ordered by ``(rank, key)`` and spreads by ascending key. ``by``
+    and each ``key`` render as JSON strings; ``rank``, ``min_rank``,
+    ``max_rank`` and ``gap`` are integers; every other number renders
+    with exactly six decimals, negative zero normalized to
+    ``0.000000``. With no panels the only valid input is ``reports={}``
+    and ``weights={}``, yielding ``total_weight`` ``0.000000`` and empty
+    ``groups`` and ``spreads`` arrays.
+    """
+    parsed = _scenario_decision_inputs(reports, weights)
+    if parsed is None:
+        return '{"total_weight":0.000000,"groups":[],"spreads":[]}\n'
+    (
+        weight_values, panels, scenario_keys,
+        kind_values, share_values,
+    ) = parsed
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = Decimal(0)
+        for panel_key in panels:
+            total_weight += weight_values[panel_key]
+
+        # Per-panel judgment as in scenario_decision_attribution: the
+        # candidate is the smallest-(rank, key) scenario, its reason the
+        # first matching of unstable, nonsignificant, direction and
+        # recommend, and the decision the candidate only on recommend.
+        panel_candidate: dict[tuple[str, str], str] = {}
+        panel_reason: dict[tuple[str, str], str] = {}
+        panel_decision: dict[tuple[str, str], str | None] = {}
+        for panel_key in sorted(panels):
+            rank_map = panels[panel_key]["ranks"]
+            candidate = min(
+                rank_map, key=lambda name: (rank_map[name][3], name)
+            )
+            reason = "recommend"
+            if not rank_map[candidate][4]:
+                reason = "unstable"
+            else:
+                for key_a, key_b, diff, reject in panels[panel_key][
+                    "pairs"
+                ]:
+                    if candidate != key_a and candidate != key_b:
+                        continue
+                    if not reject:
+                        reason = "nonsignificant"
+                        break
+                if reason == "recommend":
+                    for key_a, key_b, diff, reject in panels[panel_key][
+                        "pairs"
+                    ]:
+                        if candidate != key_a and candidate != key_b:
+                            continue
+                        if (candidate == key_a and diff >= 0) or (
+                            candidate == key_b and diff <= 0
+                        ):
+                            reason = "direction"
+                            break
+            panel_candidate[panel_key] = candidate
+            panel_reason[panel_key] = reason
+            panel_decision[panel_key] = (
+                candidate if reason == "recommend" else None
+            )
+
+        scenario_ranks: dict[str, list[int]] = {
+            key: [] for key in scenario_keys
+        }
+        group_items: list[str] = []
+        for by in ("region", "window"):
+            group_index = 0 if by == "region" else 1
+            group_members: dict[str, list[tuple[str, str]]] = {}
+            for panel_key in panels:
+                group_members.setdefault(
+                    panel_key[group_index], []
+                ).append(panel_key)
+            for group_key in sorted(group_members):
+                members = group_members[group_key]
+                priorities: dict[str, Decimal] = {}
+                for scenario_key in scenario_keys:
+                    contribution = Decimal(0)
+                    support = Decimal(0)
+                    unstable = Decimal(0)
+                    nonsignificant = Decimal(0)
+                    direction = Decimal(0)
+                    for panel_key in members:
+                        weight = weight_values[panel_key]
+                        contribution += (
+                            weight
+                            * panels[panel_key]["ranks"][scenario_key][2]
+                        )
+                        if panel_decision[panel_key] == scenario_key:
+                            support += weight
+                        if panel_candidate[panel_key] == scenario_key:
+                            reason = panel_reason[panel_key]
+                            if reason == "unstable":
+                                unstable += weight
+                            elif reason == "nonsignificant":
+                                nonsignificant += weight
+                            elif reason == "direction":
+                                direction += weight
+                    priorities[scenario_key] = (
+                        contribution - support + unstable
+                        + nonsignificant + direction
+                    ) / total_weight
+                ordered = sorted(
+                    scenario_keys,
+                    key=lambda name: (priorities[name], name),
+                )
+                candidate_items: list[str] = []
+                for rank, scenario_key in enumerate(ordered, start=1):
+                    scenario_ranks[scenario_key].append(rank)
+                    candidate_items.append(
+                        '{"key":'
+                        + json.dumps(scenario_key, ensure_ascii=False)
+                        + ',"priority":'
+                        + _format6(priorities[scenario_key])
+                        + ',"rank":' + str(rank)
+                        + '}'
+                    )
+                group_items.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"key":' + json.dumps(group_key, ensure_ascii=False)
+                    + ',"candidates":[' + ",".join(candidate_items) + ']}'
+                )
+
+        spread_items: list[str] = []
+        for scenario_key in sorted(scenario_keys):
+            ranks = scenario_ranks[scenario_key]
+            min_rank = min(ranks)
+            max_rank = max(ranks)
+            spread_items.append(
+                '{"key":' + json.dumps(scenario_key, ensure_ascii=False)
+                + ',"min_rank":' + str(min_rank)
+                + ',"max_rank":' + str(max_rank)
+                + ',"gap":' + str(max_rank - min_rank)
+                + '}'
+            )
+
+        return (
+            '{"total_weight":' + _format6(total_weight)
+            + ',"groups":[' + ",".join(group_items) + ']'
+            + ',"spreads":[' + ",".join(spread_items) + ']}'
+            + "\n"
+        )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
