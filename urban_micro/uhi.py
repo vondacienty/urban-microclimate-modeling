@@ -13391,6 +13391,375 @@ def budget_frontier(report: str, cost: dict, budgets: list) -> str:
     return '{"points":[' + ",".join(point_strings) + "]}\n"
 
 
+_FRONTIER_MIX_ERROR = "each frontier must be a budget_frontier JSON output"
+
+
+class _BudgetFrontierNumber(Decimal):
+    """Marker for a canonical fixed-six-decimal number token."""
+
+
+def _budget_frontier_parse_constant(value: str) -> Decimal:
+    raise ValueError(_FRONTIER_MIX_ERROR)
+
+
+def _budget_frontier_parse(
+    raw: object,
+) -> tuple[
+    list[Decimal],
+    list[tuple[Decimal, Decimal, Decimal, tuple[str, ...], dict]],
+    list[tuple[str, str]],
+]:
+    """Parse one :func:`budget_frontier` JSON output.
+
+    Returns ``(budgets, points, panel_keys)`` where ``budgets`` is the
+    ascending budget sequence, ``points`` holds one ``(effect, lower,
+    upper, pick, panel_effects)`` tuple per point with ``pick`` the
+    ascending picked-kind tuple and ``panel_effects`` mapping each
+    ``(by, key)`` panel to its effect, and ``panel_keys`` is the
+    canonical panel order shared by every point. The input must be
+    byte-for-byte identical to a canonical output (key order, escaping,
+    spacing, budget and panel order, switches and the six-decimal
+    number tokens included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_FRONTIER_MIX_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_FRONTIER_MIX_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        number = _BudgetFrontierNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        return number
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=int,
+            parse_constant=_budget_frontier_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_FRONTIER_MIX_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"points"}:
+        raise ValueError(_FRONTIER_MIX_ERROR)
+    raw_points = data["points"]
+    if not isinstance(raw_points, list) or not raw_points:
+        raise ValueError(_FRONTIER_MIX_ERROR)
+
+    budgets: list[Decimal] = []
+    points: list[
+        tuple[Decimal, Decimal, Decimal, tuple[str, ...], dict]
+    ] = []
+    panel_keys: list[tuple[str, str]] | None = None
+    point_tokens: list[str] = []
+    previous_budget: Decimal | None = None
+    previous_pick: tuple[str, ...] | None = None
+    for point in raw_points:
+        if not isinstance(point, dict) or set(point) != {
+            "budget", "cost", "effect", "lower", "upper", "pick",
+            "switch", "panels",
+        }:
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        budget = point["budget"]
+        cost = point["cost"]
+        effect = point["effect"]
+        lower = point["lower"]
+        upper = point["upper"]
+        pick = point["pick"]
+        switch = point["switch"]
+        panels = point["panels"]
+        if (
+            not isinstance(budget, _BudgetFrontierNumber)
+            or not isinstance(cost, _BudgetFrontierNumber)
+            or not isinstance(effect, _BudgetFrontierNumber)
+            or not isinstance(lower, _BudgetFrontierNumber)
+            or not isinstance(upper, _BudgetFrontierNumber)
+            or not isinstance(pick, list)
+            or not isinstance(switch, bool)
+            or not isinstance(panels, list)
+            or not panels
+        ):
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        if (
+            budget < 0
+            or (previous_budget is not None and budget <= previous_budget)
+            or cost < 0
+            or lower > effect
+            or effect > upper
+        ):
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        previous_budget = budget
+        pick_tuple = tuple(pick)
+        if any(kind not in _INTERVENTION_KINDS for kind in pick_tuple):
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        if list(pick_tuple) != sorted(set(pick_tuple)):
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        # The empty pick selects nothing and costs nothing; a non-empty
+        # pick always costs a positive amount.
+        if (not pick_tuple) != (cost == 0):
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        if not pick_tuple and (effect != 0 or lower != 0 or upper != 0):
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        if switch != (previous_pick is not None and pick_tuple != previous_pick):
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        previous_pick = pick_tuple
+
+        panel_effects: dict[tuple[str, str], Decimal] = {}
+        point_panel_keys: list[tuple[str, str]] = []
+        panel_tokens: list[str] = []
+        section = "region"
+        section_keys: dict[str, str | None] = {"region": None, "window": None}
+        section_counts: dict[str, int] = {"region": 0, "window": 0}
+        for panel in panels:
+            if not isinstance(panel, dict) or set(panel) != {
+                "by", "key", "n", "effect", "lower", "upper",
+            }:
+                raise ValueError(_FRONTIER_MIX_ERROR)
+            by = panel["by"]
+            key = panel["key"]
+            count = panel["n"]
+            panel_effect = panel["effect"]
+            panel_lower = panel["lower"]
+            panel_upper = panel["upper"]
+            if by not in ("region", "window"):
+                raise ValueError(_FRONTIER_MIX_ERROR)
+            if by == "region" and section == "window":
+                raise ValueError(_FRONTIER_MIX_ERROR)
+            if by == "window":
+                section = "window"
+            if not isinstance(key, str) or not key:
+                raise ValueError(_FRONTIER_MIX_ERROR)
+            last_key = section_keys[by]
+            if last_key is not None and key <= last_key:
+                raise ValueError(_FRONTIER_MIX_ERROR)
+            section_keys[by] = key
+            section_counts[by] += 1
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+                or not isinstance(panel_effect, _BudgetFrontierNumber)
+                or not isinstance(panel_lower, _BudgetFrontierNumber)
+                or not isinstance(panel_upper, _BudgetFrontierNumber)
+                or panel_lower > panel_effect
+                or panel_effect > panel_upper
+            ):
+                raise ValueError(_FRONTIER_MIX_ERROR)
+            if count == 0 and (
+                panel_effect != 0 or panel_lower != 0 or panel_upper != 0
+            ):
+                raise ValueError(_FRONTIER_MIX_ERROR)
+            panel_effects[(by, key)] = panel_effect
+            point_panel_keys.append((by, key))
+            panel_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"n":' + str(count)
+                + ',"effect":' + _format6(panel_effect)
+                + ',"lower":' + _format6(panel_lower)
+                + ',"upper":' + _format6(panel_upper)
+                + "}"
+            )
+        if section_counts["region"] == 0 or section_counts["window"] == 0:
+            raise ValueError(_FRONTIER_MIX_ERROR)
+        if panel_keys is None:
+            panel_keys = point_panel_keys
+        elif point_panel_keys != panel_keys:
+            raise ValueError(_FRONTIER_MIX_ERROR)
+
+        budgets.append(budget)
+        points.append((effect, lower, upper, pick_tuple, panel_effects))
+        point_tokens.append(
+            '{"budget":' + _format6(budget)
+            + ',"cost":' + _format6(cost)
+            + ',"effect":' + _format6(effect)
+            + ',"lower":' + _format6(lower)
+            + ',"upper":' + _format6(upper)
+            + ',"pick":'
+            + json.dumps(
+                list(pick_tuple), ensure_ascii=False, separators=(",", ":")
+            )
+            + ',"switch":' + ("true" if switch else "false")
+            + ',"panels":[' + ",".join(panel_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations
+    # (whitespace, escaping, key order); the payload must reproduce the
+    # canonical output byte-for-byte.
+    canonical = '{"points":[' + ",".join(point_tokens) + "]}"
+    if payload != canonical:
+        raise ValueError(_FRONTIER_MIX_ERROR)
+    assert panel_keys is not None
+    return budgets, points, panel_keys
+
+
+def frontier_mix(frontiers: dict, weights: dict) -> str:
+    """Blend several budget frontiers into one weighted frontier.
+
+    ``frontiers`` is a dict with at least two items mapping a non-empty
+    string key to a byte-for-byte :func:`budget_frontier` JSON output;
+    ``weights`` is a dict with exactly the same keys whose values are
+    strictly positive finite non-boolean int/float weights. A non-dict
+    ``frontiers`` or ``weights`` raises ``TypeError``; every other
+    contract violation raises ``ValueError``, including frontier
+    reports whose budget sequences or ``(by, key)`` panel sets differ.
+
+    With ``W`` the total weight, each budget point's ``effect``,
+    ``lower`` and ``upper`` are the weighted means ``Σ(w·v)/W`` of the
+    same fields across the reports. The point's ``pick`` is the pick
+    array with the largest summed weight, ties broken by the
+    lexicographically smaller array, and ``stability`` is that summed
+    weight divided by ``W``; ``switch`` is true when the pick differs
+    from the previous point's pick and false on the first point.
+    ``cases`` lists one entry per frontier key in ascending key order
+    with ``delta`` the case's ``effect`` minus the weighted ``effect``.
+    ``panels`` lists one entry per ``(by, key)`` panel, region panels
+    before window panels and ascending key within each, with ``effect``
+    the weighted mean of that panel's ``effect`` across the reports.
+
+    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
+    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``total_weight,
+    points`` and each point uses the key order ``budget, pick,
+    stability, effect, lower, upper, switch, cases, panels`` with cases
+    using ``key, delta`` and panels using ``by, key, effect``. ``pick``
+    is a string array, ``switch`` a boolean and every other number
+    renders with six decimals, negative zero normalized to
+    ``0.000000``.
+    """
+    if not isinstance(frontiers, dict):
+        raise TypeError("frontiers must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if len(frontiers) < 2:
+        raise ValueError("frontiers must have at least two items")
+    for key in frontiers:
+        if not isinstance(key, str) or not key:
+            raise ValueError("each frontiers key must be a non-empty string")
+    if set(weights) != set(frontiers):
+        raise ValueError("weights keys must be exactly the frontiers keys")
+    weight_values: dict[str, Decimal] = {}
+    for key in frontiers:
+        weight = _portfolio_number(weights[key], "weight")
+        if weight <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values[key] = weight
+
+    parsed = {
+        key: _budget_frontier_parse(frontiers[key]) for key in frontiers
+    }
+    case_keys = sorted(frontiers)
+    budgets, _, panel_keys = parsed[case_keys[0]]
+    for key in case_keys[1:]:
+        other_budgets, _, other_panel_keys = parsed[key]
+        if other_budgets != budgets:
+            raise ValueError(
+                "all frontiers must share the same budget sequence"
+            )
+        if set(other_panel_keys) != set(panel_keys):
+            raise ValueError("all frontiers must share the same panels")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = sum(
+            (weight_values[key] for key in case_keys), Decimal(0)
+        )
+        point_strings: list[str] = []
+        previous_pick: tuple[str, ...] | None = None
+        for index, budget in enumerate(budgets):
+            effect = sum(
+                (
+                    weight_values[key] * parsed[key][1][index][0]
+                    for key in case_keys
+                ),
+                Decimal(0),
+            ) / total_weight
+            lower = sum(
+                (
+                    weight_values[key] * parsed[key][1][index][1]
+                    for key in case_keys
+                ),
+                Decimal(0),
+            ) / total_weight
+            upper = sum(
+                (
+                    weight_values[key] * parsed[key][1][index][2]
+                    for key in case_keys
+                ),
+                Decimal(0),
+            ) / total_weight
+
+            pick_weights: dict[tuple[str, ...], Decimal] = {}
+            for key in case_keys:
+                pick = parsed[key][1][index][3]
+                pick_weights[pick] = (
+                    pick_weights.get(pick, Decimal(0)) + weight_values[key]
+                )
+            best_weight = max(pick_weights.values())
+            best_pick = min(
+                pick
+                for pick, weight in pick_weights.items()
+                if weight == best_weight
+            )
+            stability = best_weight / total_weight
+            switch = previous_pick is not None and best_pick != previous_pick
+            previous_pick = best_pick
+
+            case_strings: list[str] = []
+            for key in case_keys:
+                delta = parsed[key][1][index][0] - effect
+                case_strings.append(
+                    '{"key":' + json.dumps(key, ensure_ascii=False)
+                    + ',"delta":' + _format6(delta)
+                    + "}"
+                )
+            panel_strings: list[str] = []
+            for by, panel_key in panel_keys:
+                panel_effect = sum(
+                    (
+                        weight_values[key]
+                        * parsed[key][1][index][4][(by, panel_key)]
+                        for key in case_keys
+                    ),
+                    Decimal(0),
+                ) / total_weight
+                panel_strings.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"key":' + json.dumps(panel_key, ensure_ascii=False)
+                    + ',"effect":' + _format6(panel_effect)
+                    + "}"
+                )
+
+            point_strings.append(
+                '{"budget":' + _format6(budget)
+                + ',"pick":'
+                + json.dumps(
+                    list(best_pick), ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + ',"stability":' + _format6(stability)
+                + ',"effect":' + _format6(effect)
+                + ',"lower":' + _format6(lower)
+                + ',"upper":' + _format6(upper)
+                + ',"switch":' + ("true" if switch else "false")
+                + ',"cases":[' + ",".join(case_strings) + "]"
+                + ',"panels":[' + ",".join(panel_strings) + "]}"
+            )
+
+    return (
+        '{"total_weight":' + _format6(total_weight)
+        + ',"points":[' + ",".join(point_strings) + "]}\n"
+    )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
