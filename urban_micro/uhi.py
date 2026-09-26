@@ -10894,6 +10894,174 @@ def panel_priority(
     )
 
 
+def panel_priority_frontier(
+    reports: dict,
+    weights: dict,
+    cost: dict,
+    limits: list,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Trace the best affordable significant-candidate subset over limits.
+
+    ``reports``, ``weights``, ``cost`` and ``alpha`` follow the
+    :func:`panel_priority` contract and each candidate's ``score`` and
+    ``significant`` are computed exactly as there. ``limits`` must be a
+    non-empty list of non-negative finite non-boolean int/float values
+    that are pairwise distinct by their ``Decimal(str(x))`` value. A
+    non-dict ``reports``, ``weights`` or ``cost`` or a non-list
+    ``limits`` raises ``TypeError``; every other contract violation
+    raises ``ValueError``.
+
+    The limits are processed in ascending numeric order. For each limit
+    ``L`` every subset of the significant candidates whose total cost is
+    at most ``L`` is enumerated exhaustively — the empty subset is
+    always feasible — and the winner maximizes total score, then
+    minimizes total cost, then minimizes the lexicographically
+    ascending selected-key list. The first frontier entry is compared
+    against a baseline of ``score`` 0 and an empty pick; each later
+    entry is compared against the previous entry's result, with
+    ``marginal`` the score difference and ``added``/``removed`` the
+    ascending set differences between the current and previous picks.
+    All arithmetic is ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context and comparisons use the unquantized values.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, frontier``.
+    Each frontier entry uses the key order ``limit, cost, score,
+    marginal, pick, added, removed`` and entries are sorted by ascending
+    ``limit``; ``pick``, ``added`` and ``removed`` are string arrays and
+    every numeric value renders with six decimals, negative zero
+    normalized to ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+    if not isinstance(limits, list):
+        raise TypeError("limits must be a list")
+    if not limits:
+        raise ValueError("limits must be a non-empty list")
+
+    alpha_value, _groups_spec, records = _panel_report_data(
+        reports, weights, alpha
+    )
+
+    overall_mean: dict[str, Decimal] = {}
+    min_stable: dict[str, Decimal] = {}
+    significant: dict[str, bool] = {}
+    for by, _group_key, candidate, _n, mean, _range, stable, _p, q in records:
+        if candidate not in min_stable or stable < min_stable[candidate]:
+            min_stable[candidate] = stable
+        if by == "overall":
+            overall_mean[candidate] = mean
+        reject = q <= alpha_value
+        if candidate in significant:
+            significant[candidate] = significant[candidate] and reject
+        else:
+            significant[candidate] = reject
+
+    candidates = sorted(overall_mean)
+    if set(cost) != set(candidates):
+        raise ValueError("cost keys must be exactly the candidate keys")
+    costs: dict[str, Decimal] = {}
+    for key in candidates:
+        cost_value = _portfolio_number(cost[key], "cost")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        costs[key] = cost_value
+
+    limit_values: list[Decimal] = []
+    seen_limits: set[Decimal] = set()
+    for limit in limits:
+        limit_value = _portfolio_number(limit, "limits")
+        if limit_value < 0:
+            raise ValueError("each limit must be non-negative")
+        if limit_value in seen_limits:
+            raise ValueError("limits must be distinct")
+        seen_limits.add(limit_value)
+        limit_values.append(limit_value)
+    limit_values.sort()
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        scores = {
+            key: overall_mean[key] * min_stable[key] for key in candidates
+        }
+        sig_keys = [key for key in candidates if significant[key]]
+        sig_count = len(sig_keys)
+        subsets: list[tuple[Decimal, Decimal, tuple[str, ...]]] = []
+        for size in range(sig_count + 1):
+            for idxs in combinations(range(sig_count), size):
+                total_cost = sum(
+                    (costs[sig_keys[i]] for i in idxs), Decimal(0)
+                )
+                total_score = sum(
+                    (scores[sig_keys[i]] for i in idxs), Decimal(0)
+                )
+                subsets.append(
+                    (total_score, total_cost, tuple(sig_keys[i] for i in idxs))
+                )
+
+        frontier_strings: list[str] = []
+        prev_score = Decimal(0)
+        prev_pick: tuple[str, ...] = ()
+        for limit_value in limit_values:
+            best: tuple[Decimal, Decimal, tuple[str, ...]] | None = None
+            for total_score, total_cost, chosen_keys in subsets:
+                if total_cost > limit_value:
+                    continue
+                if (
+                    best is None
+                    or total_score > best[0]
+                    or (
+                        total_score == best[0]
+                        and (
+                            total_cost < best[1]
+                            or (
+                                total_cost == best[1]
+                                and chosen_keys < best[2]
+                            )
+                        )
+                    )
+                ):
+                    best = (total_score, total_cost, chosen_keys)
+
+            assert best is not None  # the empty subset is always feasible
+            total_score, total_cost, chosen_keys = best
+            chosen = set(chosen_keys)
+            previous = set(prev_pick)
+            added = sorted(chosen - previous)
+            removed = sorted(previous - chosen)
+            marginal = total_score - prev_score
+            frontier_strings.append(
+                '{"limit":' + _format6(limit_value)
+                + ',"cost":' + _format6(total_cost)
+                + ',"score":' + _format6(total_score)
+                + ',"marginal":' + _format6(marginal)
+                + ',"pick":'
+                + json.dumps(
+                    list(chosen_keys), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"added":'
+                + json.dumps(added, ensure_ascii=False, separators=(",", ":"))
+                + ',"removed":'
+                + json.dumps(removed, ensure_ascii=False, separators=(",", ":"))
+                + "}"
+            )
+            prev_score = total_score
+            prev_pick = chosen_keys
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"frontier":[' + ",".join(frontier_strings) + "]}\n"
+    )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
