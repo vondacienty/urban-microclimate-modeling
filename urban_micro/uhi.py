@@ -81,6 +81,7 @@ __all__ = [
     "portfolio",
     "portfolio_robustness",
     "portfolio_attribution",
+    "panel_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -10296,6 +10297,427 @@ def portfolio_attribution(
         '{"alpha":' + _format6(alpha_value)
         + ',"total_weight":' + _format6(total_weight)
         + ',"items":[' + ",".join(items) + "]}\n"
+    )
+
+
+_PANEL_ATTRIBUTION_ERROR = (
+    "each reports value must be a portfolio_attribution JSON output"
+)
+_PANEL_ATTRIBUTION_INT_RE = re.compile(r"(?:0|[1-9][0-9]*)")
+_PANEL_ATTRIBUTION_DECIMAL_RE = re.compile(
+    r"-?(?:0|[1-9][0-9]*)\.[0-9]{6}"
+)
+
+
+class _PanelAttributionInt(Decimal):
+    """Marker for a canonical unsigned JSON integer token."""
+
+
+class _PanelAttributionDecimal(Decimal):
+    """Marker for a canonical fixed-six-decimal JSON number token."""
+
+
+def _panel_attribution_parse_constant(value: str) -> Decimal:
+    raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+
+
+def _panel_attribution_signed_zero(value: Decimal) -> bool:
+    return value == 0 and value.is_signed()
+
+
+def _panel_attribution_items(raw: object) -> list[tuple[str, Decimal, bool]]:
+    """Parse one :func:`portfolio_attribution` JSON output.
+
+    Returns ``(key, expected, reject)`` triples in the report's item
+    order. The input must be byte-for-byte identical to a canonical
+    output (key order, escaping, spacing, the integer ``n`` token and
+    the six-decimal numeric tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+    payload = raw[:-1]
+
+    def _parse_integer(value: str) -> Decimal:
+        if not _PANEL_ATTRIBUTION_INT_RE.fullmatch(value):
+            raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+        return _PanelAttributionInt(value)
+
+    def _parse_decimal(value: str) -> Decimal:
+        if not _PANEL_ATTRIBUTION_DECIMAL_RE.fullmatch(value):
+            raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+        return _PanelAttributionDecimal(value)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_decimal,
+            parse_int=_parse_integer,
+            parse_constant=_panel_attribution_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_PANEL_ATTRIBUTION_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {
+        "alpha", "total_weight", "items",
+    }:
+        raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+    alpha_raw = data["alpha"]
+    total_weight_raw = data["total_weight"]
+    items_raw = data["items"]
+    if (
+        not isinstance(alpha_raw, _PanelAttributionDecimal)
+        or not isinstance(total_weight_raw, _PanelAttributionDecimal)
+        or not isinstance(items_raw, list)
+    ):
+        raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+    # Canonical values are always non-negative (weights/gains are), the
+    # fixed-six serializer never emits negative zero and alpha is in
+    # (0, 1] while total_weight is a sum of positive weights.
+    if (
+        alpha_raw <= 0
+        or alpha_raw > 1
+        or total_weight_raw <= 0
+        or _panel_attribution_signed_zero(alpha_raw)
+        or _panel_attribution_signed_zero(total_weight_raw)
+    ):
+        raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+
+    triples: list[tuple[str, Decimal, bool]] = []
+    item_tokens: list[str] = []
+    seen: set[str] = set()
+    last_key: str | None = None
+    n_value: _PanelAttributionInt | None = None
+    for item in items_raw:
+        if not isinstance(item, dict) or set(item) != {
+            "key", "n", "expected", "worst", "sensitivity", "p", "q",
+            "reject",
+        }:
+            raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+        key = item["key"]
+        n_item = item["n"]
+        expected = item["expected"]
+        worst = item["worst"]
+        sensitivity = item["sensitivity"]
+        p_value = item["p"]
+        q_value = item["q"]
+        reject = item["reject"]
+        if (
+            not isinstance(key, str)
+            or not key
+            or not isinstance(n_item, _PanelAttributionInt)
+            or not isinstance(expected, _PanelAttributionDecimal)
+            or not isinstance(worst, _PanelAttributionDecimal)
+            or not isinstance(sensitivity, _PanelAttributionDecimal)
+            or not isinstance(p_value, _PanelAttributionDecimal)
+            or not isinstance(q_value, _PanelAttributionDecimal)
+            or not isinstance(reject, bool)
+        ):
+            raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+        # A canonical report attributes across 2..16 scenarios.
+        if n_item < 2 or n_item > 16:
+            raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+        if (
+            expected < 0
+            or worst < 0
+            or sensitivity < 0
+            or p_value < 0
+            or p_value > 1
+            or q_value < 0
+            or q_value > 1
+            or _panel_attribution_signed_zero(expected)
+            or _panel_attribution_signed_zero(worst)
+            or _panel_attribution_signed_zero(sensitivity)
+            or _panel_attribution_signed_zero(p_value)
+            or _panel_attribution_signed_zero(q_value)
+        ):
+            raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+        if key in seen or (last_key is not None and key <= last_key):
+            raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+        seen.add(key)
+        last_key = key
+        if n_value is None:
+            n_value = n_item
+        elif n_item != n_value:
+            raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+        triples.append((key, expected, reject))
+        item_tokens.append(
+            '{"key":' + json.dumps(key, ensure_ascii=False)
+            + ',"n":' + str(n_item)
+            + ',"expected":' + str(expected)
+            + ',"worst":' + str(worst)
+            + ',"sensitivity":' + str(sensitivity)
+            + ',"p":' + str(p_value)
+            + ',"q":' + str(q_value)
+            + ',"reject":' + ("true" if reject else "false")
+            + "}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations
+    # (whitespace, escaping, key order); the payload must reproduce the
+    # canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + str(alpha_raw)
+        + ',"total_weight":' + str(total_weight_raw)
+        + ',"items":[' + ",".join(item_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_PANEL_ATTRIBUTION_ERROR)
+    return triples
+
+
+_PANEL_GROUP_ORDER = {"region": 0, "window": 1, "overall": 2}
+
+
+def panel_report(
+    reports: dict,
+    weights: dict,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Aggregate portfolio attribution reports across a region/window panel.
+
+    ``reports`` must be a dict with 2 to 16 entries mapping non-empty
+    ``(region, window)`` string pairs to canonical
+    :func:`portfolio_attribution` JSON outputs whose candidate key sets
+    are all identical. ``weights`` is a dict with exactly those pair
+    keys and strictly positive finite non-boolean int/float values.
+    ``alpha`` must be a finite non-boolean number with
+    ``0 < alpha <= 1``.
+
+    Candidates are tested within three group dimensions, sorted by
+    region, by window and overall across every panel (the overall group
+    key is ``"all"``). For a group containing panels with weights
+    ``w`` and source per-candidate values ``v`` (each report's
+    ``expected``) and ``n`` panels, ``mean = sum(w*v)/sum(w)``,
+    ``range = max(v) - min(v)`` and ``stable = sum(w * source reject) /
+    sum(w)`` with the source ``reject`` flags taken straight from the
+    reports. The p-value enumerates all ``2**n`` sign vectors: ``p`` is
+    the proportion of vectors with
+    ``|sum_i sign_i * w_i * v_i / sum(w)| >= |mean|``. All tests across
+    every group and candidate are pooled for one Benjamini-Hochberg
+    pass: tests rank ascending by ``(p, dimension order, group key,
+    candidate)`` with dimensions ordered region, window, overall, and
+    rank ``j`` (1-based, of ``N``) gets
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha``, compared on the unquantized values. All arithmetic
+    is ``Decimal(str(x))`` under a precision-1000, ROUND_HALF_EVEN
+    context.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups``.
+    Each group object uses the key order ``by, key, items``, groups
+    appear as all region groups (key ascending), then all window groups
+    (key ascending), then the single overall group, and each item uses
+    the key order ``key, n, mean, range, stable, p, q, reject`` with
+    items in ascending candidate order. ``n`` is an integer and
+    ``reject`` a boolean; every other numeric value renders with six
+    decimals, negative zero normalized to ``0.000000``, and Unicode is
+    preserved. A non-dict ``reports`` or ``weights`` raises
+    ``TypeError``; every other contract violation raises
+    ``ValueError``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+
+    if len(reports) < 2:
+        raise ValueError("reports must contain at least two panels")
+    panel_keys: list[tuple[str, str]] = []
+    for panel in reports:
+        if (
+            not isinstance(panel, tuple)
+            or len(panel) != 2
+            or not isinstance(panel[0], str)
+            or not panel[0]
+            or not isinstance(panel[1], str)
+            or not panel[1]
+        ):
+            raise ValueError(
+                "each reports key must be a non-empty (region, window) "
+                "string pair"
+            )
+        panel_keys.append(panel)
+    panel_keys.sort()
+
+    if set(weights) != set(panel_keys):
+        raise ValueError("weights keys must be exactly the reports keys")
+    weight_values: list[Decimal] = []
+    total_weight = Decimal(0)
+    for panel in panel_keys:
+        weight_value = _portfolio_number(weights[panel], "weight")
+        if weight_value <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values.append(weight_value)
+        total_weight += weight_value
+
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    panel_items: list[list[tuple[str, Decimal, bool]]] = []
+    candidate_set: set[str] | None = None
+    for panel in panel_keys:
+        triples = _panel_attribution_items(reports[panel])
+        keys = {key for key, _, _ in triples}
+        if candidate_set is None:
+            candidate_set = keys
+        elif keys != candidate_set:
+            raise ValueError("every report must share the same candidate keys")
+        panel_items.append(triples)
+    assert candidate_set is not None
+
+    n = len(panel_keys)
+    if n > 16:
+        raise ValueError("reports must contain at most sixteen panels")
+
+    candidates = sorted(candidate_set)
+    candidate_index = {candidate: i for i, candidate in enumerate(candidates)}
+    m = len(candidates)
+    # Panel-aligned source expected values and reject flags per candidate.
+    expected_rows = [[Decimal(0)] * n for _ in range(m)]
+    reject_rows = [[False] * n for _ in range(m)]
+    for panel_index, triples in enumerate(panel_items):
+        for key, expected, source_reject in triples:
+            i = candidate_index[key]
+            expected_rows[i][panel_index] = expected
+            reject_rows[i][panel_index] = source_reject
+
+    # (by, key, member panel indices) in canonical group emission order.
+    groups_spec: list[tuple[str, str, list[int]]] = []
+    regions = sorted({panel[0] for panel in panel_keys})
+    windows = sorted({panel[1] for panel in panel_keys})
+    for region in regions:
+        members = [
+            j for j, panel in enumerate(panel_keys) if panel[0] == region
+        ]
+        groups_spec.append(("region", region, members))
+    for window in windows:
+        members = [
+            j for j, panel in enumerate(panel_keys) if panel[1] == window
+        ]
+        groups_spec.append(("window", window, members))
+    groups_spec.append(("overall", "all", list(range(n))))
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # One record per (group, candidate):
+        # ``[by, group_key, candidate, n, mean, range, stable, p, q]``
+        # with q filled in by the pooled BH pass below.
+        records: list[list] = []
+        for by, group_key, members in groups_spec:
+            group_n = len(members)
+            group_weights = [weight_values[j] for j in members]
+            group_weight_total = sum(group_weights, Decimal(0))
+            sign_count = 1 << group_n
+            for i, candidate in enumerate(candidates):
+                values = [expected_rows[i][j] for j in members]
+                terms = [
+                    group_weights[k] * values[k] for k in range(group_n)
+                ]
+                mean = sum(terms, Decimal(0)) / group_weight_total
+                value_range = max(values) - min(values)
+                stable_weight = sum(
+                    (
+                        group_weights[k]
+                        for k in range(group_n)
+                        if reject_rows[i][members[k]]
+                    ),
+                    Decimal(0),
+                )
+                stable = stable_weight / group_weight_total
+                threshold = abs(sum(terms, Decimal(0)))
+                hits = 0
+                for mask in range(sign_count):
+                    statistic = Decimal(0)
+                    for k in range(group_n):
+                        if mask >> k & 1:
+                            statistic += terms[k]
+                        else:
+                            statistic -= terms[k]
+                    if abs(statistic) >= threshold:
+                        hits += 1
+                p_value = Decimal(hits) / Decimal(sign_count)
+                records.append(
+                    [
+                        by,
+                        group_key,
+                        candidate,
+                        group_n,
+                        mean,
+                        value_range,
+                        stable,
+                        p_value,
+                        None,
+                    ]
+                )
+
+        # Pooled Benjamini-Hochberg across every group and candidate:
+        # rank by (p, dimension order, group key, candidate), then
+        # accumulate the running minimum of N * p_l / l top-down.
+        count = len(records)
+        ranked = sorted(
+            range(count),
+            key=lambda idx: (
+                records[idx][7],
+                _PANEL_GROUP_ORDER[records[idx][0]],
+                records[idx][1],
+                records[idx][2],
+            ),
+        )
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            idx = ranked[rank - 1]
+            candidate_q = Decimal(count) * records[idx][7] / rank
+            if candidate_q < running:
+                running = candidate_q
+            records[idx][8] = running
+
+        group_strings: list[str] = []
+        for by, group_key, _members in groups_spec:
+            group_records = [
+                record
+                for record in records
+                if record[0] == by and record[1] == group_key
+            ]
+            group_records.sort(key=lambda record: record[2])
+            item_strings: list[str] = []
+            for (
+                _by,
+                _group_key,
+                candidate,
+                group_n,
+                mean,
+                value_range,
+                stable,
+                p_value,
+                q_value,
+            ) in group_records:
+                item_strings.append(
+                    '{"key":' + json.dumps(candidate, ensure_ascii=False)
+                    + ',"n":' + str(group_n)
+                    + ',"mean":' + _format6(mean)
+                    + ',"range":' + _format6(value_range)
+                    + ',"stable":' + _format6(stable)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":'
+                    + ("true" if q_value <= alpha_value else "false")
+                    + "}"
+                )
+            group_strings.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(group_key, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_strings) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"groups":[' + ",".join(group_strings) + "]}\n"
     )
 
 
