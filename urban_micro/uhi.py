@@ -83,6 +83,7 @@ __all__ = [
     "portfolio_attribution",
     "panel_priority",
     "panel_report",
+    "frontier_sensitivity",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -11055,6 +11056,238 @@ def panel_priority_frontier(
             )
             prev_score = total_score
             prev_pick = chosen_keys
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"frontier":[' + ",".join(frontier_strings) + "]}\n"
+    )
+
+
+def frontier_sensitivity(
+    reports: dict,
+    weights: dict,
+    cost: dict,
+    limits: list,
+    cases: dict,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Trace the best affordable subset over limits under cost-multiplier cases.
+
+    ``reports``, ``weights``, ``cost``, ``limits`` and ``alpha`` follow the
+    :func:`panel_priority_frontier` contract and each candidate's ``score``
+    and ``significant`` are computed exactly as there. ``cases`` must be a
+    non-empty dict mapping a non-empty string case key to a dict whose keys
+    are exactly the candidate keys and whose values are positive finite
+    non-boolean int/float cost multipliers. A non-dict ``cases`` raises
+    ``TypeError``; every other ``cases`` contract violation raises
+    ``ValueError``.
+
+    For each case the effective cost of a candidate is its ``cost`` times
+    the case multiplier and, exactly as in :func:`panel_priority_frontier`,
+    every subset of the significant candidates whose total effective cost
+    is at most the limit is enumerated exhaustively — the empty subset is
+    always feasible — and the winner maximizes total score, then minimizes
+    total cost, then minimizes the lexicographically ascending selected-key
+    list. Cases are processed in ascending key order and limits in
+    ascending numeric order; within each case the first limit entry is
+    compared against a baseline of ``score`` 0 and an empty pick and each
+    later entry against the previous limit's result, with ``marginal`` the
+    score difference, ``added``/``removed`` the ascending set differences
+    between the current and previous picks and ``switch`` whether the pick
+    changed. ``stability`` is the share of cases whose pick at that limit
+    equals the most common pick. All arithmetic is ``Decimal(str(x))``
+    under a precision-1000, ROUND_HALF_EVEN context and comparisons use the
+    unquantized values.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, frontier``. Each
+    frontier entry uses the key order ``limit, stability, cases`` and each
+    case entry the key order ``key, cost, score, marginal, pick, added,
+    removed, switch``; frontier entries are sorted by ascending ``limit``
+    and case entries by ascending ``key``. ``key`` is the case key,
+    ``pick``, ``added`` and ``removed`` are string arrays, ``switch`` is a
+    boolean and every numeric value renders with six decimals, negative
+    zero normalized to ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+    if not isinstance(limits, list):
+        raise TypeError("limits must be a list")
+    if not isinstance(cases, dict):
+        raise TypeError("cases must be a dict")
+    if not limits:
+        raise ValueError("limits must be a non-empty list")
+    if not cases:
+        raise ValueError("cases must be a non-empty dict")
+
+    alpha_value, _groups_spec, records = _panel_report_data(
+        reports, weights, alpha
+    )
+
+    overall_mean: dict[str, Decimal] = {}
+    min_stable: dict[str, Decimal] = {}
+    significant: dict[str, bool] = {}
+    for by, _group_key, candidate, _n, mean, _range, stable, _p, q in records:
+        if candidate not in min_stable or stable < min_stable[candidate]:
+            min_stable[candidate] = stable
+        if by == "overall":
+            overall_mean[candidate] = mean
+        reject = q <= alpha_value
+        if candidate in significant:
+            significant[candidate] = significant[candidate] and reject
+        else:
+            significant[candidate] = reject
+
+    candidates = sorted(overall_mean)
+    if set(cost) != set(candidates):
+        raise ValueError("cost keys must be exactly the candidate keys")
+    costs: dict[str, Decimal] = {}
+    for key in candidates:
+        cost_value = _portfolio_number(cost[key], "cost")
+        if cost_value <= 0:
+            raise ValueError("each cost must be positive")
+        costs[key] = cost_value
+
+    limit_values: list[Decimal] = []
+    seen_limits: set[Decimal] = set()
+    for limit in limits:
+        limit_value = _portfolio_number(limit, "limits")
+        if limit_value < 0:
+            raise ValueError("each limit must be non-negative")
+        if limit_value in seen_limits:
+            raise ValueError("limits must be distinct")
+        seen_limits.add(limit_value)
+        limit_values.append(limit_value)
+    limit_values.sort()
+
+    case_keys: list[str] = []
+    multipliers: dict[str, dict[str, Decimal]] = {}
+    for case_key, mapping in cases.items():
+        if not isinstance(case_key, str) or not case_key:
+            raise ValueError("each cases key must be a non-empty string")
+        if not isinstance(mapping, dict) or set(mapping) != set(candidates):
+            raise ValueError(
+                "each cases value must be a dict keyed by exactly the "
+                "candidate keys"
+            )
+        case_multipliers: dict[str, Decimal] = {}
+        for key in candidates:
+            multiplier = _portfolio_number(mapping[key], "multiplier")
+            if multiplier <= 0:
+                raise ValueError("each multiplier must be positive")
+            case_multipliers[key] = multiplier
+        case_keys.append(case_key)
+        multipliers[case_key] = case_multipliers
+    case_keys.sort()
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        scores = {
+            key: overall_mean[key] * min_stable[key] for key in candidates
+        }
+        sig_keys = [key for key in candidates if significant[key]]
+        sig_count = len(sig_keys)
+
+        # case key -> per-limit winning (score, cost, keys) triples
+        case_winners: dict[str, list[tuple[Decimal, Decimal, tuple[str, ...]]]] = {}
+        for case_key in case_keys:
+            case_costs = {
+                key: costs[key] * multipliers[case_key][key]
+                for key in sig_keys
+            }
+            subsets: list[tuple[Decimal, Decimal, tuple[str, ...]]] = []
+            for size in range(sig_count + 1):
+                for idxs in combinations(range(sig_count), size):
+                    total_cost = sum(
+                        (case_costs[sig_keys[i]] for i in idxs), Decimal(0)
+                    )
+                    total_score = sum(
+                        (scores[sig_keys[i]] for i in idxs), Decimal(0)
+                    )
+                    subsets.append(
+                        (total_score, total_cost, tuple(sig_keys[i] for i in idxs))
+                    )
+            winners: list[tuple[Decimal, Decimal, tuple[str, ...]]] = []
+            for limit_value in limit_values:
+                best: tuple[Decimal, Decimal, tuple[str, ...]] | None = None
+                for total_score, total_cost, chosen_keys in subsets:
+                    if total_cost > limit_value:
+                        continue
+                    if (
+                        best is None
+                        or total_score > best[0]
+                        or (
+                            total_score == best[0]
+                            and (
+                                total_cost < best[1]
+                                or (
+                                    total_cost == best[1]
+                                    and chosen_keys < best[2]
+                                )
+                            )
+                        )
+                    ):
+                        best = (total_score, total_cost, chosen_keys)
+                assert best is not None  # the empty subset is always feasible
+                winners.append(best)
+            case_winners[case_key] = winners
+
+        case_total = len(case_keys)
+        frontier_strings: list[str] = []
+        for limit_index, limit_value in enumerate(limit_values):
+            pick_counts: dict[tuple[str, ...], int] = {}
+            for case_key in case_keys:
+                pick = case_winners[case_key][limit_index][2]
+                pick_counts[pick] = pick_counts.get(pick, 0) + 1
+            stability = Decimal(max(pick_counts.values())) / Decimal(case_total)
+
+            case_strings: list[str] = []
+            for case_key in case_keys:
+                total_score, total_cost, chosen_keys = case_winners[case_key][
+                    limit_index
+                ]
+                if limit_index == 0:
+                    prev_score = Decimal(0)
+                    prev_pick: tuple[str, ...] = ()
+                else:
+                    previous = case_winners[case_key][limit_index - 1]
+                    prev_score = previous[0]
+                    prev_pick = previous[2]
+                chosen = set(chosen_keys)
+                previous_set = set(prev_pick)
+                added = sorted(chosen - previous_set)
+                removed = sorted(previous_set - chosen)
+                marginal = total_score - prev_score
+                switch = chosen_keys != prev_pick
+                case_strings.append(
+                    '{"key":' + json.dumps(case_key, ensure_ascii=False)
+                    + ',"cost":' + _format6(total_cost)
+                    + ',"score":' + _format6(total_score)
+                    + ',"marginal":' + _format6(marginal)
+                    + ',"pick":'
+                    + json.dumps(
+                        list(chosen_keys), ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + ',"added":'
+                    + json.dumps(added, ensure_ascii=False, separators=(",", ":"))
+                    + ',"removed":'
+                    + json.dumps(removed, ensure_ascii=False, separators=(",", ":"))
+                    + ',"switch":' + json.dumps(switch)
+                    + "}"
+                )
+            frontier_strings.append(
+                '{"limit":' + _format6(limit_value)
+                + ',"stability":' + _format6(stability)
+                + ',"cases":[' + ",".join(case_strings) + "]}"
+            )
 
     return (
         '{"alpha":' + _format6(alpha_value)
