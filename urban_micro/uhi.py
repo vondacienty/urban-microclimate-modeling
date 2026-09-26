@@ -8121,45 +8121,18 @@ def _scenario_decision_parse_constant(value: str) -> Decimal:
     )
 
 
-def scenario_decision(reports: dict, weights: dict) -> str:
-    """Combine per-panel scenario sensitivity reports into one decision.
+def _scenario_decision_load(reports: dict, weights: dict):
+    """Validate :func:`scenario_decision` inputs and parse every report.
 
-    ``reports`` must be a dict whose keys are ``(region, window)``
-    two-tuples of non-empty strings and whose values are
-    :func:`scenario_sensitivity` JSON outputs; passing a non-dict raises
-    ``TypeError`` and any other violation raises ``ValueError``. Every
-    report must rank the same set of at least two scenario keys, and a
-    scenario's ``kind`` and ``share`` must agree across all reports.
-    ``weights`` must be a dict with exactly the ``reports`` key set whose
-    values are positive finite non-boolean int/float weights; a non-dict
-    raises ``TypeError`` and any other violation raises ``ValueError``.
-
-    Within each panel the candidate is the scenario with the smallest
-    ``rank``; the panel recommends its candidate only when the candidate's
-    ``stable`` is true, every pair involving it has ``reject`` true, and
-    the pair ``diff`` is negative when the candidate is ``a`` and positive
-    when it is ``b``. With ``W`` the sum of all weights, each scenario's
-    ``score`` is the weight-weighted mean of its per-panel scores, its
-    ``support`` is the fraction of ``W`` held by panels recommending it,
-    and its ``stable`` is true only when it is stable in every panel.
-    Scenarios are ranked ascending by ``(score, key)`` with integer ranks
-    starting at 1. ``recommend`` is the first-ranked scenario's key only
-    when that scenario is stable and its support is exactly 1, and
-    ``null`` otherwise.
-
-    All numbers enter the computation as ``Decimal(str(x))`` (report
-    numbers are parsed straight from the JSON text) under a precision-1000,
-    ROUND_HALF_EVEN local context. Returns a compact UTF-8 JSON string
-    with no spaces and exactly one trailing newline; the top-level key
-    order is ``total_weight, recommend, ranks`` and each rank object uses
-    the key order ``key, kind, share, score, support, rank, stable``.
-    Ranks are in ascending ``(rank, key)`` order. ``rank`` renders as a
-    JSON integer, ``stable`` as a boolean and ``recommend`` as a JSON
-    string or null; every other number renders with exactly six decimals,
-    negative zero normalized to ``0.000000``. With no panels the only
-    valid input is ``reports={}`` and ``weights={}``, yielding
-    ``total_weight`` ``0.000000``, ``recommend`` ``null`` and an empty
-    ``ranks`` array.
+    Return ``(weight_values, panels, scenario_keys, kind_values,
+    share_values)`` where ``weight_values`` maps each ``(region, window)``
+    key to its ``Decimal`` weight, ``panels`` maps each key to
+    ``{"ranks": key -> (kind, share, score, rank, stable), "pairs":
+    [(a, b, diff, reject), ...]}`` and ``kind_values``/``share_values``
+    hold the cross-panel-agreed kind and share per scenario key. Return
+    ``None`` when both ``reports`` and ``weights`` are empty; a non-dict
+    argument raises ``TypeError`` and every other violation raises
+    ``ValueError``.
     """
     if not isinstance(reports, dict):
         raise TypeError("reports must be a dict")
@@ -8181,7 +8154,7 @@ def scenario_decision(reports: dict, weights: dict) -> str:
     if set(weights) != set(reports):
         raise ValueError("weights keys must be exactly the reports keys")
     if not reports:
-        return '{"total_weight":0.000000,"recommend":null,"ranks":[]}\n'
+        return None
 
     weight_values: dict[tuple[str, str], Decimal] = {}
     for panel_key, weight in weights.items():
@@ -8360,6 +8333,60 @@ def scenario_decision(reports: dict, weights: dict) -> str:
         kind_values[key] = first_kind
         share_values[key] = first_share
 
+    return weight_values, panels, scenario_keys, kind_values, share_values
+
+
+def scenario_decision(reports: dict, weights: dict) -> str:
+    """Combine per-panel scenario sensitivity reports into one decision.
+
+    ``reports`` must be a dict whose keys are ``(region, window)``
+    two-tuples of non-empty strings and whose values are
+    :func:`scenario_sensitivity` JSON outputs; passing a non-dict raises
+    ``TypeError`` and any other violation raises ``ValueError``. Every
+    report must rank the same set of at least two scenario keys, and a
+    scenario's ``kind`` and ``share`` must agree across all reports.
+    ``weights`` must be a dict with exactly the ``reports`` key set whose
+    values are positive finite non-boolean int/float weights; a non-dict
+    raises ``TypeError`` and any other violation raises ``ValueError``.
+
+    Within each panel the candidate is the scenario with the smallest
+    ``rank``; the panel recommends its candidate only when the candidate's
+    ``stable`` is true, every pair involving it has ``reject`` true, and
+    the pair ``diff`` is negative when the candidate is ``a`` and positive
+    when it is ``b``. With ``W`` the sum of all weights, each scenario's
+    ``score`` is the weight-weighted mean of its per-panel scores, its
+    ``support`` is the fraction of ``W`` held by panels recommending it,
+    and its ``stable`` is true only when it is stable in every panel.
+    Scenarios are ranked ascending by ``(score, key)`` with integer ranks
+    starting at 1. ``recommend`` is the first-ranked scenario's key only
+    when that scenario is stable and its support is exactly 1, and
+    ``null`` otherwise.
+
+    All numbers enter the computation as ``Decimal(str(x))`` (report
+    numbers are parsed straight from the JSON text) under a precision-1000,
+    ROUND_HALF_EVEN local context. Returns a compact UTF-8 JSON string
+    with no spaces and exactly one trailing newline; the top-level key
+    order is ``total_weight, recommend, ranks`` and each rank object uses
+    the key order ``key, kind, share, score, support, rank, stable``.
+    Ranks are in ascending ``(rank, key)`` order. ``rank`` renders as a
+    JSON integer, ``stable`` as a boolean and ``recommend`` as a JSON
+    string or null; every other number renders with exactly six decimals,
+    negative zero normalized to ``0.000000``. With no panels the only
+    valid input is ``reports={}`` and ``weights={}``, yielding
+    ``total_weight`` ``0.000000``, ``recommend`` ``null`` and an empty
+    ``ranks`` array.
+    """
+    loaded = _scenario_decision_load(reports, weights)
+    if loaded is None:
+        return '{"total_weight":0.000000,"recommend":null,"ranks":[]}\n'
+    (
+        weight_values,
+        panels,
+        scenario_keys,
+        kind_values,
+        share_values,
+    ) = loaded
+
     with localcontext() as ctx:
         ctx.prec = _MODEL_PRECISION
         ctx.rounding = ROUND_HALF_EVEN
@@ -8449,6 +8476,127 @@ def scenario_decision(reports: dict, weights: dict) -> str:
                 else "null"
             )
             + ',"ranks":[' + ",".join(rank_items) + ']}'
+            + "\n"
+        )
+
+
+def scenario_decision_attribution(reports: dict, weights: dict) -> str:
+    """Attribute the :func:`scenario_decision` outcome to individual panels.
+
+    Inputs, validation and ``Decimal`` arithmetic match
+    :func:`scenario_decision` exactly: ``reports`` is a dict of
+    ``(region, window)`` keys to :func:`scenario_sensitivity` JSON outputs
+    and ``weights`` a dict with the same key set of positive finite
+    non-boolean int/float weights; a non-dict raises ``TypeError`` and any
+    other violation raises ``ValueError``.
+
+    ``key`` is the key of the first-ranked scenario of the
+    :func:`scenario_decision` output (the smallest ``(score, key)``
+    scenario, where each score is the weight-weighted mean of its per-panel
+    scores). Each panel's ``candidate`` is its smallest ``(rank, key)``
+    scenario and ``reason`` is the first hit among: ``"unstable"`` when
+    the candidate's ``stable`` is false, ``"nonsignificant"`` when a pair
+    involving the candidate has ``reject`` false, ``"direction"`` when the
+    candidate is ``a`` of a pair with ``diff >= 0`` or ``b`` of one with
+    ``diff <= 0``, and ``"recommend"`` otherwise. ``decision`` equals the
+    candidate only for ``"recommend"`` panels and is null in every other
+    case. With ``W`` the sum of all weights, each panel's ``score`` is
+    ``weight * (the key's score in that panel) / W`` and ``support`` is
+    ``weight / W`` when the panel decides ``key`` and ``0`` otherwise.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is
+    ``total_weight, key, panels``. Panels are sorted ascending by
+    ``(region, window)`` and each panel object uses the key order
+    ``region, window, weight, candidate, decision, reason, score,
+    support``. ``region``, ``window``, ``candidate`` and ``decision``
+    render as JSON strings or null, ``reason`` as a JSON string, and
+    every number renders with exactly six decimals, negative zero
+    normalized to ``0.000000``. With ``reports={}`` and ``weights={}`` the
+    output is
+    ``{"total_weight":0.000000,"key":null,"panels":[]}\\n``.
+    """
+    loaded = _scenario_decision_load(reports, weights)
+    if loaded is None:
+        return '{"total_weight":0.000000,"key":null,"panels":[]}\n'
+    weight_values, panels, scenario_keys, _, _ = loaded
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        total_weight = Decimal(0)
+        for panel_key in panels:
+            total_weight += weight_values[panel_key]
+
+        # Each scenario's decision score is the weight-weighted mean of
+        # its per-panel scores; the key is the smallest (score, key).
+        scored: list[tuple[Decimal, str]] = []
+        for key in scenario_keys:
+            weighted_score = Decimal(0)
+            for panel_key in panels:
+                weighted_score += (
+                    weight_values[panel_key]
+                    * panels[panel_key]["ranks"][key][2]
+                )
+            scored.append((weighted_score / total_weight, key))
+        decision_key = min(scored)[1]
+
+        panel_items: list[str] = []
+        for panel_key in sorted(panels):
+            region, window = panel_key
+            weight = weight_values[panel_key]
+            rank_map = panels[panel_key]["ranks"]
+            candidate = min(
+                rank_map, key=lambda key: (rank_map[key][3], key)
+            )
+
+            reason = "recommend"
+            if not rank_map[candidate][4]:
+                reason = "unstable"
+            else:
+                for key_a, key_b, diff, reject in panels[panel_key]["pairs"]:
+                    if candidate != key_a and candidate != key_b:
+                        continue
+                    if not reject:
+                        reason = "nonsignificant"
+                        break
+                    if candidate == key_a and diff >= 0:
+                        reason = "direction"
+                        break
+                    if candidate == key_b and diff <= 0:
+                        reason = "direction"
+                        break
+
+            decision = candidate if reason == "recommend" else None
+            candidate_panel_score = rank_map[decision_key][2]
+            score = weight * candidate_panel_score / total_weight
+            support = (
+                weight / total_weight if decision == decision_key else Decimal(0)
+            )
+
+            panel_items.append(
+                '{"region":' + json.dumps(region, ensure_ascii=False)
+                + ',"window":' + json.dumps(window, ensure_ascii=False)
+                + ',"weight":' + _format6(weight)
+                + ',"candidate":'
+                + json.dumps(candidate, ensure_ascii=False)
+                + ',"decision":'
+                + (
+                    json.dumps(decision, ensure_ascii=False)
+                    if decision is not None
+                    else "null"
+                )
+                + ',"reason":' + json.dumps(reason, ensure_ascii=False)
+                + ',"score":' + _format6(score)
+                + ',"support":' + _format6(support)
+                + '}'
+            )
+
+        return (
+            '{"total_weight":' + _format6(total_weight)
+            + ',"key":' + json.dumps(decision_key, ensure_ascii=False)
+            + ',"panels":[' + ",".join(panel_items) + ']}'
             + "\n"
         )
 
