@@ -12076,11 +12076,12 @@ def _frontier_intervals_parse(
     return alpha, segments
 
 
-def _frontier_attribution_validate(
-    reports: dict, weights: dict, factors: dict
+def _frontier_reports_validate(
+    reports: dict, weights: dict
 ) -> tuple[list, dict, dict, set]:
-    """Validate the shared ``(reports, weights, factors)`` contract of
-    :func:`frontier_interval_attribution` and :func:`interval_sig`.
+    """Validate the shared ``(reports, weights)`` contract of
+    :func:`frontier_interval_attribution`, :func:`interval_sig` and
+    :func:`intervention_sig`.
 
     Returns ``(panel_keys, weight_values, parsed, common_cases)`` with
     ``panel_keys`` the sorted ``(region, window)`` pairs,
@@ -12093,8 +12094,6 @@ def _frontier_attribution_validate(
         raise TypeError("reports must be a dict")
     if not isinstance(weights, dict):
         raise TypeError("weights must be a dict")
-    if not isinstance(factors, dict):
-        raise TypeError("factors must be a dict")
     if len(reports) < 2:
         raise ValueError("reports must contain at least two entries")
 
@@ -12157,6 +12156,24 @@ def _frontier_attribution_validate(
             else:
                 common_cases &= set(gains)
     assert common_cases is not None  # reports is non-empty
+    return panel_keys, weight_values, parsed, common_cases
+
+
+def _frontier_attribution_validate(
+    reports: dict, weights: dict, factors: dict
+) -> tuple[list, dict, dict, set]:
+    """Validate the shared ``(reports, weights, factors)`` contract of
+    :func:`frontier_interval_attribution` and :func:`interval_sig`.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(factors, dict):
+        raise TypeError("factors must be a dict")
+    panel_keys, weight_values, parsed, common_cases = (
+        _frontier_reports_validate(reports, weights)
+    )
     if set(factors) != common_cases:
         raise ValueError(
             "factors keys must be exactly the case keys common to all "
@@ -12343,6 +12360,69 @@ def frontier_interval_attribution(
 _INTERVAL_SIG_MAX_N = 16
 _INTERVAL_SIG_Z = Decimal("1.96")
 _INTERVAL_SIG_CATEGORIES = ("weather", "cover", "morphology")
+_INTERVENTION_KINDS = ("green", "roof", "material")
+
+
+def _interval_sig_stats(
+    sample: list[tuple[Decimal, Decimal]],
+) -> tuple[int, Decimal, Decimal, Decimal, Decimal, Decimal]:
+    """Weighted mean, standard error, 1.96 interval and exact sign-flip
+    p-value for one sample of ``(x, weight)`` pairs.
+
+    Returns ``(n, mean, se, lower, upper, p)`` using the
+    :func:`interval_sig` definitions shared with
+    :func:`intervention_sig`: ``mu = sum(w * x) / W``, ``se`` is ``0``
+    for ``n <= 1`` and ``sqrt(sum(w * (x - mu) ** 2) / (n * W))``
+    otherwise, the interval is ``mu +/- 1.96 * se`` and ``p`` is the
+    share of the ``2 ** n`` sign assignments with
+    ``|sum(s_i * w_i * x_i) / W| >= |mu|``. An empty sample yields zeros
+    with ``p = 1``; a sample longer than ``_INTERVAL_SIG_MAX_N`` raises
+    ``ValueError``. Arithmetic uses the enclosing precision-1000,
+    ROUND_HALF_EVEN context.
+    """
+    n = len(sample)
+    if n > _INTERVAL_SIG_MAX_N:
+        raise ValueError("each sample must contain at most 16 entries")
+    if n == 0:
+        return n, Decimal(0), Decimal(0), Decimal(0), Decimal(0), Decimal(1)
+    total_weight = sum(
+        (weight for _x, weight in sample), Decimal(0)
+    )
+    mean = sum(
+        (weight * x for x, weight in sample), Decimal(0)
+    ) / total_weight
+    if n == 1:
+        se = Decimal(0)
+    else:
+        se = (
+            sum(
+                (
+                    weight * (x - mean) ** 2
+                    for x, weight in sample
+                ),
+                Decimal(0),
+            )
+            / (Decimal(n) * total_weight)
+        ).sqrt()
+    lower = mean - _INTERVAL_SIG_Z * se
+    upper = mean + _INTERVAL_SIG_Z * se
+    threshold = abs(mean)
+    flips = 0
+    for mask in range(1 << n):
+        statistic = sum(
+            (
+                weight * x
+                if mask >> position & 1
+                else -(weight * x)
+                for position, (x, weight)
+                in enumerate(sample)
+            ),
+            Decimal(0),
+        ) / total_weight
+        if abs(statistic) >= threshold:
+            flips += 1
+    p = Decimal(flips) / Decimal(1 << n)
+    return n, mean, se, lower, upper, p
 
 
 def interval_sig(
@@ -12476,52 +12556,7 @@ def interval_sig(
 
             items: list[dict] = []
             for k_order, (key, sample) in enumerate(samples):
-                n = len(sample)
-                if n > _INTERVAL_SIG_MAX_N:
-                    raise ValueError(
-                        "each sample must contain at most 16 entries"
-                    )
-                if n == 0:
-                    mean = lower = upper = Decimal(0)
-                    p = Decimal(1)
-                else:
-                    total_weight = sum(
-                        (weight for _x, weight in sample), Decimal(0)
-                    )
-                    mean = sum(
-                        (weight * x for x, weight in sample), Decimal(0)
-                    ) / total_weight
-                    if n == 1:
-                        se = Decimal(0)
-                    else:
-                        se = (
-                            sum(
-                                (
-                                    weight * (x - mean) ** 2
-                                    for x, weight in sample
-                                ),
-                                Decimal(0),
-                            )
-                            / (Decimal(n) * total_weight)
-                        ).sqrt()
-                    lower = mean - _INTERVAL_SIG_Z * se
-                    upper = mean + _INTERVAL_SIG_Z * se
-                    threshold = abs(mean)
-                    flips = 0
-                    for mask in range(1 << n):
-                        statistic = sum(
-                            (
-                                weight * x
-                                if mask >> position & 1
-                                else -(weight * x)
-                                for position, (x, weight)
-                                in enumerate(sample)
-                            ),
-                            Decimal(0),
-                        ) / total_weight
-                        if abs(statistic) >= threshold:
-                            flips += 1
-                    p = Decimal(flips) / Decimal(1 << n)
+                n, mean, _se, lower, upper, p = _interval_sig_stats(sample)
                 item = {
                     "key": key,
                     "n": n,
@@ -12569,6 +12604,183 @@ def interval_sig(
             '{"start":' + _format6(start)
             + ',"end":' + _format6(end)
             + ',"items":[' + ",".join(item_strings) + "]}"
+        )
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"intervals":[' + ",".join(interval_strings) + "]}\n"
+    )
+
+
+def intervention_sig(
+    reports: dict,
+    weights: dict,
+    kinds: dict,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Sign-flip significance intervals for per-group interventions.
+
+    ``reports`` and ``weights`` follow the
+    :func:`frontier_interval_attribution` contract and ``alpha`` follows
+    :func:`interval_sig`: it must be a finite non-boolean int/float in
+    ``(0, 1]``. ``kinds`` maps each case key shared by every interval of
+    every report to exactly one of ``"green"``, ``"roof"`` or
+    ``"material"``; its keys must be exactly that common case key set.
+    A non-dict ``reports``, ``weights`` or ``kinds`` raises
+    ``TypeError``; every other contract violation raises
+    ``ValueError``.
+
+    For each interval the three interventions are evaluated for every
+    ``region`` key and every ``window`` key. A group-kind sample holds
+    one ``(x, w)`` pair per panel belonging to the group that has at
+    least one case of that kind in the interval, panels without such a
+    case being skipped; ``x`` is the arithmetic mean of the panel's
+    member-case ``gain`` values and ``w`` is the panel weight. The
+    weighted mean and standard error, the ``mu +/- 1.96 * se`` interval,
+    the ``n <= 1`` zero-``se`` rule, the empty-sample rule, the
+    ``n > 16`` rejection and the exact sign-enumeration p-value are all
+    identical to :func:`interval_sig`.
+
+    The ``q`` values come from a Benjamini-Hochberg adjustment over all
+    items of all intervals sorted by ascending
+    ``(p, start, by, key, kind)`` with ``by`` ordered
+    ``region, window``; ``reject`` is ``q <= alpha`` on the unquantized
+    values. Within a group, items are ranked by rejecting status first
+    (rejections first), then descending mean, then ascending kind.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, intervals``,
+    each interval uses ``start, end, groups``, each group uses
+    ``by, key, items`` and each item uses
+    ``kind, n, mean, se, lower, upper, p, q, reject, rank``. Groups are
+    ordered ``region`` before ``window`` with ascending keys within each
+    and items follow their rank. ``n`` and ``rank`` are integers,
+    ``reject`` a boolean and every other number renders with six
+    decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(kinds, dict):
+        raise TypeError("kinds must be a dict")
+    panel_keys, weight_values, parsed, common_cases = (
+        _frontier_reports_validate(reports, weights)
+    )
+    if set(kinds) != common_cases:
+        raise ValueError(
+            "kinds keys must be exactly the case keys common to all "
+            "intervals"
+        )
+    for kind in kinds.values():
+        if kind not in _INTERVENTION_KINDS:
+            raise ValueError(
+                'each kinds value must be "green", "roof" or "material"'
+            )
+    alpha_value = _portfolio_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be in (0, 1]")
+
+    segment_count = len(parsed[panel_keys[0]][1])
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        intervals: list[tuple[Decimal, Decimal, list[tuple]]] = []
+        # (p, start, by_order, key, kind, item)
+        flat: list[tuple] = []
+        for index in range(segment_count):
+            start, end = parsed[panel_keys[0]][1][index][:2]
+
+            groups: list[tuple[int, str, str, list[dict]]] = []
+            for axis, by in enumerate(("region", "window")):
+                for key in sorted({panel[axis] for panel in panel_keys}):
+                    items: list[dict] = []
+                    for kind in _INTERVENTION_KINDS:
+                        sample: list[tuple[Decimal, Decimal]] = []
+                        for panel in panel_keys:
+                            if panel[axis] != key:
+                                continue
+                            member = [
+                                gain
+                                for case_key, gain
+                                in parsed[panel][1][index][3].items()
+                                if kinds.get(case_key) == kind
+                            ]
+                            if member:
+                                sample.append((
+                                    sum(member, Decimal(0))
+                                    / Decimal(len(member)),
+                                    weight_values[panel],
+                                ))
+                        n, mean, se, lower, upper, p = (
+                            _interval_sig_stats(sample)
+                        )
+                        item = {
+                            "kind": kind,
+                            "n": n,
+                            "mean": mean,
+                            "se": se,
+                            "lower": lower,
+                            "upper": upper,
+                            "p": p,
+                        }
+                        items.append(item)
+                        flat.append((p, start, axis, key, kind, item))
+                    groups.append((axis, by, key, items))
+            intervals.append((start, end, groups))
+
+        # Benjamini-Hochberg q values over all items of all intervals.
+        total = len(flat)
+        ordered = sorted(range(total), key=lambda i: flat[i][:5])
+        q_values: list[Decimal] = [Decimal(0)] * total
+        running: Decimal | None = None
+        for rank in range(total, 0, -1):
+            position = ordered[rank - 1]
+            candidate = Decimal(total) * flat[position][0] / Decimal(rank)
+            if running is None or candidate < running:
+                running = candidate
+            q_values[position] = running
+        for position in range(total):
+            item = flat[position][5]
+            item["q"] = q_values[position]
+            item["reject"] = q_values[position] <= alpha_value
+
+    interval_strings: list[str] = []
+    for start, end, groups in intervals:
+        group_strings: list[str] = []
+        for _axis, by, key, items in groups:
+            ranked = sorted(
+                items,
+                key=lambda item: (
+                    not item["reject"], -item["mean"], item["kind"]
+                ),
+            )
+            item_strings: list[str] = []
+            for rank, item in enumerate(ranked, 1):
+                item_strings.append(
+                    '{"kind":' + json.dumps(item["kind"], ensure_ascii=False)
+                    + ',"n":' + str(item["n"])
+                    + ',"mean":' + _format6(item["mean"])
+                    + ',"se":' + _format6(item["se"])
+                    + ',"lower":' + _format6(item["lower"])
+                    + ',"upper":' + _format6(item["upper"])
+                    + ',"p":' + _format6(item["p"])
+                    + ',"q":' + _format6(item["q"])
+                    + ',"reject":' + ("true" if item["reject"] else "false")
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+            group_strings.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_strings) + "]}"
+            )
+        interval_strings.append(
+            '{"start":' + _format6(start)
+            + ',"end":' + _format6(end)
+            + ',"groups":[' + ",".join(group_strings) + "]}"
         )
     return (
         '{"alpha":' + _format6(alpha_value)
