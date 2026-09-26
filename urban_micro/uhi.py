@@ -86,6 +86,7 @@ __all__ = [
     "frontier_sensitivity",
     "frontier_joint",
     "frontier_interval_attribution",
+    "interval_sig",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -12075,45 +12076,18 @@ def _frontier_intervals_parse(
     return alpha, segments
 
 
-def frontier_interval_attribution(
-    reports: dict,
-    weights: dict,
-    factors: dict,
-) -> str:
-    """Attribute merged frontier intervals to regions, windows and factors.
+def _frontier_attribution_validate(
+    reports: dict, weights: dict, factors: dict
+) -> tuple[list, dict, dict, set]:
+    """Validate the shared ``(reports, weights, factors)`` contract of
+    :func:`frontier_interval_attribution` and :func:`interval_sig`.
 
-    ``reports`` maps a ``(region, window)`` pair of non-empty strings to
-    a canonical :func:`frontier_joint_intervals` JSON output and must
-    contain at least two entries; ``weights`` maps the same keys to
-    positive finite non-boolean int/float weights; ``factors`` maps each
-    case key shared by every interval of every report to exactly one of
-    ``"weather"``, ``"cover"`` or ``"morphology"``. A non-dict
-    ``reports``, ``weights`` or ``factors`` raises ``TypeError``; every
-    other contract violation raises ``ValueError``. Every report must
-    share the same ``alpha``, the same number of intervals and, at each
-    interval position, the same ``start``, ``end`` and case key set.
-
-    For each interval ``W`` is the total weight and each report's
-    ``m_p`` is the mean of its case ``gain`` values. The interval's
-    ``pick`` is the report pick with the largest summed weight, ties
-    broken by the lexicographically smaller pick, and ``consistency``
-    is that summed weight divided by ``W``. ``region`` and ``window``
-    are the keys whose group of reports has the smallest
-    weight-weighted mean of ``m_p``, ties broken by the smaller key.
-    For each factor category ``f`` with a non-empty member set the value
-    is the sum over reports and member cases of ``weight * gain``
-    divided by ``W * |f|``; an empty category yields ``0``. All
-    arithmetic is ``Decimal(str(x))`` under a precision-1000,
-    ROUND_HALF_EVEN context and comparisons use the unquantized values.
-
-    Returns a compact UTF-8 JSON string with no spaces and exactly one
-    trailing newline; the top-level key order is ``alpha, intervals``.
-    Each interval uses the key order ``start, end, pick, consistency,
-    region, window, factors`` and each ``factors`` object the key order
-    ``weather, cover, morphology``; intervals are sorted by ascending
-    ``start``. ``pick`` is an ascending string array, ``region`` and
-    ``window`` are strings and every numeric value renders with six
-    decimals, negative zero normalized to ``0.000000``.
+    Returns ``(panel_keys, weight_values, parsed, common_cases)`` with
+    ``panel_keys`` the sorted ``(region, window)`` pairs,
+    ``weight_values`` the positive ``Decimal`` weight per panel,
+    ``parsed`` the :func:`_frontier_intervals_parse` result per panel
+    and ``common_cases`` the case keys shared by every interval of every
+    report.
     """
     if not isinstance(reports, dict):
         raise TypeError("reports must be a dict")
@@ -12194,6 +12168,54 @@ def frontier_interval_attribution(
                 'each factors value must be "weather", "cover" or '
                 '"morphology"'
             )
+    return panel_keys, weight_values, parsed, common_cases
+
+
+def frontier_interval_attribution(
+    reports: dict,
+    weights: dict,
+    factors: dict,
+) -> str:
+    """Attribute merged frontier intervals to regions, windows and factors.
+
+    ``reports`` maps a ``(region, window)`` pair of non-empty strings to
+    a canonical :func:`frontier_joint_intervals` JSON output and must
+    contain at least two entries; ``weights`` maps the same keys to
+    positive finite non-boolean int/float weights; ``factors`` maps each
+    case key shared by every interval of every report to exactly one of
+    ``"weather"``, ``"cover"`` or ``"morphology"``. A non-dict
+    ``reports``, ``weights`` or ``factors`` raises ``TypeError``; every
+    other contract violation raises ``ValueError``. Every report must
+    share the same ``alpha``, the same number of intervals and, at each
+    interval position, the same ``start``, ``end`` and case key set.
+
+    For each interval ``W`` is the total weight and each report's
+    ``m_p`` is the mean of its case ``gain`` values. The interval's
+    ``pick`` is the report pick with the largest summed weight, ties
+    broken by the lexicographically smaller pick, and ``consistency``
+    is that summed weight divided by ``W``. ``region`` and ``window``
+    are the keys whose group of reports has the smallest
+    weight-weighted mean of ``m_p``, ties broken by the smaller key.
+    For each factor category ``f`` with a non-empty member set the value
+    is the sum over reports and member cases of ``weight * gain``
+    divided by ``W * |f|``; an empty category yields ``0``. All
+    arithmetic is ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context and comparisons use the unquantized values.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, intervals``.
+    Each interval uses the key order ``start, end, pick, consistency,
+    region, window, factors`` and each ``factors`` object the key order
+    ``weather, cover, morphology``; intervals are sorted by ascending
+    ``start``. ``pick`` is an ascending string array, ``region`` and
+    ``window`` are strings and every numeric value renders with six
+    decimals, negative zero normalized to ``0.000000``.
+    """
+    panel_keys, weight_values, parsed, common_cases = (
+        _frontier_attribution_validate(reports, weights, factors)
+    )
+    alpha_value, reference_segments = parsed[panel_keys[0]]
+    segment_count = len(reference_segments)
     category_counts = {"weather": 0, "cover": 0, "morphology": 0}
     for case_key in common_cases:
         category_counts[factors[case_key]] += 1
@@ -12312,6 +12334,242 @@ def frontier_interval_attribution(
                 + "}}"
             )
 
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"intervals":[' + ",".join(interval_strings) + "]}\n"
+    )
+
+
+_INTERVAL_SIG_MAX_N = 16
+_INTERVAL_SIG_Z = Decimal("1.96")
+_INTERVAL_SIG_CATEGORIES = ("weather", "cover", "morphology")
+
+
+def interval_sig(
+    reports: dict,
+    weights: dict,
+    factors: dict,
+    *,
+    alpha: float = 0.05,
+) -> str:
+    """Sign-flip significance intervals for merged frontier attributions.
+
+    ``reports``, ``weights`` and ``factors`` follow the
+    :func:`frontier_interval_attribution` contract. ``alpha`` must be a
+    finite non-boolean int/float in ``(0, 1]``; every contract violation
+    raises ``ValueError`` (a non-dict ``reports``, ``weights`` or
+    ``factors`` raises ``TypeError``).
+
+    For each interval a panel's ``m`` is the mean of its case ``gain``
+    values. The ``region`` (``window``) sample holds the ``(m, weight)``
+    pairs of the panels belonging to the region (window) key whose group
+    has the smallest weight-weighted mean of ``m``, ties broken by the
+    smaller key. Each factor category sample holds one ``(x, weight)``
+    pair per panel with at least one member case, ``x`` the mean of that
+    panel's member-case gains; a category with no member case anywhere
+    yields an empty sample.
+
+    For a sample of ``n`` pairs, ``W`` is the summed weight,
+    ``mu = sum(w * x) / W``, ``se`` is ``0`` when ``n <= 1`` and
+    ``sqrt(sum(w * (x - mu) ** 2) / (n * W))`` otherwise, and the
+    interval is ``mu +/- 1.96 * se``; an ``n`` above 16 raises
+    ``ValueError``. ``p`` is the exact sign-flip p-value: the share of
+    the ``2 ** n`` sign assignments ``s`` in ``{-1, 1} ** n`` with
+    ``|sum(s_i * w_i * x_i) / W| >= |mu|``, compared on the unquantized
+    values. An empty sample yields ``mu = se = lower = upper = 0`` and
+    ``p = 1``.
+
+    The ``q`` values come from a Benjamini-Hochberg adjustment over all
+    items of all intervals sorted by ascending ``(p, start, k)`` with
+    ``k`` ordered ``region, window, weather, cover, morphology``;
+    ``reject`` is ``q <= alpha`` on the unquantized values. All
+    arithmetic is ``Decimal(str(x))`` under a precision-1000,
+    ROUND_HALF_EVEN context.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, intervals``,
+    each interval uses ``start, end, items`` and each item uses
+    ``key, n, mean, lower, upper, p, q, reject``. Intervals are sorted
+    by ascending ``start`` and items follow the ``k`` order above, the
+    ``region``/``window`` item keys being the weakest keys and the
+    factor item keys the category names. ``n`` is an integer, ``reject``
+    a boolean and every other number renders with six decimals, negative
+    zero normalized to ``0.000000``.
+    """
+    panel_keys, weight_values, parsed, common_cases = (
+        _frontier_attribution_validate(reports, weights, factors)
+    )
+    alpha_value = _portfolio_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be in (0, 1]")
+
+    case_categories = {
+        case_key: factors[case_key] for case_key in common_cases
+    }
+    segment_count = len(parsed[panel_keys[0]][1])
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        intervals: list[tuple[Decimal, Decimal, list[dict]]] = []
+        flat: list[tuple[Decimal, Decimal, int, dict]] = []
+        for index in range(segment_count):
+            start, end = parsed[panel_keys[0]][1][index][:2]
+
+            panel_means: dict[tuple[str, str], Decimal] = {}
+            for panel in panel_keys:
+                gains = parsed[panel][1][index][3]
+                panel_means[panel] = sum(
+                    gains.values(), Decimal(0)
+                ) / Decimal(len(gains))
+
+            samples: list[tuple[str, list[tuple[Decimal, Decimal]]]] = []
+            for axis in (0, 1):
+                group_sums: dict[str, Decimal] = {}
+                group_weights: dict[str, Decimal] = {}
+                for panel in panel_keys:
+                    key = panel[axis]
+                    weight = weight_values[panel]
+                    group_sums[key] = (
+                        group_sums.get(key, Decimal(0))
+                        + weight * panel_means[panel]
+                    )
+                    group_weights[key] = (
+                        group_weights.get(key, Decimal(0)) + weight
+                    )
+                weakest: str | None = None
+                weakest_mean: Decimal | None = None
+                for key in group_sums:
+                    group_mean = group_sums[key] / group_weights[key]
+                    if (
+                        weakest_mean is None
+                        or group_mean < weakest_mean
+                        or (group_mean == weakest_mean and key < weakest)
+                    ):
+                        weakest = key
+                        weakest_mean = group_mean
+                assert weakest is not None  # reports is non-empty
+                samples.append((
+                    weakest,
+                    [
+                        (panel_means[panel], weight_values[panel])
+                        for panel in panel_keys
+                        if panel[axis] == weakest
+                    ],
+                ))
+            for category in _INTERVAL_SIG_CATEGORIES:
+                category_sample: list[tuple[Decimal, Decimal]] = []
+                for panel in panel_keys:
+                    member = [
+                        gain
+                        for case_key, gain
+                        in parsed[panel][1][index][3].items()
+                        if case_categories.get(case_key) == category
+                    ]
+                    if member:
+                        category_sample.append((
+                            sum(member, Decimal(0)) / Decimal(len(member)),
+                            weight_values[panel],
+                        ))
+                samples.append((category, category_sample))
+
+            items: list[dict] = []
+            for k_order, (key, sample) in enumerate(samples):
+                n = len(sample)
+                if n > _INTERVAL_SIG_MAX_N:
+                    raise ValueError(
+                        "each sample must contain at most 16 entries"
+                    )
+                if n == 0:
+                    mean = lower = upper = Decimal(0)
+                    p = Decimal(1)
+                else:
+                    total_weight = sum(
+                        (weight for _x, weight in sample), Decimal(0)
+                    )
+                    mean = sum(
+                        (weight * x for x, weight in sample), Decimal(0)
+                    ) / total_weight
+                    if n == 1:
+                        se = Decimal(0)
+                    else:
+                        se = (
+                            sum(
+                                (
+                                    weight * (x - mean) ** 2
+                                    for x, weight in sample
+                                ),
+                                Decimal(0),
+                            )
+                            / (Decimal(n) * total_weight)
+                        ).sqrt()
+                    lower = mean - _INTERVAL_SIG_Z * se
+                    upper = mean + _INTERVAL_SIG_Z * se
+                    threshold = abs(mean)
+                    flips = 0
+                    for mask in range(1 << n):
+                        statistic = sum(
+                            (
+                                weight * x
+                                if mask >> position & 1
+                                else -(weight * x)
+                                for position, (x, weight)
+                                in enumerate(sample)
+                            ),
+                            Decimal(0),
+                        ) / total_weight
+                        if abs(statistic) >= threshold:
+                            flips += 1
+                    p = Decimal(flips) / Decimal(1 << n)
+                item = {
+                    "key": key,
+                    "n": n,
+                    "mean": mean,
+                    "lower": lower,
+                    "upper": upper,
+                    "p": p,
+                }
+                items.append(item)
+                flat.append((p, start, k_order, item))
+            intervals.append((start, end, items))
+
+        # Benjamini-Hochberg q values over all items of all intervals.
+        total = len(flat)
+        ordered = sorted(range(total), key=lambda i: flat[i][:3])
+        q_values: list[Decimal] = [Decimal(0)] * total
+        running: Decimal | None = None
+        for rank in range(total, 0, -1):
+            position = ordered[rank - 1]
+            candidate = Decimal(total) * flat[position][0] / Decimal(rank)
+            if running is None or candidate < running:
+                running = candidate
+            q_values[position] = running
+        for position in range(total):
+            item = flat[position][3]
+            item["q"] = q_values[position]
+            item["reject"] = q_values[position] <= alpha_value
+
+    interval_strings: list[str] = []
+    for start, end, items in intervals:
+        item_strings = []
+        for item in items:
+            item_strings.append(
+                '{"key":' + json.dumps(item["key"], ensure_ascii=False)
+                + ',"n":' + str(item["n"])
+                + ',"mean":' + _format6(item["mean"])
+                + ',"lower":' + _format6(item["lower"])
+                + ',"upper":' + _format6(item["upper"])
+                + ',"p":' + _format6(item["p"])
+                + ',"q":' + _format6(item["q"])
+                + ',"reject":' + ("true" if item["reject"] else "false")
+                + "}"
+            )
+        interval_strings.append(
+            '{"start":' + _format6(start)
+            + ',"end":' + _format6(end)
+            + ',"items":[' + ",".join(item_strings) + "]}"
+        )
     return (
         '{"alpha":' + _format6(alpha_value)
         + ',"intervals":[' + ",".join(interval_strings) + "]}\n"
