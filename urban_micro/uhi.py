@@ -13980,7 +13980,16 @@ def frontier_mix_rank_report(
     renders with six decimals, negative zero normalized to
     ``0.000000``.
     """
-    case_keys, weight_values, parsed, budgets, _panel_keys = (
+    return _frontier_mix_rank_core(frontiers, weights, alpha, False)
+
+
+def _frontier_mix_rank_core(
+    frontiers: dict, weights: dict, alpha: float, attribution: bool
+) -> str:
+    """Shared implementation of :func:`frontier_mix_rank_report` and
+    :func:`frontier_rank_attribution`; ``attribution`` selects whether
+    each rank entry gains the ``driver`` and ``panels`` keys."""
+    case_keys, weight_values, parsed, budgets, panel_keys = (
         _frontier_mix_inputs(frontiers, weights)
     )
     alpha_value = _validate_finite_number(alpha, "alpha")
@@ -14028,6 +14037,46 @@ def frontier_mix_rank_report(
             groups = _groups(index, case_keys)
             ranking = _ranking(groups, total_weight)
 
+            panel_data: list[tuple] = []
+            if attribution:
+                # Per (by, key) panel: each pick group's in-group
+                # weighted panel effect and the panel rank of the pick.
+                members: dict[tuple[str, ...], list[str]] = {}
+                for key in case_keys:
+                    members.setdefault(
+                        parsed[key][1][index][3], []
+                    ).append(key)
+                for panel in panel_keys:
+                    panel_effects: dict[tuple[str, ...], Decimal] = {}
+                    for pick, keys in members.items():
+                        panel_effects[pick] = sum(
+                            (
+                                weight_values[key]
+                                * parsed[key][1][index][4][panel]
+                                for key in keys
+                            ),
+                            Decimal(0),
+                        ) / groups[pick][1]
+                    panel_ranking = sorted(
+                        panel_effects,
+                        key=lambda pick: (
+                            -(groups[pick][1] / total_weight),
+                            -panel_effects[pick],
+                            pick,
+                        ),
+                    )
+                    panel_data.append(
+                        (
+                            panel,
+                            panel_effects,
+                            {
+                                pick: position
+                                for position, pick in
+                                enumerate(panel_ranking, start=1)
+                            },
+                        )
+                    )
+
             rank_strings: list[str] = []
             for rank, pick in enumerate(ranking, start=1):
                 n, weight_sum, effect_sum = groups[pick]
@@ -14043,7 +14092,7 @@ def frontier_mix_rank_report(
                     if sub_ranking.index(pick) + 1 != rank:
                         stable = False
                         break
-                rank_strings.append(
+                rank_string = (
                     '{"pick":'
                     + json.dumps(
                         list(pick), ensure_ascii=False,
@@ -14054,8 +14103,52 @@ def frontier_mix_rank_report(
                     + ',"effect":' + _format6(effect_sum / weight_sum)
                     + ',"rank":' + str(rank)
                     + ',"stable":' + ("true" if stable else "false")
-                    + "}"
                 )
+                if attribution:
+                    global_effect = effect_sum / weight_sum
+                    panel_strings: list[str] = []
+                    driver: tuple | None = None
+                    for (by, panel_key), panel_effects, panel_ranks in (
+                        panel_data
+                    ):
+                        panel_effect = panel_effects[pick]
+                        panel_rank = panel_ranks[pick]
+                        delta = panel_rank - rank
+                        if delta < 0:
+                            direction = "rise"
+                        elif delta > 0:
+                            direction = "fall"
+                        else:
+                            direction = "same"
+                        contribution = panel_effect - global_effect
+                        panel_strings.append(
+                            '{"by":' + json.dumps(by, ensure_ascii=False)
+                            + ',"key":'
+                            + json.dumps(panel_key, ensure_ascii=False)
+                            + ',"effect":' + _format6(panel_effect)
+                            + ',"rank":' + str(panel_rank)
+                            + ',"delta":' + str(delta)
+                            + ',"direction":' + json.dumps(direction)
+                            + ',"contribution":' + _format6(contribution)
+                            + "}"
+                        )
+                        driver_key = (
+                            -abs(delta),
+                            -abs(contribution),
+                            0 if by == "region" else 1,
+                            panel_key,
+                        )
+                        if driver is None or driver_key < driver[0]:
+                            driver = (driver_key, by, panel_key)
+                    assert driver is not None
+                    rank_string += (
+                        ',"driver":{"by":'
+                        + json.dumps(driver[1], ensure_ascii=False)
+                        + ',"key":'
+                        + json.dumps(driver[2], ensure_ascii=False)
+                        + '},"panels":[' + ",".join(panel_strings) + "]"
+                    )
+                rank_strings.append(rank_string + "}")
 
             pairs: list[tuple] = []
             for a, b in combinations(sorted(groups), 2):
@@ -14160,6 +14253,48 @@ def frontier_mix_rank_report(
         '{"alpha":' + _format6(alpha_value)
         + ',"points":[' + ",".join(rendered_points) + "]}\n"
     )
+
+
+def frontier_rank_attribution(
+    frontiers: dict, weights: dict, *, alpha: float = 0.05
+) -> str:
+    """Attribute each ranked pick's position to the ``(by, key)`` panels.
+
+    ``frontiers``, ``weights`` and ``alpha`` follow the
+    :func:`frontier_mix_rank_report` contract exactly: a non-dict
+    argument raises ``TypeError`` and every other violation raises
+    ``ValueError``. The global pick groups, their ``support``,
+    ``effect``, ``rank`` and ``stable`` values and every ``tests``
+    entry are computed exactly as in :func:`frontier_mix_rank_report`.
+
+    Additionally, each budget's pick group is scored inside every
+    ``(by, key)`` panel: the panel ``effect`` is ``Σ(w·e)/Σw`` over the
+    group's scenarios with ``e`` the scenario's panel effect, and the
+    panel ``rank`` re-ranks the budget's picks by descending
+    ``support`` (the pick's weight share ``Σw/W``), then descending
+    panel ``effect``, then ascending pick. A panel's ``delta`` is
+    ``panel rank − global rank`` with ``direction`` ``"rise"``,
+    ``"fall"`` or ``"same"`` for a negative, positive or zero delta,
+    and ``contribution`` is ``panel effect − global effect``. The
+    rank's ``driver`` is the panel with the largest ``|delta|``, ties
+    broken by descending ``|contribution|``, region panels before
+    window panels and ascending key.
+
+    Numbers enter as ``Decimal(str(x))`` and every comparison uses the
+    unquantized values under a precision-1000, ROUND_HALF_EVEN context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, points`` and
+    each point uses the key order ``budget, ranks, tests`` with ranks
+    using ``pick, n, support, effect, rank, stable, driver, panels``
+    and tests using ``a, b, n_a, n_b, diff, p, q, reject``. ``driver``
+    uses the key order ``by, key`` and each panel uses ``by, key,
+    effect, rank, delta, direction, contribution``; panels are ordered
+    region panels before window panels and ascending key within each.
+    ``rank`` and ``delta`` are integers, ``direction`` a string and
+    every other number renders with six decimals, negative zero
+    normalized to ``0.000000``.
+    """
+    return _frontier_mix_rank_core(frontiers, weights, alpha, True)
 
 
 _TEMPORAL_LAG_MAX_N = 8
