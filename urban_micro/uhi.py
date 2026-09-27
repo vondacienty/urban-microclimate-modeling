@@ -91,6 +91,7 @@ __all__ = [
     "hotspot_plan",
     "hotspot_plan_impact",
     "hotspot_summary",
+    "hotspot_kind_summary",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -16405,6 +16406,207 @@ def hotspot_summary(report: str, weights: dict) -> str:
             + ',"q":' + _format6(q)
             + ',"reject":' + ("true" if reject else "false")
             + "}"
+        )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_HOTSPOT_KIND_SUMMARY_ERROR = "report must be a hotspot_plan JSON output"
+_HOTSPOT_KIND_SUMMARY_MAX_PANELS = 16
+
+
+def hotspot_kind_summary(report: str, effects: dict, weights: dict) -> str:
+    """Aggregate a :func:`hotspot_plan` report along its two dimensions
+    and intervention kinds and run a sign-flip test per ``(by, kind)``.
+
+    ``report`` must be a byte-for-byte :func:`hotspot_plan` JSON output.
+    ``effects`` is keyed by every selected panel/pick triple
+    ``(by, key, pick)`` with ``pick`` the panel's chosen pick tuple; its
+    values are finite non-boolean numbers. ``weights`` is keyed by every
+    ``(by, key)`` panel tuple in the report with positive finite
+    non-boolean values. A non-string ``report`` or a non-dict ``effects``
+    or ``weights`` raises ``TypeError``; every other violation, or a
+    single ``by`` dimension spanning more than 16 panels, raises
+    ``ValueError``. An empty report is valid only with
+    ``effects == weights == {}``.
+
+    Each selected pick holding ``k`` kinds allocates ``effect / k`` to
+    every one of its kinds (the ``k`` shares summing back to the effect);
+    equal kinds within a panel sum their shares into that panel's value
+    ``v``. Panels carrying a kind are summarized within that
+    ``(by, kind)`` cell. With ``W`` the cell's total weight,
+    ``change = sum(w_i * v_i) / W`` over the cell's panels with weighted
+    contributions ``v_i``; all ``2**n`` sign vectors
+    ``(s_1, ..., s_n)`` with ``s_i in {-1, 1}`` are enumerated and ``p``
+    is the proportion for which
+    ``|sum(s_i * w_i * v_i / W)| >= |change|``. Items sort by ascending
+    ``p`` (the BH order) with ``region`` before ``window`` on ties, then
+    ascending ``kind``. Applying Benjamini-Hochberg across the ``N``
+    tested items in that order,
+    ``q_j = min(1, min_{l >= j}(N * p_l / l))`` and an item
+    ``reject``s when ``q`` is no greater than the report's ``alpha``.
+
+    Numbers enter as ``Decimal(str(x))`` and every weighted sum, sign sum
+    and statistic runs under a precision-1000, ROUND_HALF_EVEN local
+    context; comparisons use the unquantized values. Returns a compact
+    UTF-8 JSON string with no spaces and exactly one trailing newline;
+    the top-level key order is ``alpha, groups``, each group uses
+    ``by, items`` and each item uses ``kind, n, change, p, q, reject``.
+    Groups sort by ascending ``by`` and items by ascending ``kind``;
+    ``n`` renders as an integer and ``reject`` as a boolean while every
+    other number renders with six decimals, negative zero normalized to
+    ``0.000000``. ``by`` dimensions without a tested kind are omitted, so
+    a report without items yields ``groups`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(effects, dict):
+        raise TypeError("effects must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    alpha, groups = _hotspot_plan_parse(report)
+
+    panel_keys = [(by, key) for by, key, *_ in groups]
+    if set(weights) != set(panel_keys):
+        raise ValueError(
+            "weights keys must be every report (by, key) panel tuple"
+        )
+    selected = {
+        (by, key, pick)
+        for by, key, _, _, picks, _ in groups
+        for pick in picks
+    }
+    if set(effects) != selected:
+        raise ValueError(
+            "effects keys must be every selected (by, key, pick) triple"
+        )
+
+    panel_weights: dict[tuple[str, str], Decimal] = {}
+    for panel in panel_keys:
+        number = _validate_finite_number(weights[panel], "weights")
+        if number <= 0:
+            raise ValueError("weights values must be positive")
+        panel_weights[panel] = number
+    panel_effects: dict[tuple[str, str, tuple[str, ...]], Decimal] = {
+        triple: _validate_finite_number(value, "effects")
+        for triple, value in effects.items()
+    }
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        dimensions: dict[str, list[tuple[str, Decimal]]] = {
+            "region": [],
+            "window": [],
+        }
+        for by, key, _, _, picks, _ in groups:
+            weight = panel_weights[(by, key)]
+            # A pick with k kinds allocates effect/k to each kind (the k
+            # shares summing back to the effect); equal kinds within a
+            # panel then sum their shares into v.
+            kind_values: dict[str, Decimal] = {}
+            for pick in picks:
+                share = panel_effects[(by, key, pick)] / Decimal(len(pick))
+                for kind in pick:
+                    kind_values[kind] = (
+                        kind_values.get(kind, Decimal(0)) + share
+                    )
+            for kind, value in kind_values.items():
+                dimensions[by].append((key, kind, weight, value))
+
+        # by -> kind -> list of (weight, value) panels carrying the kind.
+        cells: dict[str, dict[str, list[tuple[Decimal, Decimal]]]] = {
+            by: {} for by in dimensions
+        }
+        for by, panels_in in dimensions.items():
+            for _key, kind, weight, value in panels_in:
+                cells[by].setdefault(kind, []).append((weight, value))
+
+        items: list[tuple[str, str, int, Decimal, Decimal]] = []
+        for by in ("region", "window"):
+            for kind in sorted(cells[by]):
+                panels_in = cells[by][kind]
+                n = len(panels_in)
+                if n > _HOTSPOT_KIND_SUMMARY_MAX_PANELS:
+                    raise ValueError(
+                        "a single by dimension may hold at most "
+                        f"{_HOTSPOT_KIND_SUMMARY_MAX_PANELS} panels"
+                    )
+                total_weight = sum(
+                    (weight for weight, _ in panels_in), Decimal(0)
+                )
+                # Per-panel weighted contributions w_i * v_i / W; the
+                # observed change is their all-plus sum, so that sign
+                # vector reaches the threshold exactly.
+                contributions = [
+                    weight * value / total_weight
+                    for weight, value in panels_in
+                ]
+                change = sum(contributions, Decimal(0))
+                observed_abs = abs(change)
+                tail = 0
+                for mask in range(1 << n):
+                    statistic = Decimal(0)
+                    for index, contribution in enumerate(contributions):
+                        if (mask >> index) & 1:
+                            statistic += contribution
+                        else:
+                            statistic -= contribution
+                    if abs(statistic) >= observed_abs:
+                        tail += 1
+                p = Decimal(tail) / Decimal(1 << n)
+                items.append((by, kind, n, change, p))
+
+    # Order by ascending p for the BH step-up; region precedes window on
+    # ties and then the kind sorts ascending.
+    items.sort(
+        key=lambda item: (
+            item[4],
+            0 if item[0] == "region" else 1,
+            item[1],
+        )
+    )
+    tested = len(items)
+
+    # Benjamini-Hochberg: q_j = min(1, min_{l >= j} N*p_l/l) with ranks
+    # taken in the sorted order (1-based).
+    q_values: list[Decimal] = [Decimal(0)] * tested
+    running = Decimal(1)
+    for rank in range(tested, 0, -1):
+        candidate = Decimal(tested) * items[rank - 1][4] / Decimal(rank)
+        if candidate < running:
+            running = candidate
+        q_values[rank - 1] = min(Decimal(1), running)
+
+    # Render groups/items by ascending by/kind while keeping each item's
+    # BH q alongside it.
+    rendered: dict[tuple[str, str], str] = {}
+    for index, (by, kind, n, change, p) in enumerate(items):
+        q = q_values[index]
+        reject = q <= alpha
+        rendered[(by, kind)] = (
+            '{"kind":' + json.dumps(kind, ensure_ascii=False)
+            + ',"n":' + str(n)
+            + ',"change":' + _format6(change)
+            + ',"p":' + _format6(p)
+            + ',"q":' + _format6(q)
+            + ',"reject":' + ("true" if reject else "false")
+            + "}"
+        )
+
+    group_tokens: list[str] = []
+    for by in ("region", "window"):
+        kinds = sorted(cells[by])
+        if not kinds:
+            continue
+        item_tokens = [rendered[(by, kind)] for kind in kinds]
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
         )
 
     return (
