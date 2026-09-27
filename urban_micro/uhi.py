@@ -14297,6 +14297,603 @@ def frontier_rank_attribution(
     return _frontier_mix_rank_core(frontiers, weights, alpha, True)
 
 
+_RANK_TRAJECTORY_ERROR = (
+    "report must be a frontier_rank_attribution JSON output"
+)
+
+
+class _RankTrajectoryNumber(Decimal):
+    """Marker for a canonical fixed-six-decimal number token."""
+
+
+def _rank_trajectory_parse_int(value: str) -> int:
+    return int(value)
+
+
+def _rank_trajectory_parse_constant(value: str) -> Decimal:
+    raise ValueError(_RANK_TRAJECTORY_ERROR)
+
+
+def _frontier_rank_attribution_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[
+        tuple[
+            Decimal,
+            dict[tuple[str, ...], tuple[int, tuple[str, str]]],
+            dict[tuple[tuple[str, ...], tuple[str, ...]], bool],
+        ]
+    ],
+]:
+    """Parse one :func:`frontier_rank_attribution` JSON output.
+
+    Returns ``(alpha, points)`` with points in ascending budget order;
+    each point holds ``(budget, picks, tests)`` where ``picks`` maps a
+    pick tuple to ``(rank, driver)`` with ``driver`` the winning
+    ``(by, key)`` panel, and ``tests`` maps each ``(a, b)`` pair to its
+    ``reject`` flag. The input must be byte-for-byte identical to a
+    canonical output (key order, escaping, spacing, point, rank, panel
+    and test order, rank and panel ordering and the six-decimal number
+    tokens included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_RANK_TRAJECTORY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_RANK_TRAJECTORY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_RANK_TRAJECTORY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_RANK_TRAJECTORY_ERROR)
+        return number
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_rank_trajectory_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_RANK_TRAJECTORY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "points"}:
+        raise ValueError(_RANK_TRAJECTORY_ERROR)
+    alpha = data["alpha"]
+    raw_points = data["points"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_points, list)
+        or not raw_points
+    ):
+        raise ValueError(_RANK_TRAJECTORY_ERROR)
+
+    def _as_pick(value: object) -> tuple[str, ...]:
+        if not isinstance(value, list) or any(
+            not isinstance(kind, str) or not kind for kind in value
+        ):
+            raise ValueError(_RANK_TRAJECTORY_ERROR)
+        if any(
+            value[position] >= value[position + 1]
+            for position in range(len(value) - 1)
+        ):
+            raise ValueError(_RANK_TRAJECTORY_ERROR)
+        return tuple(value)
+
+    points: list[
+        tuple[
+            Decimal,
+            dict[tuple[str, ...], tuple[int, tuple[str, str]]],
+            dict[tuple[tuple[str, ...], tuple[str, ...]], bool],
+        ]
+    ] = []
+    point_tokens: list[str] = []
+    previous_budget: Decimal | None = None
+    for point in raw_points:
+        if not isinstance(point, dict) or set(point) != {
+            "budget", "ranks", "tests",
+        }:
+            raise ValueError(_RANK_TRAJECTORY_ERROR)
+        budget = point["budget"]
+        ranks_raw = point["ranks"]
+        tests_raw = point["tests"]
+        if (
+            not isinstance(budget, _RankTrajectoryNumber)
+            or budget < 0
+            or (
+                previous_budget is not None
+                and budget <= previous_budget
+            )
+            or not isinstance(ranks_raw, list)
+            or not ranks_raw
+            or not isinstance(tests_raw, list)
+        ):
+            raise ValueError(_RANK_TRAJECTORY_ERROR)
+        previous_budget = budget
+
+        pick_records: dict[
+            tuple[str, ...], tuple[int, Decimal, int, tuple[str, str]]
+        ] = {}
+        rank_tokens: list[str] = []
+        seen_picks: set[tuple[str, ...]] = set()
+        previous_order: tuple[Decimal, Decimal, tuple[str, ...]] | None = None
+        # panel -> one (panel rank, support, panel effect, pick) per rank
+        panel_entries: dict[
+            tuple[str, str],
+            list[tuple[int, Decimal, Decimal, tuple[str, ...]]],
+        ] = {}
+        panel_pair_sets: list[set[tuple[str, str]]] = []
+        for position, rank_item in enumerate(ranks_raw, start=1):
+            if not isinstance(rank_item, dict) or set(rank_item) != {
+                "pick", "n", "support", "effect", "rank", "stable",
+                "driver", "panels",
+            }:
+                raise ValueError(_RANK_TRAJECTORY_ERROR)
+            pick = _as_pick(rank_item["pick"])
+            count = rank_item["n"]
+            support = rank_item["support"]
+            effect = rank_item["effect"]
+            rank = rank_item["rank"]
+            stable = rank_item["stable"]
+            driver_raw = rank_item["driver"]
+            panels_raw = rank_item["panels"]
+            if (
+                pick in seen_picks
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 1
+                or not isinstance(support, _RankTrajectoryNumber)
+                or support <= 0
+                or support > 1
+                or not isinstance(effect, _RankTrajectoryNumber)
+                or isinstance(rank, bool)
+                or not isinstance(rank, int)
+                or rank != position
+                or not isinstance(stable, bool)
+                or not isinstance(driver_raw, dict)
+                or set(driver_raw) != {"by", "key"}
+                or not isinstance(panels_raw, list)
+                or not panels_raw
+            ):
+                raise ValueError(_RANK_TRAJECTORY_ERROR)
+            seen_picks.add(pick)
+            # Ranks order by descending support, then descending effect,
+            # then ascending pick; the pick field guarantees strictness.
+            order = (support, effect, pick)
+            if previous_order is not None:
+                prev_support, prev_effect, prev_pick = previous_order
+                if not (
+                    prev_support > support
+                    or (
+                        prev_support == support
+                        and (
+                            prev_effect > effect
+                            or (
+                                prev_effect == effect
+                                and prev_pick < pick
+                            )
+                        )
+                    )
+                ):
+                    raise ValueError(_RANK_TRAJECTORY_ERROR)
+            previous_order = order
+
+            driver_by = driver_raw["by"]
+            driver_key = driver_raw["key"]
+            if (
+                driver_by not in ("region", "window")
+                or not isinstance(driver_key, str)
+                or not driver_key
+            ):
+                raise ValueError(_RANK_TRAJECTORY_ERROR)
+
+            # Panels list all region panels first (ascending key), then
+            # all window panels; both sections must be present.
+            section = "region"
+            section_keys: dict[str, str | None] = {
+                "region": None, "window": None,
+            }
+            section_counts: dict[str, int] = {"region": 0, "window": 0}
+            panel_tokens: list[str] = []
+            panel_pairs: set[tuple[str, str]] = set()
+            winner: tuple[tuple, str, str] | None = None
+            for panel in panels_raw:
+                if not isinstance(panel, dict) or set(panel) != {
+                    "by", "key", "effect", "rank", "delta",
+                    "direction", "contribution",
+                }:
+                    raise ValueError(_RANK_TRAJECTORY_ERROR)
+                by = panel["by"]
+                panel_key = panel["key"]
+                panel_effect = panel["effect"]
+                panel_rank = panel["rank"]
+                delta = panel["delta"]
+                direction = panel["direction"]
+                contribution = panel["contribution"]
+                if by not in ("region", "window"):
+                    raise ValueError(_RANK_TRAJECTORY_ERROR)
+                if by == "region" and section == "window":
+                    raise ValueError(_RANK_TRAJECTORY_ERROR)
+                if by == "window":
+                    section = "window"
+                if not isinstance(panel_key, str) or not panel_key:
+                    raise ValueError(_RANK_TRAJECTORY_ERROR)
+                last_key = section_keys[by]
+                if last_key is not None and panel_key <= last_key:
+                    raise ValueError(_RANK_TRAJECTORY_ERROR)
+                section_keys[by] = panel_key
+                section_counts[by] += 1
+                if (
+                    not isinstance(panel_effect, _RankTrajectoryNumber)
+                    or isinstance(panel_rank, bool)
+                    or not isinstance(panel_rank, int)
+                    or not 1 <= panel_rank <= len(ranks_raw)
+                    or isinstance(delta, bool)
+                    or not isinstance(delta, int)
+                    or direction not in ("rise", "fall", "same")
+                    or not isinstance(
+                        contribution, _RankTrajectoryNumber
+                    )
+                ):
+                    raise ValueError(_RANK_TRAJECTORY_ERROR)
+                if delta < 0:
+                    expected_direction = "rise"
+                elif delta > 0:
+                    expected_direction = "fall"
+                else:
+                    expected_direction = "same"
+                if direction != expected_direction:
+                    raise ValueError(_RANK_TRAJECTORY_ERROR)
+                pair = (by, panel_key)
+                if pair in panel_pairs:
+                    raise ValueError(_RANK_TRAJECTORY_ERROR)
+                panel_pairs.add(pair)
+                panel_entries.setdefault(pair, []).append(
+                    (panel_rank, support, panel_effect, pick)
+                )
+                # Driver: largest |delta|, ties broken by descending
+                # |contribution|, region before window, ascending key.
+                winner_key = (
+                    -abs(delta),
+                    -abs(contribution),
+                    0 if by == "region" else 1,
+                    panel_key,
+                )
+                if winner is None or winner_key < winner[0]:
+                    winner = (winner_key, by, panel_key)
+                panel_tokens.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"key":'
+                    + json.dumps(panel_key, ensure_ascii=False)
+                    + ',"effect":' + _format6(panel_effect)
+                    + ',"rank":' + str(panel_rank)
+                    + ',"delta":' + str(delta)
+                    + ',"direction":'
+                    + json.dumps(direction, ensure_ascii=False)
+                    + ',"contribution":' + _format6(contribution)
+                    + "}"
+                )
+            if section_counts["region"] == 0 or section_counts["window"] == 0:
+                raise ValueError(_RANK_TRAJECTORY_ERROR)
+            panel_pair_sets.append(panel_pairs)
+            assert winner is not None
+            if (driver_by, driver_key) != (winner[1], winner[2]):
+                raise ValueError(_RANK_TRAJECTORY_ERROR)
+
+            pick_records[pick] = (
+                count, support, rank, (driver_by, driver_key),
+            )
+            rank_tokens.append(
+                '{"pick":'
+                + json.dumps(
+                    list(pick), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"n":' + str(count)
+                + ',"support":' + _format6(support)
+                + ',"effect":' + _format6(effect)
+                + ',"rank":' + str(rank)
+                + ',"stable":' + ("true" if stable else "false")
+                + ',"driver":{"by":'
+                + json.dumps(driver_by, ensure_ascii=False)
+                + ',"key":'
+                + json.dumps(driver_key, ensure_ascii=False)
+                + '},"panels":[' + ",".join(panel_tokens) + "]}"
+            )
+
+        # Every panel re-ranks every pick: its panel ranks are a
+        # permutation of 1..G ordered like the global ranking but on
+        # panel effect instead of global effect. Every rank entry lists
+        # the same panels.
+        if any(pair_set != panel_pair_sets[0] for pair_set in panel_pair_sets):
+            raise ValueError(_RANK_TRAJECTORY_ERROR)
+        for entries in panel_entries.values():
+            if len(entries) != len(ranks_raw):
+                raise ValueError(_RANK_TRAJECTORY_ERROR)
+            ordered = sorted(entries)
+            if [entry[0] for entry in ordered] != list(
+                range(1, len(ranks_raw) + 1)
+            ):
+                raise ValueError(_RANK_TRAJECTORY_ERROR)
+            previous_panel_order = None
+            for _, panel_support, panel_eff, panel_pick in ordered:
+                panel_order = (
+                    panel_support, panel_eff, panel_pick
+                )
+                if previous_panel_order is not None:
+                    p_support, p_effect, p_pick = (
+                        previous_panel_order
+                    )
+                    if not (
+                        p_support > panel_support
+                        or (
+                            p_support == panel_support
+                            and (
+                                p_effect > panel_eff
+                                or (
+                                    p_effect == panel_eff
+                                    and p_pick < panel_pick
+                                )
+                            )
+                        )
+                    ):
+                        raise ValueError(_RANK_TRAJECTORY_ERROR)
+                previous_panel_order = panel_order
+
+        tests: dict[
+            tuple[tuple[str, ...], tuple[str, ...]], bool
+        ] = {}
+        test_tokens: list[str] = []
+        previous_pair: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        group_count = len(ranks_raw)
+        if len(tests_raw) != math.comb(group_count, 2):
+            raise ValueError(_RANK_TRAJECTORY_ERROR)
+        for test in tests_raw:
+            if not isinstance(test, dict) or set(test) != {
+                "a", "b", "n_a", "n_b", "diff", "p", "q", "reject",
+            }:
+                raise ValueError(_RANK_TRAJECTORY_ERROR)
+            pick_a = _as_pick(test["a"])
+            pick_b = _as_pick(test["b"])
+            n_a = test["n_a"]
+            n_b = test["n_b"]
+            diff = test["diff"]
+            p_value = test["p"]
+            q_value = test["q"]
+            reject = test["reject"]
+            pair = (pick_a, pick_b)
+            if (
+                not (pick_a < pick_b)
+                or (
+                    previous_pair is not None
+                    and pair <= previous_pair
+                )
+                or pick_a not in pick_records
+                or pick_b not in pick_records
+                or isinstance(n_a, bool)
+                or not isinstance(n_a, int)
+                or isinstance(n_b, bool)
+                or not isinstance(n_b, int)
+                or n_a != pick_records[pick_a][0]
+                or n_b != pick_records[pick_b][0]
+                or n_a + n_b > _FRONTIER_MIX_RANK_MAX_GROUP
+                or not isinstance(diff, _RankTrajectoryNumber)
+                or not isinstance(p_value, _RankTrajectoryNumber)
+                or p_value < 0
+                or p_value > 1
+                or not isinstance(q_value, _RankTrajectoryNumber)
+                or q_value < 0
+                or q_value > 1
+                or not isinstance(reject, bool)
+            ):
+                raise ValueError(_RANK_TRAJECTORY_ERROR)
+            previous_pair = pair
+            tests[pair] = reject
+            test_tokens.append(
+                '{"a":'
+                + json.dumps(
+                    list(pick_a), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"b":'
+                + json.dumps(
+                    list(pick_b), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"n_a":' + str(n_a)
+                + ',"n_b":' + str(n_b)
+                + ',"diff":' + _format6(diff)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":'
+                + ("true" if reject else "false")
+                + "}"
+            )
+
+        points.append(
+            (
+                budget,
+                {
+                    pick: (record[2], record[3])
+                    for pick, record in pick_records.items()
+                },
+                tests,
+            )
+        )
+        point_tokens.append(
+            '{"budget":' + _format6(budget)
+            + ',"ranks":[' + ",".join(rank_tokens) + "]"
+            + ',"tests":[' + ",".join(test_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations
+    # (whitespace, escaping, key order); the payload must reproduce the
+    # canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"points":[' + ",".join(point_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_RANK_TRAJECTORY_ERROR)
+    return alpha, points
+
+
+def frontier_rank_trajectory(report: str) -> str:
+    """Trace each pick's rank across adjacent budget points.
+
+    ``report`` must be a byte-for-byte :func:`frontier_rank_attribution`
+    JSON output; a non-string argument raises ``TypeError`` and every
+    other violation raises ``ValueError``.
+
+    A pick's occurrences across the ascending budget points are split
+    into maximal runs of adjacent budget points and runs with fewer
+    than two points are omitted. Each adjacent pair within a run is one
+    step with ``delta = later rank − earlier rank``; a negative,
+    positive or zero delta gives direction ``"rise"``, ``"fall"`` or
+    ``"same"``, the step's ``driver`` is the later point's driver and
+    ``significant`` is true only when ``delta`` is non-zero and the
+    later point lists a rejected test involving the pick.
+
+    With ``n`` the run's point count and ``max_abs`` the largest
+    ``|delta|``, the run's ``driver`` is the modal step ``(by, key)``;
+    ties resolve region panels before window panels and then ascending
+    key. ``persistence`` is the modal driver's step count divided by
+    ``n − 1``, computed under a precision-1000, ROUND_HALF_EVEN context.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha,
+    trajectories`` and each trajectory uses ``pick, start, end, n,
+    max_abs, driver, persistence, steps`` with ``driver`` using
+    ``by, key`` and steps using ``from, to, from_rank, to_rank, delta,
+    direction, driver, significant``. Trajectories sort by ascending
+    pick then ascending start and steps follow the budget order.
+    Budgets, ``alpha`` and ``persistence`` render with six decimals,
+    negative zero normalized to ``0.000000``; ranks and counts are
+    integers and booleans keep their type.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    alpha, points = _frontier_rank_attribution_parse(report)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # Per pick, one entry per budget point in ascending point order:
+        # (point index, budget, rank, driver, significant).
+        occurrences: dict[
+            tuple[str, ...],
+            list[tuple[int, Decimal, int, tuple[str, str], bool]],
+        ] = {}
+        for index, (budget, picks, tests) in enumerate(points):
+            rejected: set[tuple[str, ...]] = set()
+            for (pick_a, pick_b), reject in tests.items():
+                if reject:
+                    rejected.add(pick_a)
+                    rejected.add(pick_b)
+            for pick, (rank, driver) in picks.items():
+                occurrences.setdefault(pick, []).append(
+                    (index, budget, rank, driver, pick in rejected)
+                )
+
+        segments: list[
+            tuple[
+                tuple[str, ...],
+                list[
+                    tuple[
+                        int, Decimal, int, tuple[str, str], bool
+                    ]
+                ],
+            ]
+        ] = []
+        for pick in sorted(occurrences):
+            run: list[
+                tuple[int, Decimal, int, tuple[str, str], bool]
+            ] = []
+            previous_index: int | None = None
+            for entry in occurrences[pick]:
+                if previous_index is not None and entry[0] != previous_index + 1:
+                    if len(run) >= 2:
+                        segments.append((pick, run))
+                    run = []
+                run.append(entry)
+                previous_index = entry[0]
+            if len(run) >= 2:
+                segments.append((pick, run))
+
+        segment_strings: list[str] = []
+        for pick, run in segments:
+            step_strings: list[str] = []
+            driver_counts: dict[tuple[str, str], int] = {}
+            max_abs = 0
+            for earlier, later in zip(run, run[1:]):
+                _, start_budget, from_rank, _, _ = earlier
+                _, end_budget, to_rank, driver, significant = later
+                delta = to_rank - from_rank
+                if delta < 0:
+                    direction = "rise"
+                elif delta > 0:
+                    direction = "fall"
+                else:
+                    direction = "same"
+                if abs(delta) > max_abs:
+                    max_abs = abs(delta)
+                driver_counts[driver] = driver_counts.get(driver, 0) + 1
+                by, driver_key = driver
+                step_strings.append(
+                    '{"from":' + _format6(start_budget)
+                    + ',"to":' + _format6(end_budget)
+                    + ',"from_rank":' + str(from_rank)
+                    + ',"to_rank":' + str(to_rank)
+                    + ',"delta":' + str(delta)
+                    + ',"direction":'
+                    + json.dumps(direction, ensure_ascii=False)
+                    + ',"driver":{"by":'
+                    + json.dumps(by, ensure_ascii=False)
+                    + ',"key":'
+                    + json.dumps(driver_key, ensure_ascii=False)
+                    + '},"significant":'
+                    + ("true" if significant and delta != 0 else "false")
+                    + "}"
+                )
+
+            # Modal driver; ties resolve region before window, then key.
+            driver_by, driver_key = min(
+                driver_counts,
+                key=lambda item: (
+                    -driver_counts[item],
+                    0 if item[0] == "region" else 1,
+                    item[1],
+                ),
+            )
+            driver_count = driver_counts[(driver_by, driver_key)]
+            persistence = Decimal(driver_count) / Decimal(len(run) - 1)
+            segment_strings.append(
+                '{"pick":'
+                + json.dumps(
+                    list(pick), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"start":' + _format6(run[0][1])
+                + ',"end":' + _format6(run[-1][1])
+                + ',"n":' + str(len(run))
+                + ',"max_abs":' + str(max_abs)
+                + ',"driver":{"by":'
+                + json.dumps(driver_by, ensure_ascii=False)
+                + ',"key":'
+                + json.dumps(driver_key, ensure_ascii=False)
+                + '},"persistence":' + _format6(persistence)
+                + ',"steps":[' + ",".join(step_strings) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"trajectories":[' + ",".join(segment_strings) + "]}\n"
+    )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
