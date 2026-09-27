@@ -90,6 +90,7 @@ __all__ = [
     "intervention_sig",
     "hotspot_plan",
     "hotspot_plan_impact",
+    "hotspot_summary",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -16105,6 +16106,273 @@ def hotspot_plan_impact(report: str, effects: dict) -> str:
                 + ',"change":' + _format6(change)
                 + "}"
             )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_HOTSPOT_SUMMARY_REPORT_ERROR = (
+    "report must be a hotspot_plan_impact JSON output"
+)
+
+_HOTSPOT_SUMMARY_MAX_PANELS = 16
+
+
+def _hotspot_impact_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[tuple[str, str, Decimal, Decimal, Decimal]],
+]:
+    """Parse one :func:`hotspot_plan_impact` JSON output.
+
+    Returns ``(alpha, groups)`` with groups in canonical order; each group
+    holds ``(by, key, baseline, post, change)``. The input must be
+    byte-for-byte identical to a canonical output (key order, escaping,
+    spacing, group order and the six-decimal number tokens included); any
+    deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+
+    groups: list[tuple[str, str, Decimal, Decimal, Decimal]] = []
+    group_tokens: list[str] = []
+    previous_panel: tuple[int, str] | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {
+            "by", "key", "limit", "cost", "n",
+            "baseline", "post", "change",
+        }:
+            raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+        by = group["by"]
+        key = group["key"]
+        limit = group["limit"]
+        cost = group["cost"]
+        n = group["n"]
+        baseline = group["baseline"]
+        post = group["post"]
+        change = group["change"]
+        if (
+            by not in ("region", "window")
+            or not isinstance(key, str)
+            or not key
+            or not isinstance(limit, _RankTrajectoryNumber)
+            or limit < 0
+            or not isinstance(cost, _RankTrajectoryNumber)
+            or cost < 0
+            or cost > limit
+            or isinstance(n, bool)
+            or not isinstance(n, int)
+            or n < 0
+            or not isinstance(baseline, _RankTrajectoryNumber)
+            or not isinstance(post, _RankTrajectoryNumber)
+            or not isinstance(change, _RankTrajectoryNumber)
+        ):
+            raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+        panel_order = (0 if by == "region" else 1, key)
+        if previous_panel is not None and panel_order <= previous_panel:
+            raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+        previous_panel = panel_order
+
+        groups.append((by, key, baseline, post, change))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"key":' + json.dumps(key, ensure_ascii=False)
+            + ',"limit":' + _format6(limit)
+            + ',"cost":' + _format6(cost)
+            + ',"n":' + str(n)
+            + ',"baseline":' + _format6(baseline)
+            + ',"post":' + _format6(post)
+            + ',"change":' + _format6(change)
+            + "}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_HOTSPOT_SUMMARY_REPORT_ERROR)
+    return alpha, groups
+
+
+def hotspot_summary(report: str, weights: dict) -> str:
+    """Summarize a weighted hotspot impact report by region/window.
+
+    ``report`` must be a byte-for-byte :func:`hotspot_plan_impact` JSON
+    output. ``weights`` is a dict keyed by every ``(by, key)`` panel tuple
+    in the report whose values are positive finite non-boolean numbers. A
+    non-string ``report`` or a non-dict ``weights`` raises ``TypeError``;
+    every other violation raises ``ValueError``, including a dimension
+    (``region`` or ``window``) that spans more than 16 panels. A report
+    without groups requires ``weights == {}``.
+
+    Panels are pooled within each ``by`` dimension and each present
+    dimension becomes one summary group. With ``W`` the total weight of
+    the dimension's ``n`` panels, ``base``, ``post`` and ``change`` are
+    the weighted means ``sum(w_i * v_i) / W`` of the report's
+    ``baseline``, ``post`` and ``change`` values. Every one of the
+    ``2**n`` sign vectors ``s_i`` in ``{-1, +1}`` is enumerated and ``p``
+    is the proportion for which ``|sum(s_i * w_i * change_i) / W| >=
+    |change|``, compared on the unquantized values. The dimension groups
+    sort by ascending ``p`` with region before window breaking ties; the
+    Benjamini-Hochberg adjustment over the ranked groups is
+    ``q_j = min(1, min_{l >= j} N * p_l / l)`` with ``N`` the number of
+    groups, and ``reject`` is ``q <= alpha`` with the report's ``alpha``.
+
+    Numbers enter as ``Decimal(str(x))`` and all arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``alpha, groups`` and each group uses
+    ``by, n, base, post, change, p, q, reject``. ``n`` renders as an
+    integer and ``reject`` as a boolean; every number renders with six
+    decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    alpha, groups = _hotspot_impact_parse(report)
+
+    panel_keys = [(by, key) for by, key, *_ in groups]
+    if set(weights) != set(panel_keys):
+        raise ValueError("weights keys must be every (by, key) panel tuple")
+
+    panel_weights: dict[tuple[str, str], Decimal] = {}
+    for panel in panel_keys:
+        number = _validate_finite_number(weights[panel], "weight")
+        if number <= 0:
+            raise ValueError("weight values must be positive")
+        panel_weights[panel] = number
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        dimension_summaries: list[
+            tuple[str, int, Decimal, Decimal, Decimal, Decimal]
+        ] = []
+        for by in ("region", "window"):
+            members = [
+                (key, baseline, post, change)
+                for dim, key, baseline, post, change in groups
+                if dim == by
+            ]
+            n = len(members)
+            if n > _HOTSPOT_SUMMARY_MAX_PANELS:
+                raise ValueError(
+                    "a single dimension must span at most "
+                    f"{_HOTSPOT_SUMMARY_MAX_PANELS} panels"
+                )
+            if n == 0:
+                continue
+
+            total_weight = Decimal(0)
+            sum_baseline = Decimal(0)
+            sum_post = Decimal(0)
+            sum_change = Decimal(0)
+            weighted_changes: list[Decimal] = []
+            for key, baseline, post, change in members:
+                weight = panel_weights[(by, key)]
+                total_weight += weight
+                sum_baseline += weight * baseline
+                sum_post += weight * post
+                sum_change += weight * change
+                weighted_changes.append(weight * change)
+
+            base = sum_baseline / total_weight
+            post_mean = sum_post / total_weight
+            change_mean = sum_change / total_weight
+
+            observed = abs(change_mean)
+            hits = 0
+            for mask in range(1 << n):
+                signed = Decimal(0)
+                for index, weighted_change in enumerate(weighted_changes):
+                    if (mask >> index) & 1:
+                        signed -= weighted_change
+                    else:
+                        signed += weighted_change
+                if abs(signed / total_weight) >= observed:
+                    hits += 1
+            p = Decimal(hits) / Decimal(1 << n)
+
+            dimension_summaries.append(
+                (by, n, base, post_mean, change_mean, p)
+            )
+
+        # Rank the dimension groups by ascending p, region panels before
+        # window panels breaking ties; the Benjamini-Hochberg adjustment
+        # pools every present dimension: q_j = min(1, min_{l >= j}
+        # N * p_l / l) with N the group count.
+        dimension_summaries.sort(
+            key=lambda item: (item[5], 0 if item[0] == "region" else 1)
+        )
+        count = len(dimension_summaries)
+        running = Decimal(1)
+        group_tokens: list[str] = []
+        for rank in range(count, 0, -1):
+            by, n, base, post_mean, change_mean, p = (
+                dimension_summaries[rank - 1]
+            )
+            candidate = Decimal(count) * p / Decimal(rank)
+            if candidate < running:
+                running = candidate
+            q = running if running < 1 else Decimal(1)
+            reject = q <= alpha
+            token = (
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"base":' + _format6(base)
+                + ',"post":' + _format6(post_mean)
+                + ',"change":' + _format6(change_mean)
+                + ',"p":' + _format6(p)
+                + ',"q":' + _format6(q)
+                + ',"reject":' + ("true" if reject else "false")
+                + "}"
+            )
+            group_tokens.append(token)
+        group_tokens.reverse()
 
     return (
         '{"alpha":' + _format6(alpha)
