@@ -88,6 +88,7 @@ __all__ = [
     "frontier_interval_attribution",
     "interval_sig",
     "intervention_sig",
+    "hotspot_plan",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -15477,6 +15478,354 @@ def rank_hotspot_priority(report: str, effects: dict) -> str:
                 '{"by":' + json.dumps(by, ensure_ascii=False)
                 + ',"key":' + json.dumps(key, ensure_ascii=False)
                 + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_HOTSPOT_PLAN_ERROR = "report must be a rank_hotspot_priority JSON output"
+
+
+def _hotspot_priority_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    dict[
+        tuple[str, str],
+        list[tuple[tuple[str, ...], Decimal, Decimal, Decimal, bool]],
+    ],
+]:
+    """Parse one :func:`rank_hotspot_priority` JSON output.
+
+    Returns ``(alpha, panels)`` keyed by ``(by, key)`` panels; each panel
+    lists ``(pick, effect, q, score, eligible)`` entries in report (rank)
+    order. The input must be byte-for-byte identical to a canonical output
+    (key order, escaping, spacing, group and item order and the
+    six-decimal number tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_HOTSPOT_PLAN_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_HOTSPOT_PLAN_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_HOTSPOT_PLAN_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_HOTSPOT_PLAN_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_HOTSPOT_PLAN_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_HOTSPOT_PLAN_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_HOTSPOT_PLAN_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_HOTSPOT_PLAN_ERROR)
+
+    panels: dict[
+        tuple[str, str],
+        list[tuple[tuple[str, ...], Decimal, Decimal, Decimal, bool]],
+    ] = {}
+    group_tokens: list[str] = []
+    previous_panel: tuple[int, str] | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {
+            "by", "key", "items",
+        }:
+            raise ValueError(_HOTSPOT_PLAN_ERROR)
+        by = group["by"]
+        key = group["key"]
+        raw_items = group["items"]
+        if (
+            by not in ("region", "window")
+            or not isinstance(key, str)
+            or not key
+            or not isinstance(raw_items, list)
+            or not raw_items
+        ):
+            raise ValueError(_HOTSPOT_PLAN_ERROR)
+        panel_order = (0 if by == "region" else 1, key)
+        if previous_panel is not None and panel_order <= previous_panel:
+            raise ValueError(_HOTSPOT_PLAN_ERROR)
+        previous_panel = panel_order
+
+        entries: list[
+            tuple[tuple[str, ...], Decimal, Decimal, Decimal, bool]
+        ] = []
+        item_tokens: list[str] = []
+        seen_picks: set[tuple[str, ...]] = set()
+        for expected_rank, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict) or set(item) != {
+                "pick", "effect", "q", "score", "eligible", "rank",
+            }:
+                raise ValueError(_HOTSPOT_PLAN_ERROR)
+            pick = _rank_pick(item["pick"], _HOTSPOT_PLAN_ERROR)
+            effect = item["effect"]
+            q = item["q"]
+            score = item["score"]
+            eligible = item["eligible"]
+            rank = item["rank"]
+            if (
+                pick in seen_picks
+                or not isinstance(effect, _RankTrajectoryNumber)
+                or not isinstance(q, _RankTrajectoryNumber)
+                or q < 0
+                or q > 1
+                or not isinstance(score, _RankTrajectoryNumber)
+                or score < 0
+                or not isinstance(eligible, bool)
+                or isinstance(rank, bool)
+                or not isinstance(rank, int)
+                or rank != expected_rank
+            ):
+                raise ValueError(_HOTSPOT_PLAN_ERROR)
+            seen_picks.add(pick)
+            if eligible != (effect < 0 and q <= alpha):
+                raise ValueError(_HOTSPOT_PLAN_ERROR)
+            # Non-eligible items always score exactly zero; an eligible
+            # item's positive score may still render as 0.000000.
+            if not eligible and score != 0:
+                raise ValueError(_HOTSPOT_PLAN_ERROR)
+            entries.append((pick, effect, q, score, eligible))
+            item_tokens.append(
+                '{"pick":'
+                + json.dumps(
+                    list(pick), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"effect":' + _format6(effect)
+                + ',"q":' + _format6(q)
+                + ',"score":' + _format6(score)
+                + ',"eligible":' + ("true" if eligible else "false")
+                + ',"rank":' + str(rank)
+                + "}"
+            )
+
+        panels[(by, key)] = entries
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"key":' + json.dumps(key, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_HOTSPOT_PLAN_ERROR)
+    return alpha, panels
+
+
+def hotspot_plan(report: str, cost: dict, limit: dict, allow: dict) -> str:
+    """Plan a per-panel hotspot pick portfolio under a cost limit.
+
+    ``report`` must be a byte-for-byte :func:`rank_hotspot_priority` JSON
+    output. ``cost`` is keyed by every pick tuple appearing in the report
+    and its values are positive finite non-boolean numbers. ``limit`` is
+    keyed by every ``(by, key)`` panel tuple and its values are
+    non-negative finite non-boolean numbers. ``allow`` shares the
+    ``limit`` key set and its values are duplicate-free lists of that
+    panel's pick tuples. A non-string ``report`` or a non-dict among the
+    other three arguments raises ``TypeError``; every other violation
+    raises ``ValueError``.
+
+    Within each panel every subset of the picks that are both
+    ``eligible`` in the report and listed in ``allow`` is enumerated;
+    subsets whose total cost exceeds the panel limit are discarded and
+    the remainder is ranked by descending total score, then ascending
+    total cost, then ascending lexicographic order of the sorted pick
+    list. Each non-selected pick gets a ``reason``: ``q`` when it is not
+    eligible, ``a`` when it is not in ``allow``, ``b`` when adding it to
+    the chosen picks would exceed the limit, and ``d`` otherwise. Costs
+    enter as ``Decimal(str(x))`` and all sums run under a
+    precision-1000, ROUND_HALF_EVEN local context; comparisons use the
+    unquantized values.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups``, each
+    group uses ``by, key, limit, cost, score, pick, skip`` and each skip
+    item uses ``pick, reason``. Groups sort region panels before window
+    panels and then by ascending key; ``pick`` and ``skip`` sort by
+    ascending pick. ``pick`` renders as a two-dimensional array of
+    intervention kinds; every number renders with six decimals, negative
+    zero normalized to ``0.000000``. A report without groups requires
+    ``cost``, ``limit`` and ``allow`` to be empty and yields ``groups``
+    empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    for name, value in (("cost", cost), ("limit", limit), ("allow", allow)):
+        if not isinstance(value, dict):
+            raise TypeError(f"{name} must be a dict")
+    alpha, panels = _hotspot_priority_parse(report)
+
+    all_picks = {
+        pick for entries in panels.values() for pick, *_ in entries
+    }
+    panel_keys = set(panels)
+    if set(cost) != all_picks:
+        raise ValueError("cost keys must be every hotspot pick tuple")
+    if set(limit) != panel_keys:
+        raise ValueError("limit keys must be every (by, key) panel tuple")
+    if set(allow) != panel_keys:
+        raise ValueError("allow keys must match the limit panels")
+
+    costs: dict[tuple[str, ...], Decimal] = {}
+    for pick, value in cost.items():
+        number = _validate_finite_number(value, "cost")
+        if number <= 0:
+            raise ValueError("cost values must be positive")
+        costs[pick] = number
+
+    limits: dict[tuple[str, str], Decimal] = {}
+    for panel, value in limit.items():
+        number = _validate_finite_number(value, "limit")
+        if number < 0:
+            raise ValueError("limit values must be non-negative")
+        limits[panel] = number
+
+    allowed: dict[tuple[str, str], set[tuple[str, ...]]] = {}
+    for panel, value in allow.items():
+        if not isinstance(value, list):
+            raise ValueError("allow values must be lists")
+        panel_pick_set = {pick for pick, *_ in panels[panel]}
+        members: set[tuple[str, ...]] = set()
+        for pick in value:
+            if not isinstance(pick, tuple):
+                raise ValueError(
+                    "allow values must be duplicate-free lists of that"
+                    " panel's pick tuples"
+                )
+            try:
+                belongs = pick in panel_pick_set
+                duplicate = pick in members
+            except TypeError:
+                # An unhashable tuple (e.g. containing a list) is not a
+                # valid pick.
+                raise ValueError(
+                    "allow values must be duplicate-free lists of that"
+                    " panel's pick tuples"
+                ) from None
+            if not belongs or duplicate:
+                raise ValueError(
+                    "allow values must be duplicate-free lists of that"
+                    " panel's pick tuples"
+                )
+            members.add(pick)
+        allowed[panel] = members
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        group_tokens: list[str] = []
+        for by, key in sorted(
+            panels,
+            key=lambda panel: (0 if panel[0] == "region" else 1, panel[1]),
+        ):
+            entries = panels[(by, key)]
+            panel_limit = limits[(by, key)]
+            panel_allow = allowed[(by, key)]
+            candidates = [
+                (pick, score)
+                for pick, _, _, score, eligible in entries
+                if eligible and pick in panel_allow
+            ]
+
+            best_picks: tuple[tuple[str, ...], ...] = ()
+            best_cost = Decimal(0)
+            best_score = Decimal(0)
+            for mask in range(1 << len(candidates)):
+                total_cost = Decimal(0)
+                total_score = Decimal(0)
+                chosen: list[tuple[str, ...]] = []
+                for index, (pick, score) in enumerate(candidates):
+                    if (mask >> index) & 1:
+                        total_cost += costs[pick]
+                        total_score += score
+                        chosen.append(pick)
+                if total_cost > panel_limit:
+                    continue
+                chosen.sort()
+                if (
+                    -total_score,
+                    total_cost,
+                    chosen,
+                ) < (
+                    -best_score,
+                    best_cost,
+                    list(best_picks),
+                ):
+                    best_picks = tuple(chosen)
+                    best_cost = total_cost
+                    best_score = total_score
+
+            chosen_set = set(best_picks)
+            skip: list[tuple[tuple[str, ...], str]] = []
+            for pick, _, _, _, eligible in entries:
+                if pick in chosen_set:
+                    continue
+                if not eligible:
+                    reason = "q"
+                elif pick not in panel_allow:
+                    reason = "a"
+                elif best_cost + costs[pick] > panel_limit:
+                    reason = "b"
+                else:
+                    reason = "d"
+                skip.append((pick, reason))
+            skip.sort(key=lambda item: item[0])
+
+            pick_token = "[" + ",".join(
+                json.dumps(
+                    list(pick), ensure_ascii=False, separators=(",", ":")
+                )
+                for pick in best_picks
+            ) + "]"
+            skip_token = "[" + ",".join(
+                '{"pick":'
+                + json.dumps(
+                    list(pick), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"reason":' + json.dumps(reason, ensure_ascii=False)
+                + "}"
+                for pick, reason in skip
+            ) + "]"
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"limit":' + _format6(panel_limit)
+                + ',"cost":' + _format6(best_cost)
+                + ',"score":' + _format6(best_score)
+                + ',"pick":' + pick_token
+                + ',"skip":' + skip_token
+                + "}"
             )
 
     return (
