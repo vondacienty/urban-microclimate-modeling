@@ -89,6 +89,7 @@ __all__ = [
     "interval_sig",
     "intervention_sig",
     "hotspot_plan",
+    "hotspot_plan_impact",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -15578,6 +15579,9 @@ def _hotspot_priority_parse(
         ] = []
         item_tokens: list[str] = []
         seen_picks: set[tuple[str, ...]] = set()
+        previous_item_order: tuple[bool, Decimal, tuple[str, ...]] | None = (
+            None
+        )
         for expected_rank, item in enumerate(raw_items, start=1):
             if not isinstance(item, dict) or set(item) != {
                 "pick", "effect", "q", "score", "eligible", "rank",
@@ -15610,6 +15614,24 @@ def _hotspot_priority_parse(
             # item's positive score may still render as 0.000000.
             if not eligible and score != 0:
                 raise ValueError(_HOTSPOT_PLAN_ERROR)
+            if eligible:
+                # An eligible score never exceeds (-effect) * (1 - q),
+                # compared on its six-decimal ROUND_HALF_EVEN rendering.
+                with localcontext() as ctx:
+                    ctx.prec = _MODEL_PRECISION
+                    ctx.rounding = ROUND_HALF_EVEN
+                    bound = (-effect) * (1 - q)
+                if score > Decimal(_format6(bound)):
+                    raise ValueError(_HOTSPOT_PLAN_ERROR)
+            # Items order eligible first, then descending score, then
+            # ascending pick; unique picks make the order strict.
+            item_order = (not eligible, -score, pick)
+            if (
+                previous_item_order is not None
+                and item_order <= previous_item_order
+            ):
+                raise ValueError(_HOTSPOT_PLAN_ERROR)
+            previous_item_order = item_order
             entries.append((pick, effect, q, score, eligible))
             item_tokens.append(
                 '{"pick":'
@@ -15825,6 +15847,262 @@ def hotspot_plan(report: str, cost: dict, limit: dict, allow: dict) -> str:
                 + ',"score":' + _format6(best_score)
                 + ',"pick":' + pick_token
                 + ',"skip":' + skip_token
+                + "}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_HOTSPOT_PLAN_REPORT_ERROR = "report must be a hotspot_plan JSON output"
+
+
+def _hotspot_plan_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[
+        tuple[
+            str,
+            str,
+            Decimal,
+            Decimal,
+            tuple[tuple[str, ...], ...],
+            tuple[tuple[str, ...], ...],
+        ]
+    ],
+]:
+    """Parse one :func:`hotspot_plan` JSON output.
+
+    Returns ``(alpha, groups)`` with groups in canonical order; each group
+    holds ``(by, key, limit, cost, picks, skip_picks)``. The input must be
+    byte-for-byte identical to a canonical output (key order, escaping,
+    spacing, group, pick and skip order and the six-decimal number tokens
+    included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+
+    groups: list[
+        tuple[
+            str,
+            str,
+            Decimal,
+            Decimal,
+            tuple[tuple[str, ...], ...],
+            tuple[tuple[str, ...], ...],
+        ]
+    ] = []
+    group_tokens: list[str] = []
+    previous_panel: tuple[int, str] | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {
+            "by", "key", "limit", "cost", "score", "pick", "skip",
+        }:
+            raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+        by = group["by"]
+        key = group["key"]
+        limit = group["limit"]
+        cost = group["cost"]
+        score = group["score"]
+        raw_pick = group["pick"]
+        raw_skip = group["skip"]
+        if (
+            by not in ("region", "window")
+            or not isinstance(key, str)
+            or not key
+            or not isinstance(limit, _RankTrajectoryNumber)
+            or limit < 0
+            or not isinstance(cost, _RankTrajectoryNumber)
+            or cost < 0
+            or cost > limit
+            or not isinstance(score, _RankTrajectoryNumber)
+            or score < 0
+            or not isinstance(raw_pick, list)
+            or not isinstance(raw_skip, list)
+        ):
+            raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+        panel_order = (0 if by == "region" else 1, key)
+        if previous_panel is not None and panel_order <= previous_panel:
+            raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+        previous_panel = panel_order
+
+        picks: list[tuple[str, ...]] = []
+        for value in raw_pick:
+            pick = _rank_pick(value, _HOTSPOT_PLAN_REPORT_ERROR)
+            # Picks sort ascending; the strict order also forbids duplicates.
+            if picks and pick <= picks[-1]:
+                raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+            picks.append(pick)
+
+        skip_picks: list[tuple[str, ...]] = []
+        skip_tokens: list[str] = []
+        for item in raw_skip:
+            if not isinstance(item, dict) or set(item) != {"pick", "reason"}:
+                raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+            pick = _rank_pick(item["pick"], _HOTSPOT_PLAN_REPORT_ERROR)
+            reason = item["reason"]
+            if reason not in ("q", "a", "b", "d"):
+                raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+            if skip_picks and pick <= skip_picks[-1]:
+                raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+            skip_picks.append(pick)
+            skip_tokens.append(
+                '{"pick":'
+                + json.dumps(
+                    list(pick), ensure_ascii=False, separators=(",", ":")
+                )
+                + ',"reason":' + json.dumps(reason, ensure_ascii=False)
+                + "}"
+            )
+
+        if set(picks) & set(skip_picks):
+            raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+
+        groups.append((by, key, limit, cost, tuple(picks), tuple(skip_picks)))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"key":' + json.dumps(key, ensure_ascii=False)
+            + ',"limit":' + _format6(limit)
+            + ',"cost":' + _format6(cost)
+            + ',"score":' + _format6(score)
+            + ',"pick":[' + ",".join(
+                json.dumps(
+                    list(pick), ensure_ascii=False, separators=(",", ":")
+                )
+                for pick in picks
+            ) + "]"
+            + ',"skip":[' + ",".join(skip_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_HOTSPOT_PLAN_REPORT_ERROR)
+    return alpha, groups
+
+
+def hotspot_plan_impact(report: str, effects: dict) -> str:
+    """Summarize the per-panel impact of a hotspot pick portfolio.
+
+    ``report`` must be a byte-for-byte :func:`hotspot_plan` JSON output.
+    ``effects`` is a dict keyed by every ``(by, key)`` panel tuple whose
+    values are ``(baseline, deltas)`` two-tuples: ``baseline`` is a finite
+    non-boolean number and ``deltas`` a dict keyed by every pick tuple in
+    the panel's ``pick`` and ``skip`` lists whose values are finite
+    non-boolean numbers. A non-string ``report`` or a non-dict ``effects``
+    raises ``TypeError``; every other violation raises ``ValueError``.
+
+    Within each panel ``change`` is the sum of the selected picks' deltas,
+    ``post`` is ``baseline + change`` and ``n`` the number of selected
+    picks. Numbers enter as ``Decimal(str(x))`` and all sums run under a
+    precision-1000, ROUND_HALF_EVEN local context.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups`` and
+    each group uses ``by, key, limit, cost, n, baseline, post, change``
+    with ``limit`` and ``cost`` carried over from the report. Groups sort
+    region panels before window panels and then by ascending key; ``n``
+    renders as an integer and every other number with six decimals,
+    negative zero normalized to ``0.000000``. A report without groups
+    requires ``effects == {}`` and yields ``groups`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(effects, dict):
+        raise TypeError("effects must be a dict")
+    alpha, groups = _hotspot_plan_parse(report)
+
+    if set(effects) != {(by, key) for by, key, *_ in groups}:
+        raise ValueError(
+            "effects keys must be every (by, key) panel tuple"
+        )
+    baselines: dict[tuple[str, str], Decimal] = {}
+    panel_deltas: dict[
+        tuple[str, str], dict[tuple[str, ...], Decimal]
+    ] = {}
+    for by, key, _, _, picks, skip_picks in groups:
+        value = effects[(by, key)]
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise ValueError(
+                "effects values must be (baseline, deltas) tuples"
+            )
+        baseline, deltas = value
+        baselines[(by, key)] = _validate_finite_number(baseline, "baseline")
+        if not isinstance(deltas, dict):
+            raise ValueError("deltas must be a dict")
+        if set(deltas) != set(picks) | set(skip_picks):
+            raise ValueError(
+                "deltas keys must be every pick tuple of the panel's"
+                " pick and skip lists"
+            )
+        panel_deltas[(by, key)] = {
+            pick: _validate_finite_number(delta, "delta")
+            for pick, delta in deltas.items()
+        }
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        group_tokens: list[str] = []
+        for by, key, limit, cost, picks, _ in groups:
+            deltas = panel_deltas[(by, key)]
+            change = Decimal(0)
+            for pick in picks:
+                change += deltas[pick]
+            post = baselines[(by, key)] + change
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"limit":' + _format6(limit)
+                + ',"cost":' + _format6(cost)
+                + ',"n":' + str(len(picks))
+                + ',"baseline":' + _format6(baselines[(by, key)])
+                + ',"post":' + _format6(post)
+                + ',"change":' + _format6(change)
                 + "}"
             )
 
