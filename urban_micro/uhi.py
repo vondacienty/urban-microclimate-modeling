@@ -16413,6 +16413,220 @@ def hotspot_summary(report: str, weights: dict) -> str:
     )
 
 
+def hotspot_kind_summary(report: str, effects: dict, weights: dict) -> str:
+    """Aggregate a :func:`hotspot_plan` report per intervention kind with a
+    sign-flip significance test per ``(by, kind)`` combination.
+
+    ``report`` must be a byte-for-byte :func:`hotspot_plan` JSON output.
+    ``effects`` is keyed by every selected option as
+    ``(by, key, tuple(pick))`` and its values are finite non-boolean
+    numbers; the key set equals every ``(by, key, pick)`` triple among the
+    report groups' chosen ``pick`` lists. ``weights`` is keyed by every
+    ``(by, key)`` panel tuple and its values are positive finite
+    non-boolean numbers. A non-string ``report`` or a non-dict among
+    ``effects``/``weights`` raises ``TypeError``; every other violation
+    raises ``ValueError``. An empty report is valid only with
+    ``effects == weights == {}``.
+
+    A chosen pick holding ``k`` kinds contributes ``effect / k`` to each
+    of its kinds; within a panel the per-kind effect ``v`` is the sum of
+    those shares over every selected pick containing the kind. Each
+    ``(by, kind)`` summary then covers only the panels of that ``by``
+    holding the kind: ``n`` is their count (``n > 16`` raises
+    ``ValueError``), ``W`` their total weight and
+    ``change = sum(w_i * v_i) / W`` the weighted mean. All ``2**n`` sign
+    vectors ``(s_1, ..., s_n)`` with ``s_i in {-1, 1}`` are enumerated
+    and ``p`` is the proportion for which
+    ``|sum(s_i * w_i * v_i / W)| >= |change|``.
+
+    Groups sort by ascending ``p`` (the BH order), region panels before
+    window panels on ties, then ascending kind. Applying
+    Benjamini-Hochberg across the ``N`` tested groups in that order,
+    ``q_j = min(1, min_{l >= j}(N * p_l / l))`` and a group
+    ``reject``s when ``q`` is no greater than the report's ``alpha``.
+
+    Numbers enter as ``Decimal(str(x))`` and every weighted mean, sign
+    sum and statistic runs under a precision-1000, ROUND_HALF_EVEN local
+    context; comparisons use the unquantized values. Returns a compact
+    UTF-8 JSON string with no spaces and exactly one trailing newline;
+    the top-level key order is ``alpha, groups`` and each group uses
+    ``by, items``; each item uses ``kind, n, change, p, q, reject``.
+    Groups sort region before window and items within a group by
+    ascending kind; ``n`` renders as an integer and ``reject`` as a
+    boolean; every other number renders with six decimals, negative zero
+    normalized to ``0.000000``. With no selected picks anywhere the
+    report yields ``groups`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(effects, dict):
+        raise TypeError("effects must be a dict")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    alpha, plan_groups = _hotspot_plan_parse(report)
+
+    panel_keys = [(by, key) for by, key, *_ in plan_groups]
+    if set(weights) != set(panel_keys):
+        raise ValueError(
+            "weights keys must be every report (by, key) panel tuple"
+        )
+    selected_triples = {
+        (by, key, pick)
+        for by, key, _, _, picks, _ in plan_groups
+        for pick in picks
+    }
+    if set(effects) != selected_triples:
+        raise ValueError(
+            "effects keys must be every (by, key, tuple(pick)) triple of"
+            " the report's selected picks"
+        )
+
+    panel_weights: dict[tuple[str, str], Decimal] = {}
+    for panel in panel_keys:
+        number = _validate_finite_number(weights[panel], "weights")
+        if number <= 0:
+            raise ValueError("weights values must be positive")
+        panel_weights[panel] = number
+
+    pick_effects: dict[
+        tuple[str, str, tuple[str, ...]], Decimal
+    ] = {}
+    for triple in selected_triples:
+        pick_effects[triple] = _validate_finite_number(
+            effects[triple], "effects"
+        )
+
+    # panels[by] preserves report order, each entry holding
+    # (key, weight, {kind: summed per-kind effect share}). A pick with k
+    # kinds splits its effect evenly, contributing effect / k to each.
+    panels: dict[
+        str, list[tuple[str, Decimal, dict[str, Decimal]]]
+    ] = {"region": [], "window": []}
+    for by, key, _, _, picks, _ in plan_groups:
+        kind_effects: dict[str, Decimal] = {}
+        for pick in picks:
+            effect = pick_effects[(by, key, pick)]
+            share = effect / Decimal(len(pick))
+            for kind in pick:
+                kind_effects[kind] = (
+                    kind_effects.get(kind, Decimal(0)) + share
+                )
+        panels[by].append((key, panel_weights[(by, key)], kind_effects))
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (by, kind, n, change, p) for every (by, kind); only panels whose
+        # selected picks hold the kind participate.
+        summaries: list[tuple[str, str, int, Decimal, Decimal]] = []
+        for by in ("region", "window"):
+            by_panels = panels[by]
+            kinds = sorted(
+                {
+                    kind
+                    for _, _, kind_effects in by_panels
+                    for kind in kind_effects
+                }
+            )
+            for kind in kinds:
+                kind_panels = [
+                    (weight, kind_effects[kind])
+                    for _, weight, kind_effects in by_panels
+                    if kind in kind_effects
+                ]
+                n = len(kind_panels)
+                if n > _HOTSPOT_SUMMARY_MAX_PANELS:
+                    raise ValueError(
+                        f"a single (by, kind) summary may hold at most "
+                        f"{_HOTSPOT_SUMMARY_MAX_PANELS} panels"
+                    )
+                total_weight = sum(
+                    (weight for weight, _ in kind_panels), Decimal(0)
+                )
+                # Weighted per-panel contributions v_i = w_i * effect_i / W;
+                # the observed change is the all-plus sign vector, so its
+                # statistic equals the threshold exactly.
+                contributions = [
+                    weight * effect / total_weight
+                    for weight, effect in kind_panels
+                ]
+                change_mean = sum(contributions, Decimal(0))
+                observed_abs = abs(change_mean)
+                tail = 0
+                for mask in range(1 << n):
+                    statistic = Decimal(0)
+                    for index, contribution in enumerate(contributions):
+                        if (mask >> index) & 1:
+                            statistic += contribution
+                        else:
+                            statistic -= contribution
+                    if abs(statistic) >= observed_abs:
+                        tail += 1
+                p = Decimal(tail) / Decimal(1 << n)
+                summaries.append((by, kind, n, change_mean, p))
+
+    # Order by ascending p for the BH step-up, region first and ascending
+    # kind on further ties.
+    summaries.sort(
+        key=lambda item: (
+            item[4],
+            0 if item[0] == "region" else 1,
+            item[1],
+        )
+    )
+    tested = len(summaries)
+
+    # Benjamini-Hochberg: q_j = min(1, min_{l >= j} N*p_l/l) with ranks
+    # taken in the sorted order (1-based).
+    statistics_by_group: dict[
+        tuple[str, str], tuple[int, Decimal, Decimal, Decimal, bool]
+    ] = {}
+    running = Decimal(1)
+    for rank in range(tested, 0, -1):
+        by, kind, n, change_mean, p = summaries[rank - 1]
+        candidate = Decimal(tested) * p / Decimal(rank)
+        if candidate < running:
+            running = candidate
+        q = min(Decimal(1), running)
+        statistics_by_group[(by, kind)] = (
+            n, change_mean, p, q, q <= alpha
+        )
+
+    # Groups render region before window; items within a group sort by
+    # ascending kind, independent of the BH testing order. A dimension
+    # without selected picks has no items and is omitted.
+    group_tokens: list[str] = []
+    for by in ("region", "window"):
+        by_kinds = sorted(
+            {group_kind for group_by, group_kind, *_ in summaries
+             if group_by == by}
+        )
+        if not by_kinds:
+            continue
+        item_tokens: list[str] = []
+        for kind in by_kinds:
+            n, change_mean, p, q, reject = statistics_by_group[(by, kind)]
+            item_tokens.append(
+                '{"kind":' + json.dumps(kind, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"change":' + _format6(change_mean)
+                + ',"p":' + _format6(p)
+                + ',"q":' + _format6(q)
+                + ',"reject":' + ("true" if reject else "false")
+                + "}"
+            )
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
