@@ -90,6 +90,7 @@ __all__ = [
     "intervention_sig",
     "hotspot_plan",
     "hotspot_plan_impact",
+    "hotspot_summary",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -14328,6 +14329,27 @@ def _rank_trajectory_parse_int(value: str) -> int:
     return int(value)
 
 
+def _coerce_plan_pick(value: object, error: str) -> tuple[str, ...]:
+    """Validate one user-supplied pick and return it as a tuple.
+
+    A pick may be given as a tuple or lifted verbatim from a report's
+    ``pick`` JSON array (a list); either way it must be a non-empty
+    sequence of distinct intervention kinds (``green``, ``roof`` or
+    ``material``) in strictly ascending order.
+    """
+    if not isinstance(value, (list, tuple)) or not value or any(
+        not isinstance(kind, str) or kind not in _INTERVENTION_KINDS
+        for kind in value
+    ):
+        raise ValueError(error)
+    if any(
+        value[position] >= value[position + 1]
+        for position in range(len(value) - 1)
+    ):
+        raise ValueError(error)
+    return tuple(value)
+
+
 def _rank_trajectory_parse_constant(value: str) -> Decimal:
     raise ValueError(_RANK_TRAJECTORY_ERROR)
 
@@ -15673,7 +15695,10 @@ def hotspot_plan(report: str, cost: dict, limit: dict, allow: dict) -> str:
     keyed by every ``(by, key)`` panel tuple and its values are
     non-negative finite non-boolean numbers. ``allow`` shares the
     ``limit`` key set and its values are duplicate-free lists of that
-    panel's pick tuples. A non-string ``report`` or a non-dict among the
+    panel's picks; each pick may be a tuple or the report's ``pick``
+    array lifted verbatim as a list, either way a non-empty, strictly
+    ascending, duplicate-free sequence of ``green``, ``roof`` and
+    ``material`` kinds. A non-string ``report`` or a non-dict among the
     other three arguments raises ``TypeError``; every other violation
     raises ``ValueError``.
 
@@ -15711,7 +15736,18 @@ def hotspot_plan(report: str, cost: dict, limit: dict, allow: dict) -> str:
         pick for entries in panels.values() for pick, *_ in entries
     }
     panel_keys = set(panels)
-    if set(cost) != all_picks:
+
+    # Report picks are JSON arrays; a user lifting them verbatim hands
+    # lists to ``allow`` (``cost`` keys must stay hashable tuples), so
+    # coerce either form to the canonical tuples before matching.
+    cost_items = [
+        (
+            _coerce_plan_pick(pick, "cost keys must be pick tuples"),
+            value,
+        )
+        for pick, value in cost.items()
+    ]
+    if {pick for pick, _ in cost_items} != all_picks:
         raise ValueError("cost keys must be every hotspot pick tuple")
     if set(limit) != panel_keys:
         raise ValueError("limit keys must be every (by, key) panel tuple")
@@ -15719,7 +15755,7 @@ def hotspot_plan(report: str, cost: dict, limit: dict, allow: dict) -> str:
         raise ValueError("allow keys must match the limit panels")
 
     costs: dict[tuple[str, ...], Decimal] = {}
-    for pick, value in cost.items():
+    for pick, value in cost_items:
         number = _validate_finite_number(value, "cost")
         if number <= 0:
             raise ValueError("cost values must be positive")
@@ -15738,28 +15774,19 @@ def hotspot_plan(report: str, cost: dict, limit: dict, allow: dict) -> str:
             raise ValueError("allow values must be lists")
         panel_pick_set = {pick for pick, *_ in panels[panel]}
         members: set[tuple[str, ...]] = set()
-        for pick in value:
-            if not isinstance(pick, tuple):
+        for raw_pick in value:
+            pick = _coerce_plan_pick(
+                raw_pick,
+                "allow values must be duplicate-free lists of that"
+                " panel's pick tuples",
+            )
+            if pick in panel_pick_set and pick not in members:
+                members.add(pick)
+            else:
                 raise ValueError(
                     "allow values must be duplicate-free lists of that"
                     " panel's pick tuples"
                 )
-            try:
-                belongs = pick in panel_pick_set
-                duplicate = pick in members
-            except TypeError:
-                # An unhashable tuple (e.g. containing a list) is not a
-                # valid pick.
-                raise ValueError(
-                    "allow values must be duplicate-free lists of that"
-                    " panel's pick tuples"
-                ) from None
-            if not belongs or duplicate:
-                raise ValueError(
-                    "allow values must be duplicate-free lists of that"
-                    " panel's pick tuples"
-                )
-            members.add(pick)
         allowed[panel] = members
 
     with localcontext() as ctx:
@@ -16105,6 +16132,280 @@ def hotspot_plan_impact(report: str, effects: dict) -> str:
                 + ',"change":' + _format6(change)
                 + "}"
             )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_HOTSPOT_SUMMARY_ERROR = "report must be a hotspot_plan_impact JSON output"
+_HOTSPOT_SUMMARY_MAX_PANELS = 16
+
+
+def _hotspot_plan_impact_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[tuple[str, str, int, Decimal, Decimal, Decimal]],
+]:
+    """Parse one :func:`hotspot_plan_impact` JSON output.
+
+    Returns ``(alpha, groups)`` with groups in canonical order; each group
+    holds ``(by, key, n, baseline, post, change)``. The input must be
+    byte-for-byte identical to a canonical output (key order, escaping,
+    spacing, group order and the six-decimal number tokens included); any
+    deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_HOTSPOT_SUMMARY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+
+    groups: list[tuple[str, str, int, Decimal, Decimal, Decimal]] = []
+    group_tokens: list[str] = []
+    previous_panel: tuple[int, str] | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {
+            "by", "key", "limit", "cost", "n", "baseline", "post", "change",
+        }:
+            raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+        by = group["by"]
+        key = group["key"]
+        limit = group["limit"]
+        cost = group["cost"]
+        n = group["n"]
+        baseline = group["baseline"]
+        post = group["post"]
+        change = group["change"]
+        if (
+            by not in ("region", "window")
+            or not isinstance(key, str)
+            or not key
+            or not isinstance(limit, _RankTrajectoryNumber)
+            or limit < 0
+            or not isinstance(cost, _RankTrajectoryNumber)
+            or cost < 0
+            or cost > limit
+            or isinstance(n, bool)
+            or not isinstance(n, int)
+            or n < 0
+            or not isinstance(baseline, _RankTrajectoryNumber)
+            or not isinstance(post, _RankTrajectoryNumber)
+            or not isinstance(change, _RankTrajectoryNumber)
+        ):
+            raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+        panel_order = (0 if by == "region" else 1, key)
+        if previous_panel is not None and panel_order <= previous_panel:
+            raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+        previous_panel = panel_order
+        groups.append((by, key, n, baseline, post, change))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"key":' + json.dumps(key, ensure_ascii=False)
+            + ',"limit":' + _format6(limit)
+            + ',"cost":' + _format6(cost)
+            + ',"n":' + str(n)
+            + ',"baseline":' + _format6(baseline)
+            + ',"post":' + _format6(post)
+            + ',"change":' + _format6(change)
+            + "}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_HOTSPOT_SUMMARY_ERROR)
+    return alpha, groups
+
+
+def hotspot_summary(report: str, weights: dict) -> str:
+    """Aggregate a :func:`hotspot_plan_impact` report along its two
+    dimensions and run a sign-flip significance test per panel.
+
+    ``report`` must be a byte-for-byte :func:`hotspot_plan_impact` JSON
+    output and ``weights`` a dict keyed by every ``(by, key)`` panel
+    tuple whose values are positive finite non-boolean numbers; its key
+    set must equal every ``(by, key)`` pair in the report. A non-string
+    ``report`` or a non-dict ``weights`` raises ``TypeError``; every
+    other violation, or a single ``by`` dimension holding more than 16
+    panels, raises ``ValueError``. An empty report is valid only with
+    ``weights == {}``.
+
+    Panels are summarized within each ``by`` dimension (``region`` and
+    ``window``). With ``W`` the dimension's total weight, ``base``,
+    ``post`` and ``change`` are the weighted means of the panels'
+    ``baseline``, ``post`` and ``change``. For a dimension of ``n``
+    panels with weighted contributions ``v_i = w_i * change_i / W`` and
+    observed weighted change ``change = sum(v_i)``, all ``2**n`` sign
+    vectors ``(s_1, ..., s_n)`` with ``s_i in {-1, 1}`` are enumerated
+    and ``p`` is the proportion for which
+    ``|sum(s_i * v_i)| >= |change|``. Dimensions sort by ascending ``p``
+    (the BH order) with ``region`` first on ties. Applying
+    Benjamini-Hochberg across the ``N`` tested dimensions in that order,
+    ``q_j = min(1, min_{l >= j}(N * p_l / l))`` and a dimension
+    ``reject``s when ``q`` is no greater than the report's ``alpha``.
+
+    Numbers enter as ``Decimal(str(x))`` and every weighted mean, sign
+    sum and statistic runs under a precision-1000, ROUND_HALF_EVEN local
+    context; comparisons use the unquantized values. Returns a compact
+    UTF-8 JSON string with no spaces and exactly one trailing newline;
+    the top-level key order is ``alpha, groups`` and each group uses
+    ``by, n, base, post, change, p, q, reject``. ``n`` renders as an
+    integer and ``reject`` as a boolean; every other number renders with
+    six decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    alpha, groups = _hotspot_plan_impact_parse(report)
+
+    panel_keys = [(by, key) for by, key, *_ in groups]
+    if set(weights) != set(panel_keys):
+        raise ValueError(
+            "weights keys must be every report (by, key) panel tuple"
+        )
+    panel_weights: dict[tuple[str, str], Decimal] = {}
+    for panel in panel_keys:
+        number = _validate_finite_number(weights[panel], "weights")
+        if number <= 0:
+            raise ValueError("weights values must be positive")
+        panel_weights[panel] = number
+
+    dimensions: dict[str, list[tuple[str, Decimal, Decimal, Decimal, Decimal]]] = {
+        "region": [],
+        "window": [],
+    }
+    for by, key, _, baseline, post, change in groups:
+        dimensions[by].append(
+            (key, panel_weights[(by, key)], baseline, post, change)
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        summaries: list[tuple[str, int, Decimal, Decimal, Decimal, Decimal]] = []
+        for by, panels_in in dimensions.items():
+            n = len(panels_in)
+            if n > _HOTSPOT_SUMMARY_MAX_PANELS:
+                raise ValueError(
+                    f"a single by dimension may hold at most "
+                    f"{_HOTSPOT_SUMMARY_MAX_PANELS} panels"
+                )
+            if n == 0:
+                continue
+            total_weight = sum(
+                (weight for _, weight, *_ in panels_in), Decimal(0)
+            )
+            base = (
+                sum(
+                    (weight * baseline
+                     for _, weight, baseline, _, _ in panels_in),
+                    Decimal(0),
+                )
+                / total_weight
+            )
+            post = (
+                sum(
+                    (weight * post
+                     for _, weight, _, post, _ in panels_in),
+                    Decimal(0),
+                )
+                / total_weight
+            )
+            # Per-panel weighted contributions v_i = w_i * change_i / W;
+            # the observed change is their sum, i.e. the all-plus sign
+            # vector, so its statistic equals the threshold exactly.
+            contributions = [
+                weight * change / total_weight
+                for _, weight, _, _, change in panels_in
+            ]
+            change_mean = sum(contributions, Decimal(0))
+            observed_abs = abs(change_mean)
+            tail = 0
+            for mask in range(1 << n):
+                statistic = Decimal(0)
+                for index, contribution in enumerate(contributions):
+                    if (mask >> index) & 1:
+                        statistic += contribution
+                    else:
+                        statistic -= contribution
+                if abs(statistic) >= observed_abs:
+                    tail += 1
+            p = Decimal(tail) / Decimal(1 << n)
+            summaries.append((by, n, base, post, change_mean, p))
+
+    # Order by ascending p for the BH step-up, region first on ties.
+    summaries.sort(
+        key=lambda item: (item[5], 0 if item[0] == "region" else 1)
+    )
+    tested = len(summaries)
+
+    # Benjamini-Hochberg: q_j = min(1, min_{l >= j} N*p_l/l) with ranks
+    # taken in the sorted order (1-based).
+    q_values: list[Decimal] = [Decimal(0)] * tested
+    running = Decimal(1)
+    for rank in range(tested, 0, -1):
+        candidate = Decimal(tested) * summaries[rank - 1][5] / Decimal(rank)
+        if candidate < running:
+            running = candidate
+        q_values[rank - 1] = min(Decimal(1), running)
+
+    group_tokens: list[str] = []
+    for index, (by, n, base, post, change_mean, p) in enumerate(summaries):
+        q = q_values[index]
+        reject = q <= alpha
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"n":' + str(n)
+            + ',"base":' + _format6(base)
+            + ',"post":' + _format6(post)
+            + ',"change":' + _format6(change_mean)
+            + ',"p":' + _format6(p)
+            + ',"q":' + _format6(q)
+            + ',"reject":' + ("true" if reject else "false")
+            + "}"
+        )
 
     return (
         '{"alpha":' + _format6(alpha)
