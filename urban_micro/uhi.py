@@ -14306,6 +14306,22 @@ class _RankTrajectoryNumber(Decimal):
     """Marker for a canonical fixed-six-decimal number token."""
 
 
+def _rank_pick(value: object, error: str) -> tuple[str, ...]:
+    """Validate one pick: a non-empty list of distinct intervention
+    kinds (members of ``_INTERVENTION_KINDS``) in strictly ascending
+    order, returned as a tuple."""
+    if not isinstance(value, list) or not value or any(
+        kind not in _INTERVENTION_KINDS for kind in value
+    ):
+        raise ValueError(error)
+    if any(
+        value[position] >= value[position + 1]
+        for position in range(len(value) - 1)
+    ):
+        raise ValueError(error)
+    return tuple(value)
+
+
 def _rank_trajectory_parse_int(value: str) -> int:
     return int(value)
 
@@ -14375,16 +14391,7 @@ def _frontier_rank_attribution_parse(
         raise ValueError(_RANK_TRAJECTORY_ERROR)
 
     def _as_pick(value: object) -> tuple[str, ...]:
-        if not isinstance(value, list) or any(
-            not isinstance(kind, str) or not kind for kind in value
-        ):
-            raise ValueError(_RANK_TRAJECTORY_ERROR)
-        if any(
-            value[position] >= value[position + 1]
-            for position in range(len(value) - 1)
-        ):
-            raise ValueError(_RANK_TRAJECTORY_ERROR)
-        return tuple(value)
+        return _rank_pick(value, _RANK_TRAJECTORY_ERROR)
 
     points: list[
         tuple[
@@ -14891,6 +14898,348 @@ def frontier_rank_trajectory(report: str) -> str:
     return (
         '{"alpha":' + _format6(alpha)
         + ',"trajectories":[' + ",".join(segment_strings) + "]}\n"
+    )
+
+
+_RANK_HOTSPOTS_ERROR = (
+    "report must be a frontier_rank_trajectory JSON output"
+)
+
+
+def _frontier_rank_trajectory_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[
+        tuple[
+            tuple[str, ...],
+            list[tuple[tuple[str, str], int, bool]],
+        ]
+    ],
+]:
+    """Parse one :func:`frontier_rank_trajectory` JSON output.
+
+    Returns ``(alpha, segments)`` with segments in canonical order;
+    each segment holds ``(pick, steps)`` where ``steps`` lists one
+    ``(driver, delta, significant)`` triple per step in budget order
+    with ``driver`` the step's ``(by, key)`` panel. The input must be
+    byte-for-byte identical to a canonical output (key order, escaping,
+    spacing, trajectory and step order, the derived ``n``, ``max_abs``,
+    ``driver``, ``persistence``, ``delta`` and ``direction`` fields and
+    the six-decimal number tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_RANK_HOTSPOTS_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_RANK_HOTSPOTS_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_RANK_HOTSPOTS_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_RANK_HOTSPOTS_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_RANK_HOTSPOTS_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_RANK_HOTSPOTS_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {
+        "alpha", "trajectories",
+    }:
+        raise ValueError(_RANK_HOTSPOTS_ERROR)
+    alpha = data["alpha"]
+    raw_trajectories = data["trajectories"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_trajectories, list)
+    ):
+        raise ValueError(_RANK_HOTSPOTS_ERROR)
+
+    def _as_driver(value: object) -> tuple[str, str]:
+        if not isinstance(value, dict) or set(value) != {"by", "key"}:
+            raise ValueError(_RANK_HOTSPOTS_ERROR)
+        by = value["by"]
+        key = value["key"]
+        if (
+            by not in ("region", "window")
+            or not isinstance(key, str)
+            or not key
+        ):
+            raise ValueError(_RANK_HOTSPOTS_ERROR)
+        return (by, key)
+
+    segments: list[
+        tuple[
+            tuple[str, ...],
+            list[tuple[tuple[str, str], int, bool]],
+        ]
+    ] = []
+    segment_tokens: list[str] = []
+    previous_segment: tuple[
+        tuple[str, ...], Decimal, Decimal
+    ] | None = None
+    for trajectory in raw_trajectories:
+        if not isinstance(trajectory, dict) or set(trajectory) != {
+            "pick", "start", "end", "n", "max_abs", "driver",
+            "persistence", "steps",
+        }:
+            raise ValueError(_RANK_HOTSPOTS_ERROR)
+        pick = _rank_pick(trajectory["pick"], _RANK_HOTSPOTS_ERROR)
+        start = trajectory["start"]
+        end = trajectory["end"]
+        count = trajectory["n"]
+        max_abs = trajectory["max_abs"]
+        driver_raw = trajectory["driver"]
+        persistence = trajectory["persistence"]
+        steps_raw = trajectory["steps"]
+        if (
+            not isinstance(start, _RankTrajectoryNumber)
+            or start < 0
+            or not isinstance(end, _RankTrajectoryNumber)
+            or end <= start
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 2
+            or isinstance(max_abs, bool)
+            or not isinstance(max_abs, int)
+            or max_abs < 0
+            or not isinstance(persistence, _RankTrajectoryNumber)
+            or persistence <= 0
+            or persistence > 1
+            or not isinstance(steps_raw, list)
+            or len(steps_raw) != count - 1
+        ):
+            raise ValueError(_RANK_HOTSPOTS_ERROR)
+        driver_by, driver_key = _as_driver(driver_raw)
+
+        # Trajectories order by ascending pick then ascending start;
+        # same-pick segments never touch (their runs are maximal).
+        if previous_segment is not None:
+            prev_pick, prev_start, prev_end = previous_segment
+            if (pick, start) <= (prev_pick, prev_start) or (
+                pick == prev_pick and start <= prev_end
+            ):
+                raise ValueError(_RANK_HOTSPOTS_ERROR)
+        previous_segment = (pick, start, end)
+
+        steps: list[tuple[tuple[str, str], int, bool]] = []
+        step_tokens: list[str] = []
+        driver_counts: dict[tuple[str, str], int] = {}
+        computed_max_abs = 0
+        previous_to: Decimal | None = None
+        for position, step in enumerate(steps_raw):
+            if not isinstance(step, dict) or set(step) != {
+                "from", "to", "from_rank", "to_rank", "delta",
+                "direction", "driver", "significant",
+            }:
+                raise ValueError(_RANK_HOTSPOTS_ERROR)
+            step_from = step["from"]
+            step_to = step["to"]
+            from_rank = step["from_rank"]
+            to_rank = step["to_rank"]
+            delta = step["delta"]
+            direction = step["direction"]
+            significant = step["significant"]
+            if (
+                not isinstance(step_from, _RankTrajectoryNumber)
+                or not isinstance(step_to, _RankTrajectoryNumber)
+                or step_to <= step_from
+                or isinstance(from_rank, bool)
+                or not isinstance(from_rank, int)
+                or from_rank < 1
+                or isinstance(to_rank, bool)
+                or not isinstance(to_rank, int)
+                or to_rank < 1
+                or isinstance(delta, bool)
+                or not isinstance(delta, int)
+                or delta != to_rank - from_rank
+                or direction not in ("rise", "fall", "same")
+                or not isinstance(significant, bool)
+                or (significant and delta == 0)
+            ):
+                raise ValueError(_RANK_HOTSPOTS_ERROR)
+            if delta < 0:
+                expected_direction = "rise"
+            elif delta > 0:
+                expected_direction = "fall"
+            else:
+                expected_direction = "same"
+            if direction != expected_direction:
+                raise ValueError(_RANK_HOTSPOTS_ERROR)
+            step_driver = _as_driver(step["driver"])
+            # Steps chain from ``start`` to ``end`` without gaps.
+            if position == 0:
+                if step_from != start:
+                    raise ValueError(_RANK_HOTSPOTS_ERROR)
+            elif step_from != previous_to:
+                raise ValueError(_RANK_HOTSPOTS_ERROR)
+            previous_to = step_to
+            if abs(delta) > computed_max_abs:
+                computed_max_abs = abs(delta)
+            driver_counts[step_driver] = (
+                driver_counts.get(step_driver, 0) + 1
+            )
+            steps.append((step_driver, delta, significant))
+            step_tokens.append(
+                '{"from":' + _format6(step_from)
+                + ',"to":' + _format6(step_to)
+                + ',"from_rank":' + str(from_rank)
+                + ',"to_rank":' + str(to_rank)
+                + ',"delta":' + str(delta)
+                + ',"direction":'
+                + json.dumps(direction, ensure_ascii=False)
+                + ',"driver":{"by":'
+                + json.dumps(step_driver[0], ensure_ascii=False)
+                + ',"key":'
+                + json.dumps(step_driver[1], ensure_ascii=False)
+                + '},"significant":'
+                + ("true" if significant else "false")
+                + "}"
+            )
+        if previous_to != end or computed_max_abs != max_abs:
+            raise ValueError(_RANK_HOTSPOTS_ERROR)
+
+        # Modal driver; ties resolve region before window, then key.
+        modal_by, modal_key = min(
+            driver_counts,
+            key=lambda item: (
+                -driver_counts[item],
+                0 if item[0] == "region" else 1,
+                item[1],
+            ),
+        )
+        if (modal_by, modal_key) != (driver_by, driver_key):
+            raise ValueError(_RANK_HOTSPOTS_ERROR)
+        with localcontext() as ctx:
+            ctx.prec = _MODEL_PRECISION
+            ctx.rounding = ROUND_HALF_EVEN
+            persistence_value = (
+                Decimal(driver_counts[(modal_by, modal_key)])
+                / Decimal(count - 1)
+            )
+
+        segments.append((pick, steps))
+        segment_tokens.append(
+            '{"pick":'
+            + json.dumps(
+                list(pick), ensure_ascii=False, separators=(",", ":")
+            )
+            + ',"start":' + _format6(start)
+            + ',"end":' + _format6(end)
+            + ',"n":' + str(count)
+            + ',"max_abs":' + str(max_abs)
+            + ',"driver":{"by":'
+            + json.dumps(driver_by, ensure_ascii=False)
+            + ',"key":'
+            + json.dumps(driver_key, ensure_ascii=False)
+            + '},"persistence":' + _format6(persistence_value)
+            + ',"steps":[' + ",".join(step_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations
+    # (whitespace, escaping, key order); the payload must reproduce the
+    # canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"trajectories":[' + ",".join(segment_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_RANK_HOTSPOTS_ERROR)
+    return alpha, segments
+
+
+def rank_hotspots(report: str) -> str:
+    """Aggregate each pick's significant trajectory steps by driver.
+
+    ``report`` must be a byte-for-byte :func:`frontier_rank_trajectory`
+    JSON output; a non-string argument raises ``TypeError`` and every
+    other violation raises ``ValueError``.
+
+    All trajectory steps of a pick are pooled and ``N`` is the pick's
+    total step count. The steps are grouped by their ``(by, key)``
+    driver and only groups containing a ``significant`` step are kept
+    as hotspots. A hotspot's ``steps`` is the driver's total step
+    count, ``hits`` its significant step count, ``max_abs`` the largest
+    ``|delta|`` over its significant steps and ``persistence`` is
+    ``steps / N``, computed under a precision-1000, ROUND_HALF_EVEN
+    context.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, hotspots``
+    and each hotspot uses ``pick, by, key, steps, hits, max_abs,
+    persistence``. Hotspots sort by ascending pick, region panels
+    before window panels and ascending key. ``alpha`` and
+    ``persistence`` render with six decimals, negative zero normalized
+    to ``0.000000``; ``steps``, ``hits`` and ``max_abs`` are integers.
+    A report without significant steps yields ``hotspots`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    alpha, segments = _frontier_rank_trajectory_parse(report)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        per_pick: dict[
+            tuple[str, ...],
+            list[tuple[tuple[str, str], int, bool]],
+        ] = {}
+        for pick, steps in segments:
+            per_pick.setdefault(pick, []).extend(steps)
+
+        hotspot_strings: list[str] = []
+        for pick in sorted(per_pick):
+            pooled = per_pick[pick]
+            total = len(pooled)
+            groups: dict[tuple[str, str], list[tuple[int, bool]]] = {}
+            for driver, delta, significant in pooled:
+                groups.setdefault(driver, []).append((delta, significant))
+            for by, key in sorted(
+                groups,
+                key=lambda item: (0 if item[0] == "region" else 1, item[1]),
+            ):
+                entries = groups[(by, key)]
+                hits = sum(1 for _, flag in entries if flag)
+                if hits == 0:
+                    continue
+                max_abs = max(
+                    abs(delta) for delta, flag in entries if flag
+                )
+                persistence = Decimal(len(entries)) / Decimal(total)
+                hotspot_strings.append(
+                    '{"pick":'
+                    + json.dumps(
+                        list(pick), ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + ',"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"key":' + json.dumps(key, ensure_ascii=False)
+                    + ',"steps":' + str(len(entries))
+                    + ',"hits":' + str(hits)
+                    + ',"max_abs":' + str(max_abs)
+                    + ',"persistence":' + _format6(persistence)
+                    + "}"
+                )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"hotspots":[' + ",".join(hotspot_strings) + "]}\n"
     )
 
 
