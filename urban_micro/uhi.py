@@ -15243,6 +15243,258 @@ def rank_hotspots(report: str) -> str:
     )
 
 
+_RANK_HOTSPOT_PRIORITY_ERROR = (
+    "report must be a rank_hotspots JSON output"
+)
+
+_RANK_HOTSPOT_PRIORITY_MAX_EFFECT = Decimal(10) ** 100
+
+
+def _rank_hotspots_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[tuple[tuple[str, ...], str, str, int, int, Decimal]],
+]:
+    """Parse one :func:`rank_hotspots` JSON output.
+
+    Returns ``(alpha, hotspots)`` with each hotspot a
+    ``(pick, by, key, steps, hits, persistence)`` tuple in canonical
+    order. The input must be byte-for-byte identical to a canonical
+    output (key order, escaping, spacing, hotspot order and the
+    six-decimal number tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "hotspots"}:
+        raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+    alpha = data["alpha"]
+    raw_hotspots = data["hotspots"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_hotspots, list)
+    ):
+        raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+
+    hotspots: list[tuple[tuple[str, ...], str, str, int, int, Decimal]] = []
+    hotspot_tokens: list[str] = []
+    previous: tuple[tuple[str, ...], int, str] | None = None
+    for hotspot in raw_hotspots:
+        if not isinstance(hotspot, dict) or set(hotspot) != {
+            "pick", "by", "key", "steps", "hits", "max_abs",
+            "persistence",
+        }:
+            raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+        pick = _rank_pick(hotspot["pick"], _RANK_HOTSPOT_PRIORITY_ERROR)
+        by = hotspot["by"]
+        key = hotspot["key"]
+        steps = hotspot["steps"]
+        hits = hotspot["hits"]
+        max_abs = hotspot["max_abs"]
+        persistence = hotspot["persistence"]
+        if (
+            by not in ("region", "window")
+            or not isinstance(key, str)
+            or not key
+            or isinstance(steps, bool)
+            or not isinstance(steps, int)
+            or steps < 1
+            or isinstance(hits, bool)
+            or not isinstance(hits, int)
+            or hits < 1
+            or hits > steps
+            or isinstance(max_abs, bool)
+            or not isinstance(max_abs, int)
+            or max_abs < 1
+            or not isinstance(persistence, _RankTrajectoryNumber)
+            or persistence <= 0
+            or persistence > 1
+        ):
+            raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+        # Hotspots order by ascending pick, region panels before window
+        # panels and ascending key; (pick, by, key) never repeats.
+        order_key = (pick, 0 if by == "region" else 1, key)
+        if previous is not None and order_key <= previous:
+            raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+        previous = order_key
+
+        hotspots.append((pick, by, key, steps, hits, persistence))
+        hotspot_tokens.append(
+            '{"pick":'
+            + json.dumps(
+                list(pick), ensure_ascii=False, separators=(",", ":")
+            )
+            + ',"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"key":' + json.dumps(key, ensure_ascii=False)
+            + ',"steps":' + str(steps)
+            + ',"hits":' + str(hits)
+            + ',"max_abs":' + str(max_abs)
+            + ',"persistence":' + _format6(persistence)
+            + "}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations
+    # (whitespace, escaping, key order); the payload must reproduce the
+    # canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"hotspots":[' + ",".join(hotspot_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_RANK_HOTSPOT_PRIORITY_ERROR)
+    return alpha, hotspots
+
+
+def rank_hotspot_priority(report: str, effects: dict) -> str:
+    """Rank each driver's hotspots by intervention priority.
+
+    ``report`` must be a byte-for-byte :func:`rank_hotspots` JSON
+    output; a non-string argument raises ``TypeError`` and every other
+    violation raises ``ValueError``. ``effects`` must be a dict (a
+    non-dict argument raises ``TypeError``) whose key set is exactly the
+    hotspots' ``(pick, by, key)`` identities — with ``pick`` the
+    report's array converted to a tuple — and whose values are
+    ``(effect, q)`` two-tuples; ``effect`` and ``q`` must be finite
+    non-boolean numbers with ``|effect| <= 10**100`` and
+    ``0 <= q <= 1``.
+
+    A hotspot is ``eligible`` when ``effect < 0`` and ``q <= alpha``;
+    its ``score`` is then
+    ``(-effect) * persistence * hits / steps * (1 - q)`` and ``0``
+    otherwise, computed from ``Decimal(str(x))`` inputs under a
+    precision-1000, ROUND_HALF_EVEN context. Hotspots are grouped by
+    their ``(by, key)`` driver and ranked within each group — eligible
+    hotspots first, then descending ``score``, then ascending pick —
+    with ranks starting at 1.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups``,
+    each group uses ``by, key, items`` and each item uses ``pick,
+    effect, q, score, eligible, rank``. Groups sort region panels
+    before window panels then by ascending key; items sort by
+    ascending rank. ``pick`` renders as an array, ``rank`` as an
+    integer and ``eligible`` as a boolean; ``effect``, ``q`` and
+    ``score`` render with six decimals, negative zero normalized to
+    ``0.000000``. A report without hotspots requires ``effects`` to be
+    empty and yields ``groups`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(effects, dict):
+        raise TypeError("effects must be a dict")
+    alpha, hotspots = _rank_hotspots_parse(report)
+
+    expected = {
+        (pick, by, key) for pick, by, key, _, _, _ in hotspots
+    }
+    if set(effects) != expected:
+        raise ValueError(
+            "effects keys must be the hotspot (pick, by, key) tuples"
+        )
+    parsed_effects: dict[tuple, tuple[Decimal, Decimal]] = {}
+    for identity, value in effects.items():
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise ValueError(
+                "each effects value must be an (effect, q) two-tuple"
+            )
+        effect = _validate_finite_number(value[0], "effect")
+        if abs(effect) > _RANK_HOTSPOT_PRIORITY_MAX_EFFECT:
+            raise ValueError("effect must satisfy |effect| <= 10**100")
+        q = _validate_finite_number(value[1], "q")
+        if q < 0 or q > 1:
+            raise ValueError("q must satisfy 0 <= q <= 1")
+        parsed_effects[identity] = (effect, q)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        groups: dict[
+            tuple[str, str],
+            list[tuple[tuple[str, ...], Decimal, Decimal, Decimal, bool]],
+        ] = {}
+        for pick, by, key, steps, hits, persistence in hotspots:
+            effect, q = parsed_effects[(pick, by, key)]
+            eligible = effect < 0 and q <= alpha
+            if eligible:
+                score = (
+                    (-effect) * persistence * hits / steps * (1 - q)
+                )
+            else:
+                score = Decimal(0)
+            groups.setdefault((by, key), []).append(
+                (pick, effect, q, score, eligible)
+            )
+
+        group_strings: list[str] = []
+        for by, key in sorted(
+            groups,
+            key=lambda item: (0 if item[0] == "region" else 1, item[1]),
+        ):
+            ranked = sorted(
+                groups[(by, key)],
+                key=lambda item: (
+                    not item[4], -item[3], item[0]
+                ),
+            )
+            item_strings: list[str] = []
+            for rank, (pick, effect, q, score, eligible) in enumerate(
+                ranked, start=1
+            ):
+                item_strings.append(
+                    '{"pick":'
+                    + json.dumps(
+                        list(pick), ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + ',"effect":' + _format6(effect)
+                    + ',"q":' + _format6(q)
+                    + ',"score":' + _format6(score)
+                    + ',"eligible":'
+                    + ("true" if eligible else "false")
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+            group_strings.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_strings) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_strings) + "]}\n"
+    )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
