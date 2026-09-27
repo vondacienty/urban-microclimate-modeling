@@ -92,6 +92,7 @@ __all__ = [
     "hotspot_plan_impact",
     "hotspot_summary",
     "hotspot_kind_summary",
+    "hotspot_kind_priority",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -16428,9 +16429,10 @@ def hotspot_kind_summary(report: str, effects: dict, weights: dict) -> str:
     values are finite non-boolean numbers. ``weights`` is keyed by every
     ``(by, key)`` panel tuple in the report with positive finite
     non-boolean values. A non-string ``report`` or a non-dict ``effects``
-    or ``weights`` raises ``TypeError``; every other violation, or a
-    single ``by`` dimension spanning more than 16 panels, raises
-    ``ValueError``. An empty report is valid only with
+    or ``weights`` raises ``TypeError``; every other violation, or any
+    single ``(by, kind)`` cell spanning more than 16 panels, raises
+    ``ValueError`` (the error message names the offending cell). An
+    empty report is valid only with
     ``effects == weights == {}``.
 
     Each selected pick holding ``k`` kinds allocates ``effect / k`` to
@@ -16449,9 +16451,11 @@ def hotspot_kind_summary(report: str, effects: dict, weights: dict) -> str:
     ``q_j = min(1, min_{l >= j}(N * p_l / l))`` and an item
     ``reject``s when ``q`` is no greater than the report's ``alpha``.
 
-    Numbers enter as ``Decimal(str(x))`` and every weighted sum, sign sum
-    and statistic runs under a precision-1000, ROUND_HALF_EVEN local
-    context; comparisons use the unquantized values. Returns a compact
+    Numbers enter as ``Decimal(str(x))`` and every weighted sum, sign
+    sum, statistic and BH step (the ``N*p/l`` products, running
+    minimum, ``q`` values and reject comparisons) runs under a
+    precision-1000, ROUND_HALF_EVEN local context; comparisons use the
+    unquantized values. Returns a compact
     UTF-8 JSON string with no spaces and exactly one trailing newline;
     the top-level key order is ``alpha, groups``, each group uses
     ``by, items`` and each item uses ``kind, n, change, p, q, reject``.
@@ -16533,8 +16537,9 @@ def hotspot_kind_summary(report: str, effects: dict, weights: dict) -> str:
                 n = len(panels_in)
                 if n > _HOTSPOT_KIND_SUMMARY_MAX_PANELS:
                     raise ValueError(
-                        "a single by dimension may hold at most "
-                        f"{_HOTSPOT_KIND_SUMMARY_MAX_PANELS} panels"
+                        "a single (by, kind) cell may hold at most "
+                        f"{_HOTSPOT_KIND_SUMMARY_MAX_PANELS} panels: "
+                        f"({by!r}, {kind!r}) holds {n}"
                     )
                 total_weight = sum(
                     (weight for weight, _ in panels_in), Decimal(0)
@@ -16572,47 +16577,295 @@ def hotspot_kind_summary(report: str, effects: dict, weights: dict) -> str:
     )
     tested = len(items)
 
-    # Benjamini-Hochberg: q_j = min(1, min_{l >= j} N*p_l/l) with ranks
-    # taken in the sorted order (1-based).
-    q_values: list[Decimal] = [Decimal(0)] * tested
-    running = Decimal(1)
-    for rank in range(tested, 0, -1):
-        candidate = Decimal(tested) * items[rank - 1][4] / Decimal(rank)
-        if candidate < running:
-            running = candidate
-        q_values[rank - 1] = min(Decimal(1), running)
+    # The BH N*p/l products, running-minimum, q values and the reject
+    # comparisons all stay inside the same precision-1000,
+    # ROUND_HALF_EVEN local context as the statistics above; comparisons
+    # use the unquantized values.
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
 
-    # Render groups/items by ascending by/kind while keeping each item's
-    # BH q alongside it.
-    rendered: dict[tuple[str, str], str] = {}
-    for index, (by, kind, n, change, p) in enumerate(items):
-        q = q_values[index]
-        reject = q <= alpha
-        rendered[(by, kind)] = (
-            '{"kind":' + json.dumps(kind, ensure_ascii=False)
-            + ',"n":' + str(n)
-            + ',"change":' + _format6(change)
-            + ',"p":' + _format6(p)
-            + ',"q":' + _format6(q)
-            + ',"reject":' + ("true" if reject else "false")
-            + "}"
+        # Benjamini-Hochberg: q_j = min(1, min_{l >= j} N*p_l/l) with
+        # ranks taken in the sorted order (1-based).
+        q_values: list[Decimal] = [Decimal(0)] * tested
+        running = Decimal(1)
+        for rank in range(tested, 0, -1):
+            candidate = Decimal(tested) * items[rank - 1][4] / Decimal(rank)
+            if candidate < running:
+                running = candidate
+            q_values[rank - 1] = min(Decimal(1), running)
+
+        # Render groups/items by ascending by/kind while keeping each
+        # item's BH q alongside it.
+        rendered: dict[tuple[str, str], str] = {}
+        for index, (by, kind, n, change, p) in enumerate(items):
+            q = q_values[index]
+            reject = q <= alpha
+            rendered[(by, kind)] = (
+                '{"kind":' + json.dumps(kind, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"change":' + _format6(change)
+                + ',"p":' + _format6(p)
+                + ',"q":' + _format6(q)
+                + ',"reject":' + ("true" if reject else "false")
+                + "}"
+            )
+
+        group_tokens: list[str] = []
+        for by in ("region", "window"):
+            kinds = sorted(cells[by])
+            if not kinds:
+                continue
+            item_tokens = [rendered[(by, kind)] for kind in kinds]
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+        return (
+            '{"alpha":' + _format6(alpha)
+            + ',"groups":[' + ",".join(group_tokens) + "]}\n"
         )
 
+
+_HOTSPOT_KIND_PRIORITY_ERROR = (
+    "report must be a hotspot_kind_summary JSON output"
+)
+
+
+def _hotspot_kind_summary_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[
+        tuple[
+            str,
+            list[tuple[str, int, Decimal, Decimal, Decimal, bool]],
+        ]
+    ],
+]:
+    """Parse one :func:`hotspot_kind_summary` JSON output.
+
+    Returns ``(alpha, groups)`` in canonical group order (region before
+    window); each group is ``(by, items)`` with items in canonical
+    (ascending kind) order, each item holding
+    ``(kind, n, change, p, q, reject)``. The input must be byte-for-byte
+    identical to a canonical output (key order, escaping, spacing, group
+    and item order and the six-decimal number tokens included); any
+    deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+
+    groups: list[
+        tuple[str, list[tuple[str, int, Decimal, Decimal, Decimal, bool]]]
+    ] = []
     group_tokens: list[str] = []
-    for by in ("region", "window"):
-        kinds = sorted(cells[by])
-        if not kinds:
-            continue
-        item_tokens = [rendered[(by, kind)] for kind in kinds]
+    previous_by: int | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"by", "items"}:
+            raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+        by = group["by"]
+        raw_items = group["items"]
+        if by not in ("region", "window") or not isinstance(raw_items, list):
+            raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+        by_order = 0 if by == "region" else 1
+        if previous_by is not None and by_order <= previous_by:
+            raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+        previous_by = by_order
+        # A by dimension without a tested kind is omitted, so a present
+        # group always holds at least one item.
+        if not raw_items:
+            raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+
+        items: list[tuple[str, int, Decimal, Decimal, Decimal, bool]] = []
+        item_tokens: list[str] = []
+        previous_kind: str | None = None
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {
+                "kind", "n", "change", "p", "q", "reject",
+            }:
+                raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+            kind = item["kind"]
+            n = item["n"]
+            change = item["change"]
+            p = item["p"]
+            q = item["q"]
+            reject = item["reject"]
+            if (
+                not isinstance(kind, str)
+                or not kind
+                or kind not in _INTERVENTION_KINDS
+                or (previous_kind is not None and kind <= previous_kind)
+                or isinstance(n, bool)
+                or not isinstance(n, int)
+                or n < 1
+                or n > _HOTSPOT_KIND_SUMMARY_MAX_PANELS
+                or not isinstance(change, _RankTrajectoryNumber)
+                or not isinstance(p, _RankTrajectoryNumber)
+                or p < 0
+                or p > 1
+                or not isinstance(q, _RankTrajectoryNumber)
+                or q < 0
+                or q > 1
+                or not isinstance(reject, bool)
+            ):
+                raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+            previous_kind = kind
+            items.append((kind, n, change, p, q, reject))
+            item_tokens.append(
+                '{"kind":' + json.dumps(kind, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"change":' + _format6(change)
+                + ',"p":' + _format6(p)
+                + ',"q":' + _format6(q)
+                + ',"reject":' + ("true" if reject else "false")
+                + "}"
+            )
+
+        groups.append((by, items))
         group_tokens.append(
             '{"by":' + json.dumps(by, ensure_ascii=False)
             + ',"items":[' + ",".join(item_tokens) + "]}"
         )
 
-    return (
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
         '{"alpha":' + _format6(alpha)
-        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
     )
+    if payload != canonical:
+        raise ValueError(_HOTSPOT_KIND_PRIORITY_ERROR)
+    return alpha, groups
+
+
+def hotspot_kind_priority(report: str, cost: dict) -> str:
+    """Rank each ``(by, kind)`` item of a :func:`hotspot_kind_summary`
+    report by cooling-per-cost priority.
+
+    ``report`` must be a byte-for-byte :func:`hotspot_kind_summary` JSON
+    output and ``cost`` a dict whose key set is exactly the set of
+    intervention kinds appearing in the report, with strictly positive
+    finite non-boolean int/float values; an empty report is accepted
+    only with ``cost == {}``. A non-string ``report`` or a non-dict
+    ``cost`` raises ``TypeError``; every other violation raises
+    ``ValueError``.
+
+    An item is eligible when its report ``reject`` flag is true and its
+    ``change`` is negative; its score is then ``(-change) / cost`` and
+    ``0`` otherwise. Within each ``by`` dimension ranks start at 1,
+    ordered by eligible first, then descending score, then ascending
+    kind.
+
+    Numbers enter as ``Decimal(str(x))`` and the score arithmetic and
+    every comparison run under a precision-1000, ROUND_HALF_EVEN local
+    context on the unquantized values. Returns a compact UTF-8 JSON
+    string with no spaces and exactly one trailing newline; the
+    top-level key order is ``alpha, groups``, each group uses
+    ``by, items`` and each item uses
+    ``kind, n, change, q, cost, score, eligible, rank``. Groups sort
+    region before window and items by rank; ``n`` and ``rank`` render as
+    integers and ``eligible`` as a boolean while every other number
+    renders with six decimals, negative zero normalized to
+    ``0.000000``. A report without items yields ``groups`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(cost, dict):
+        raise TypeError("cost must be a dict")
+    alpha, groups = _hotspot_kind_summary_parse(report)
+
+    kinds = {
+        kind
+        for _by, items in groups
+        for kind, _n, _change, _p, _q, _reject in items
+    }
+    if set(cost) != kinds:
+        raise ValueError("cost keys must be every kind in the report")
+    cost_values: dict[str, Decimal] = {}
+    for kind in kinds:
+        number = _validate_finite_number(cost[kind], "cost")
+        if number <= 0:
+            raise ValueError("cost values must be positive")
+        cost_values[kind] = number
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        group_tokens: list[str] = []
+        for by, items in groups:
+            ranked: list[tuple[str, int, Decimal, Decimal, Decimal, bool]] = []
+            for kind, n, change, _p, q, reject in items:
+                eligible = reject and change < 0
+                if eligible:
+                    score = (-change) / cost_values[kind]
+                else:
+                    score = Decimal(0)
+                ranked.append((kind, n, change, q, score, eligible))
+            ranked.sort(key=lambda item: (not item[5], -item[4], item[0]))
+
+            item_tokens: list[str] = []
+            for rank, (kind, n, change, q, score, eligible) in enumerate(
+                ranked, start=1
+            ):
+                item_tokens.append(
+                    '{"kind":' + json.dumps(kind, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"change":' + _format6(change)
+                    + ',"q":' + _format6(q)
+                    + ',"cost":' + _format6(cost_values[kind])
+                    + ',"score":' + _format6(score)
+                    + ',"eligible":' + ("true" if eligible else "false")
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+        return (
+            '{"alpha":' + _format6(alpha)
+            + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+        )
 
 
 _TEMPORAL_LAG_MAX_N = 8
