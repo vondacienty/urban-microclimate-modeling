@@ -95,6 +95,7 @@ __all__ = [
     "hotspot_kind_priority",
     "hotspot_kind_portfolio",
     "kind_impact",
+    "kind_impact_summary",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -17210,6 +17211,7 @@ def hotspot_kind_portfolio(report: str, budgets: dict, allow: dict) -> str:
 
 _KIND_IMPACT_ERROR = "report must be a hotspot_kind_portfolio JSON output"
 _KIND_IMPACT_BYS = ("region", "window")
+_KIND_IMPACT_BUDGET_TOL = Decimal("0.000002")
 
 
 def _kind_impact_parse(
@@ -17337,6 +17339,17 @@ def _kind_impact_parse(
             + "}"
             for kind, reason in skip
         ) + "]"
+
+        # The empty subset is the only feasible portfolio with zero cost:
+        # then cost and score must be 0 and the whole budget must remain.
+        if not pick_tuple and (
+            cost != 0 or score != 0 or remaining != budget
+        ):
+            raise ValueError(_KIND_IMPACT_ERROR)
+        # The producer always sets remaining = budget - cost; tolerate the
+        # six-decimal quantization of the upstream budget/cost values.
+        if abs(budget - cost - remaining) > _KIND_IMPACT_BUDGET_TOL:
+            raise ValueError(_KIND_IMPACT_ERROR)
 
         groups.append((by, pick_tuple))
         group_tokens.append(
@@ -17498,6 +17511,347 @@ def kind_impact(report: str, data: dict) -> str:
         '{"alpha":' + _format6(alpha)
         + ',"groups":[' + ",".join(group_tokens) + "]}\n"
     )
+
+
+_KIND_IMPACT_SUMMARY_ERROR = "report must be a kind_impact JSON output"
+_KIND_IMPACT_SUMMARY_METRICS = ("uhi", "energy", "vent")
+_KIND_IMPACT_SUMMARY_MAX_PANELS = 16
+
+
+def _kind_impact_summary_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[
+        tuple[
+            str,
+            list[
+                tuple[
+                    str,
+                    tuple[str, ...],
+                    tuple[Decimal, Decimal, Decimal],
+                    tuple[Decimal, Decimal, Decimal],
+                    tuple[Decimal, Decimal, Decimal],
+                ]
+            ],
+        ]
+    ],
+]:
+    """Parse one :func:`kind_impact` JSON output.
+
+    Returns ``(alpha, groups)`` in canonical group order (region before
+    window); each group is ``(by, items)`` with items in canonical
+    (ascending key) order, each item holding
+    ``(key, pick, base, post, change)`` where each of ``base``, ``post``
+    and ``change`` is a ``(uhi, energy, vent)`` Decimal triple. The input
+    must be byte-for-byte identical to a canonical output (key order,
+    escaping, spacing, group and item order and the six-decimal number
+    tokens included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_KIND_IMPACT_SUMMARY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+
+    groups = []
+    group_tokens: list[str] = []
+    previous_by: int | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"by", "items"}:
+            raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+        by = group["by"]
+        raw_items = group["items"]
+        if by not in _KIND_IMPACT_BYS or not isinstance(raw_items, list):
+            raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+        by_order = 0 if by == "region" else 1
+        if previous_by is not None and by_order <= previous_by:
+            raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+        previous_by = by_order
+        # Every reported group holds at least one panel.
+        if not raw_items:
+            raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+
+        items = []
+        item_tokens: list[str] = []
+        previous_key: str | None = None
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {
+                "key", "pick", "uhi", "energy", "vent",
+            }:
+                raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+            key = item["key"]
+            raw_pick = item["pick"]
+            triples = []
+            if (
+                not isinstance(key, str)
+                or not key
+                or (previous_key is not None and key <= previous_key)
+                or not isinstance(raw_pick, list)
+            ):
+                raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+            for metric in _KIND_IMPACT_SUMMARY_METRICS:
+                raw_triple = item[metric]
+                if not isinstance(raw_triple, list) or len(raw_triple) != 3:
+                    raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+                if not all(
+                    isinstance(component, _RankTrajectoryNumber)
+                    for component in raw_triple
+                ):
+                    raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+                triples.append(tuple(raw_triple))
+            pick: list[str] = []
+            for kind in raw_pick:
+                if (
+                    not isinstance(kind, str)
+                    or not kind
+                    or kind not in _INTERVENTION_KINDS
+                    or (pick and kind <= pick[-1])
+                ):
+                    raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+                pick.append(kind)
+            pick_tuple = tuple(pick)
+            previous_key = key
+            items.append(
+                (key, pick_tuple, triples[0], triples[1], triples[2])
+            )
+
+            pick_token = "[" + ",".join(
+                json.dumps(kind, ensure_ascii=False) for kind in pick_tuple
+            ) + "]"
+            triple_tokens = [
+                "["
+                + ",".join(_format6(component) for component in triple)
+                + "]"
+                for triple in triples
+            ]
+            item_tokens.append(
+                '{"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"pick":' + pick_token
+                + ',"uhi":' + triple_tokens[0]
+                + ',"energy":' + triple_tokens[1]
+                + ',"vent":' + triple_tokens[2]
+                + "}"
+            )
+
+        groups.append((by, items))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_KIND_IMPACT_SUMMARY_ERROR)
+    return alpha, groups
+
+
+def kind_impact_summary(report: str, weights: dict) -> str:
+    """Aggregate a :func:`kind_impact` report per dimension and metric.
+
+    ``report`` must be a byte-for-byte :func:`kind_impact` JSON output.
+    ``weights`` is a dict whose keys are exactly the report's full set of
+    ``(by, key)`` panel tuples; each value is a positive finite
+    non-boolean int/float. A non-string ``report`` or a non-dict
+    ``weights`` raises ``TypeError``; every other violation, or any
+    single ``by`` dimension spanning more than 16 panels, raises
+    ``ValueError``. An empty report is accepted only with
+    ``weights == {}``.
+
+    For each ``by`` dimension and each metric (``uhi``, ``energy`` and
+    ``vent``), ``n`` is the dimension's panel count and, with ``W`` the
+    total weight, ``base``, ``post`` and ``change`` are the weighted
+    means ``sum(w_i * x_i) / W`` of the panels' base/post/change values.
+    All ``2**n`` sign vectors ``(s_1, ..., s_n)`` with
+    ``s_i in {-1, 1}`` are enumerated and ``p`` is the proportion for
+    which ``|sum(s_i * w_i * change_i / W)| >= |change|``. The items
+    (one per ``(by, metric)``) are ranked ascending by
+    ``(p, by order, metric order)`` with region before window and uhi
+    before energy before vent, and Benjamini-Hochberg is applied across
+    all of them: ``q_j = min(1, min_{l >= j}(N * p_l / l))``; an item
+    ``reject``s when ``q`` is no greater than the report's ``alpha``.
+
+    Numbers enter as ``Decimal(str(x))`` and every weighted sum, sign
+    sum, statistic and BH step runs under a precision-1000,
+    ROUND_HALF_EVEN local context; comparisons use the unquantized
+    values. Returns a compact UTF-8 JSON string with no spaces and
+    exactly one trailing newline; the top-level key order is
+    ``alpha, items`` and each item uses
+    ``by, metric, n, base, post, change, p, q, reject``. Items sort by
+    ascending ``by`` then ``metric``; ``n`` renders as an integer and
+    ``reject`` as a boolean while every other number renders with six
+    decimals, negative zero normalized to ``0.000000``. A report without
+    groups yields ``items`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    alpha, groups = _kind_impact_summary_parse(report)
+
+    panel_keys = [(by, key) for by, items in groups for key, *_ in items]
+    if not groups and weights:
+        raise ValueError("an empty report accepts only weights == {}")
+    if set(weights) != set(panel_keys):
+        raise ValueError(
+            "weights keys must be every report (by, key) panel tuple"
+        )
+
+    panel_weights: dict[tuple[str, str], Decimal] = {}
+    for panel in panel_keys:
+        number = _validate_finite_number(weights[panel], "weights")
+        if number <= 0:
+            raise ValueError("weights values must be positive")
+        panel_weights[panel] = number
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # One row per (by, metric): (by, metric, n, base, post, change, p).
+        items: list[tuple] = []
+        for by, group_items in groups:
+            n = len(group_items)
+            if n > _KIND_IMPACT_SUMMARY_MAX_PANELS:
+                raise ValueError(
+                    "a single by dimension may hold at most "
+                    f"{_KIND_IMPACT_SUMMARY_MAX_PANELS} panels: "
+                    f"{by!r} holds {n}"
+                )
+            total_weight = sum(
+                (panel_weights[(by, key)] for key, *_ in group_items),
+                Decimal(0),
+            )
+            for metric_index, metric in enumerate(
+                _KIND_IMPACT_SUMMARY_METRICS
+            ):
+                # Per-panel weighted contributions w_i * x_i / W. Each
+                # stored item holds the per-metric (base, post, change)
+                # triples in uhi/energy/vent order.
+                base_parts: list[Decimal] = []
+                post_parts: list[Decimal] = []
+                change_parts: list[Decimal] = []
+                for key, _pick, uhi_triple, energy_triple, vent_triple in (
+                    group_items
+                ):
+                    metric_triple = (
+                        uhi_triple, energy_triple, vent_triple
+                    )[metric_index]
+                    share = panel_weights[(by, key)] / total_weight
+                    base_parts.append(share * metric_triple[0])
+                    post_parts.append(share * metric_triple[1])
+                    change_parts.append(share * metric_triple[2])
+                base = sum(base_parts, Decimal(0))
+                post = sum(post_parts, Decimal(0))
+                change = sum(change_parts, Decimal(0))
+                observed_abs = abs(change)
+                tail = 0
+                for mask in range(1 << n):
+                    statistic = Decimal(0)
+                    for index, contribution in enumerate(change_parts):
+                        if (mask >> index) & 1:
+                            statistic += contribution
+                        else:
+                            statistic -= contribution
+                    if abs(statistic) >= observed_abs:
+                        tail += 1
+                p = Decimal(tail) / Decimal(1 << n)
+                items.append(
+                    (by, metric, n, base, post, change, p)
+                )
+
+    # Rank ascending by (p, by order, metric order) for the BH step-up.
+    items.sort(
+        key=lambda row: (
+            row[6],
+            0 if row[0] == "region" else 1,
+            _KIND_IMPACT_SUMMARY_METRICS.index(row[1]),
+        )
+    )
+    tested = len(items)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # Benjamini-Hochberg: q_j = min(1, min_{l >= j} N*p_l/l) with
+        # ranks taken in the sorted order (1-based).
+        q_values: list[Decimal] = [Decimal(0)] * tested
+        running = Decimal(1)
+        for rank in range(tested, 0, -1):
+            candidate = Decimal(tested) * items[rank - 1][6] / Decimal(rank)
+            if candidate < running:
+                running = candidate
+            q_values[rank - 1] = min(Decimal(1), running)
+
+        # Render items by ascending by then metric, keeping each item's
+        # BH q alongside it.
+        rendered: dict[tuple[str, str], str] = {}
+        for index, (by, metric, n, base, post, change, p) in enumerate(items):
+            q = q_values[index]
+            reject = q <= alpha
+            rendered[(by, metric)] = (
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"metric":' + json.dumps(metric, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"base":' + _format6(base)
+                + ',"post":' + _format6(post)
+                + ',"change":' + _format6(change)
+                + ',"p":' + _format6(p)
+                + ',"q":' + _format6(q)
+                + ',"reject":' + ("true" if reject else "false")
+                + "}"
+            )
+
+        item_tokens: list[str] = []
+        for by in _KIND_IMPACT_BYS:
+            if not any(group_by == by for group_by, _ in groups):
+                continue
+            for metric in _KIND_IMPACT_SUMMARY_METRICS:
+                item_tokens.append(rendered[(by, metric)])
+
+        return (
+            '{"alpha":' + _format6(alpha)
+            + ',"items":[' + ",".join(item_tokens) + "]}\n"
+        )
 
 
 _TEMPORAL_LAG_MAX_N = 8
