@@ -19337,6 +19337,262 @@ def driver_plan(report: str, actions: dict, limit) -> str:
     return '{"groups":[' + ",".join(group_tokens) + "]}\n"
 
 
+def driver_plan_frontier(report: str, actions: dict, limits: list) -> str:
+    """Trace the budgeted :func:`driver_plan` optimum over several limits.
+
+    ``report`` and ``actions`` follow the :func:`driver_plan` contract
+    exactly — the same canonical :func:`driver_link` JSON output, the
+    same ``green``/``roof``/``material`` to ``(factor, cost)`` mapping
+    and the same eligibility, scoring and tie-break rules. ``limits``
+    must be a non-empty list of finite non-boolean non-negative
+    int/float values that are pairwise distinct by their
+    ``Decimal(str(x))`` value. A non-string ``report``, a non-dict
+    ``actions`` or a non-list ``limits`` raises ``TypeError``; every
+    other contract violation raises ``ValueError``.
+
+    The limits are processed in ascending numeric order and the optimum
+    is solved independently for each reported ``by`` (region before
+    window): every subset of the eligible candidate pool whose total
+    cost is at most the current limit is enumerated and the winner
+    maximizes ``sum(score / cost)``, then minimizes total cost, then
+    minimizes the lexicographically ascending ``pick`` — the empty
+    subset is always feasible. Per ``by``, the first point is compared
+    against a baseline of ``priority`` 0 and an empty pick; each later
+    point is compared with that ``by``'s previous point, so ``marginal``
+    is the priority difference and ``added``/``removed`` are the
+    ascending set differences between the current and previous picks.
+    A point is ``dominated`` when a strictly smaller-limit point of the
+    same ``by`` has ``priority`` greater than or equal to its own and
+    ``cost`` less than or equal to its own. Costs, scores and limits
+    enter as ``Decimal(str(x))``; arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context and comparisons use
+    the unquantized values.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key is ``points`` and each point
+    uses ``limit, groups`` with groups ordered region before window.
+    Each group uses ``by, cost, priority, marginal, pick, added,
+    removed, effects, range, dominated``; ``pick``, ``added`` and
+    ``removed`` are ascending string arrays, ``effects`` is ordered
+    ``uhi, energy, vent`` and ``range`` ``low, high``. Every number
+    renders with six decimals, negative zero normalized to
+    ``0.000000``. An empty report yields one point per limit with
+    ``groups`` an empty list.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(actions, dict):
+        raise TypeError("actions must be a dict")
+    if not isinstance(limits, list):
+        raise TypeError("limits must be a list")
+    if not limits:
+        raise ValueError("limits must be a non-empty list")
+
+    kind_factor: dict[str, str] = {}
+    kind_cost: dict[str, Decimal] = {}
+    for kind in _INTERVENTION_KINDS:
+        if kind not in actions:
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        value = actions[kind]
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        factor, cost = value
+        if not isinstance(factor, str) or factor not in _DRIVER_ATTR_FACTORS:
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        if isinstance(cost, float) and not math.isfinite(cost):
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        cost_value = Decimal(str(cost))
+        if cost_value <= 0:
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        kind_factor[kind] = factor
+        kind_cost[kind] = cost_value
+    if set(actions) != set(_INTERVENTION_KINDS):
+        raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+    if len(set(kind_factor.values())) != len(_INTERVENTION_KINDS):
+        raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+
+    limit_values: list[Decimal] = []
+    seen_limits: set[Decimal] = set()
+    for limit in limits:
+        if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+            raise ValueError("each limit must be a finite int or float")
+        if isinstance(limit, float) and not math.isfinite(limit):
+            raise ValueError("each limit must be finite")
+        limit_value = Decimal(str(limit))
+        if limit_value < 0:
+            raise ValueError("each limit must be non-negative")
+        if limit_value in seen_limits:
+            raise ValueError("limits must be distinct")
+        seen_limits.add(limit_value)
+        limit_values.append(limit_value)
+    limit_values.sort()
+
+    _alpha, linked = _driver_plan_report_parse(report)
+    bys = {by for by, _factor in linked}
+    ordered_bys = [by for by in _KIND_IMPACT_BYS if by in bys]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        zero = Decimal(0)
+
+        # Enumerate every feasible candidate subset once per by; each
+        # record is (priority, cost, pick, effects, low, high).
+        subsets_by: dict[
+            str,
+            list[
+                tuple[
+                    Decimal, Decimal, tuple[str, ...],
+                    dict[str, Decimal], Decimal, Decimal,
+                ]
+            ],
+        ] = {}
+        for by in ordered_bys:
+            candidates: list[
+                tuple[str, Decimal, Decimal, str, Decimal, Decimal, Decimal]
+            ] = []
+            for kind in _INTERVENTION_KINDS:
+                factor = kind_factor[kind]
+                metric, effect, low, high, _q, score, eligible = linked[
+                    (by, factor)
+                ]
+                if eligible:
+                    candidates.append(
+                        (kind, kind_cost[kind], score, metric, effect,
+                         low, high)
+                    )
+
+            subsets = []
+            for mask in range(1 << len(candidates)):
+                chosen = [
+                    candidates[index]
+                    for index in range(len(candidates))
+                    if mask & (1 << index)
+                ]
+                total_cost = sum(
+                    (candidate[1] for candidate in chosen), zero
+                )
+                priority = sum(
+                    (candidate[2] / candidate[1] for candidate in chosen),
+                    zero,
+                )
+                pick = tuple(sorted(candidate[0] for candidate in chosen))
+                effects = {
+                    metric: zero for metric in _KIND_IMPACT_METRICS
+                }
+                range_low = zero
+                range_high = zero
+                for _kind, _cost, _score, metric, effect, low, high in chosen:
+                    effects[metric] += effect
+                    range_low += low
+                    range_high += high
+                subsets.append(
+                    (priority, total_cost, pick, effects,
+                     range_low, range_high)
+                )
+            subsets_by[by] = subsets
+
+        prev_priority = {by: zero for by in ordered_bys}
+        prev_pick: dict[str, tuple[str, ...]] = {
+            by: () for by in ordered_bys
+        }
+        history: dict[str, list[tuple[Decimal, Decimal]]] = {
+            by: [] for by in ordered_bys
+        }
+
+        point_tokens: list[str] = []
+        for limit_value in limit_values:
+            group_tokens: list[str] = []
+            for by in ordered_bys:
+                best: tuple[
+                    Decimal, Decimal, tuple[str, ...],
+                    dict[str, Decimal], Decimal, Decimal,
+                ] | None = None
+                for priority, total_cost, pick, effects, low, high in (
+                    subsets_by[by]
+                ):
+                    if total_cost > limit_value:
+                        continue
+                    if (
+                        best is None
+                        or priority > best[0]
+                        or (
+                            priority == best[0]
+                            and (
+                                total_cost < best[1]
+                                or (
+                                    total_cost == best[1]
+                                    and pick < best[2]
+                                )
+                            )
+                        )
+                    ):
+                        best = (
+                            priority, total_cost, pick, effects, low, high
+                        )
+
+                assert best is not None  # the empty subset is always feasible
+                priority, total_cost, pick, effects, low, high = best
+                marginal = priority - prev_priority[by]
+                chosen_set = set(pick)
+                previous_set = set(prev_pick[by])
+                added = sorted(chosen_set - previous_set)
+                removed = sorted(previous_set - chosen_set)
+                dominated = any(
+                    old_priority >= priority and old_cost <= total_cost
+                    for old_priority, old_cost in history[by]
+                )
+
+                effects_token = (
+                    '{"uhi":' + _format6(effects["uhi"])
+                    + ',"energy":' + _format6(effects["energy"])
+                    + ',"vent":' + _format6(effects["vent"])
+                    + "}"
+                )
+                range_token = (
+                    '{"low":' + _format6(low)
+                    + ',"high":' + _format6(high)
+                    + "}"
+                )
+                group_tokens.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"cost":' + _format6(total_cost)
+                    + ',"priority":' + _format6(priority)
+                    + ',"marginal":' + _format6(marginal)
+                    + ',"pick":'
+                    + json.dumps(
+                        list(pick), ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + ',"added":'
+                    + json.dumps(
+                        added, ensure_ascii=False, separators=(",", ":")
+                    )
+                    + ',"removed":'
+                    + json.dumps(
+                        removed, ensure_ascii=False, separators=(",", ":")
+                    )
+                    + ',"effects":' + effects_token
+                    + ',"range":' + range_token
+                    + ',"dominated":' + ("true" if dominated else "false")
+                    + "}"
+                )
+
+                prev_priority[by] = priority
+                prev_pick[by] = pick
+                history[by].append((priority, total_cost))
+
+            point_tokens.append(
+                '{"limit":' + _format6(limit_value)
+                + ',"groups":[' + ",".join(group_tokens) + "]}"
+            )
+
+    return '{"points":[' + ",".join(point_tokens) + "]}\n"
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
