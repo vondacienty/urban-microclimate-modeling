@@ -96,6 +96,7 @@ __all__ = [
     "hotspot_kind_portfolio",
     "kind_impact",
     "kind_impact_summary",
+    "driver_attr",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -17873,6 +17874,242 @@ def kind_impact_summary(report: str, weights: dict) -> str:
                     + ',"reject":' + ("true" if reject else "false")
                     + "}"
                 )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"items":[' + ",".join(item_tokens) + "]}\n"
+    )
+
+
+_DRIVER_FACTORS = ("station", "lst", "morph", "cover")
+_DRIVER_ATTR_MAX_N = 8
+
+
+def driver_attr(report: str, data: dict) -> str:
+    """Attribute UHI change to driver factors per dimension via permutation
+    correlations with a Benjamini-Hochberg correction.
+
+    ``report`` must be a byte-for-byte :func:`kind_impact` JSON output and
+    ``data`` a dict whose keys are exactly every reported ``(by, key)``
+    panel tuple: ``by`` is ``"region"`` or ``"window"`` and ``key`` the
+    panel key. Each value is a ``(station, lst, morph, cover)`` quadruple
+    of finite non-boolean int/float numbers, one observation per factor
+    for that panel. A non-string ``report`` or a non-dict ``data`` raises
+    ``TypeError``; every other violation raises ``ValueError``. An empty
+    report is accepted only with ``data == {}``.
+
+    Within each reported ``by`` dimension the panels supply ``y``, the
+    panel's UHI ``change`` from the report, and for every factor
+    ``station``, ``lst``, ``morph`` and ``cover`` the matching ``x``
+    series, with ``n`` the number of panels. Their Pearson correlation is
+    ``r = sum((x - mean(x)) * (y - mean(y))) / sqrt(sum((x -
+    mean(x)) ** 2) * sum((y - mean(y)) ** 2))``. When either sum of
+    squares is zero, ``(r, p)`` is ``(0, 1)``; otherwise all ``n!``
+    positional permutations of ``y`` (duplicates counted) are enumerated
+    and ``p`` is the proportion for which ``|r'| >= |r|``. A dimension
+    with more than eight panels raises ``ValueError``.
+
+    Every factor of both dimensions is tested in one
+    Benjamini-Hochberg pass ordered by ascending ``p``, region before
+    window and then ``station, lst, morph, cover`` on ties:
+    ``q_j = min(1, min_{l >= j}(N * p_l / l))``. An item ``reject``s when
+    ``q`` is no greater than the report's ``alpha``. Each dimension
+    contributes at most one output item: the rejected factor with the
+    greatest ``|r|``, factor order breaking ties; a dimension without a
+    rejected factor is omitted. ``direction`` is ``"down"``, ``"up"`` or
+    ``"flat"`` according to the sign of ``r``.
+
+    Numbers enter as ``Decimal(str(x))`` and every statistic, permutation
+    count and BH step runs under a precision-1000, ROUND_HALF_EVEN local
+    context; comparisons use the unquantized values (the permutation
+    tail and ``|r|`` ordering use exact rational arithmetic so equal
+    statistics are never split by rounding). Returns a compact UTF-8 JSON
+    string with no spaces and exactly one trailing newline; the top-level
+    key order is ``alpha, items`` and each item uses
+    ``by, factor, n, effect, p, q, reject, direction``. Items sort region
+    before window; ``n`` renders as an integer and ``reject`` as a
+    boolean while every other number renders with six decimals, negative
+    zero normalized to ``0.000000``. An empty report yields ``items``
+    empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dict")
+    alpha, groups = _kind_impact_output_parse(report)
+
+    report_panels: dict[str, list[str]] = {
+        by: [key for key, _pick, _metrics in items] for by, items in groups
+    }
+    if not groups and data:
+        raise ValueError("an empty report accepts only data == {}")
+
+    # by -> {key: (station, lst, morph, cover) Decimals}
+    panels: dict[str, dict[str, tuple[Decimal, ...]]] = {}
+    for entry_key, entry_value in data.items():
+        if not isinstance(entry_key, tuple) or len(entry_key) != 2:
+            raise ValueError("data keys must be (by, key) tuples")
+        by, key = entry_key
+        if by not in _KIND_IMPACT_BYS or not isinstance(key, str) or not key:
+            raise ValueError(
+                "data keys must be (by, key) with by region/window and a"
+                " non-empty key"
+            )
+        if by not in report_panels:
+            raise ValueError("data by set must match the report groups")
+        if not isinstance(entry_value, tuple) or len(entry_value) != 4:
+            raise ValueError(
+                "data values must be (station, lst, morph, cover) quadruples"
+            )
+        factor_values = tuple(
+            _validate_finite_number(component, "factor")
+            for component in entry_value
+        )
+        bucket = panels.setdefault(by, {})
+        if key in bucket:
+            raise ValueError(f"duplicate (by, key) data entry: {entry_key!r}")
+        bucket[key] = factor_values
+
+    if set(panels) != set(report_panels):
+        raise ValueError("data by set must match the report groups")
+    for by, keys in report_panels.items():
+        if set(panels[by]) != set(keys):
+            raise ValueError(
+                "data keys must be every report (by, key) panel tuple"
+            )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # Per (by, factor): n, the rendered-precision Decimal r, the exact
+        # squared correlation r**2 and sign of Sxy for tie-free ordering,
+        # and the Decimal permutation p-value.
+        tests: dict[
+            tuple[str, str],
+            tuple[int, Decimal, Fraction, int, Decimal],
+        ] = {}
+        for by, items in groups:
+            keys = [key for key, _pick, _metrics in items]
+            n = len(keys)
+            if n > _DRIVER_ATTR_MAX_N:
+                raise ValueError(
+                    "a single by dimension may hold at most "
+                    f"{_DRIVER_ATTR_MAX_N} panels: {by!r} holds {n}"
+                )
+            y = [Fraction(items[index][2][0][2]) for index in range(n)]
+            mean_y = sum(y, Fraction(0)) / n
+            dy = [value - mean_y for value in y]
+            syy = sum(
+                (deviation * deviation for deviation in dy), Fraction(0)
+            )
+            for factor_index, factor in enumerate(_DRIVER_FACTORS):
+                x = [
+                    Fraction(panels[by][key][factor_index]) for key in keys
+                ]
+                mean_x = sum(x, Fraction(0)) / n
+                dx = [value - mean_x for value in x]
+                sxx = sum(
+                    (deviation * deviation for deviation in dx), Fraction(0)
+                )
+                sxy = sum(
+                    (
+                        dx[index] * dy[index]
+                        for index in range(n)
+                    ),
+                    Fraction(0),
+                )
+                if sxx == 0 or syy == 0:
+                    r_value = Decimal(0)
+                    r_squared = Fraction(0)
+                    p_value = Decimal(1)
+                else:
+                    r_value = _fraction_to_decimal(sxy) / (
+                        _fraction_to_decimal(sxx)
+                        * _fraction_to_decimal(syy)
+                    ).sqrt()
+                    r_squared = sxy * sxy / (sxx * syy)
+                    # Permuting y permutes the dy deviations; the dx
+                    # deviations sum to zero, so Sxy_perm = sum(dx_i *
+                    # dy_perm[i]) and exact Fraction comparisons count
+                    # ties without any sqrt rounding.
+                    hits = 0
+                    for perm in permutations(dy):
+                        perm_sxy = sum(
+                            (
+                                dx[index] * perm[index]
+                                for index in range(n)
+                            ),
+                            Fraction(0),
+                        )
+                        if abs(perm_sxy) >= abs(sxy):
+                            hits += 1
+                    p_value = _fraction_to_decimal(
+                        Fraction(hits, math.factorial(n))
+                    )
+                tests[(by, factor)] = (
+                    n,
+                    r_value,
+                    r_squared,
+                    0
+                    if sxy == 0
+                    else (1 if sxy > 0 else -1),
+                    p_value,
+                )
+
+        # One BH pass over every (by, factor) test: ascending p, then
+        # region before window, then station/lst/morph/cover.
+        ordered = sorted(
+            tests,
+            key=lambda cell: (
+                tests[cell][4],
+                0 if cell[0] == "region" else 1,
+                _DRIVER_FACTORS.index(cell[1]),
+            ),
+        )
+        tested = len(ordered)
+        q_values: dict[tuple[str, str], Decimal] = {}
+        running = Decimal(1)
+        for rank in range(tested, 0, -1):
+            cell = ordered[rank - 1]
+            candidate = Decimal(tested) * tests[cell][4] / Decimal(rank)
+            if candidate < running:
+                running = candidate
+            q_values[cell] = min(Decimal(1), running)
+
+        item_tokens: list[str] = []
+        for by in _KIND_IMPACT_BYS:
+            if by not in report_panels:
+                continue
+            rejected = [
+                (factor, tests[(by, factor)])
+                for factor in _DRIVER_FACTORS
+                if q_values[(by, factor)] <= alpha
+            ]
+            if not rejected:
+                continue
+            factor, (
+                n, r_value, r_squared, sign, p_value
+            ) = min(
+                rejected,
+                key=lambda entry: (
+                    -entry[1][2],
+                    _DRIVER_FACTORS.index(entry[0]),
+                ),
+            )
+            direction = "flat" if sign == 0 else ("up" if sign > 0 else "down")
+            q_value = q_values[(by, factor)]
+            item_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"factor":' + json.dumps(factor, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"effect":' + _format6(r_value)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if q_value <= alpha else "false")
+                + ',"direction":' + json.dumps(direction, ensure_ascii=False)
+                + "}"
+            )
 
     return (
         '{"alpha":' + _format6(alpha)
