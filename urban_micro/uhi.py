@@ -19158,6 +19158,184 @@ def _driver_plan_report_parse(
     return alpha, linked
 
 
+def _driver_plan_validate_actions(
+    actions: dict,
+) -> tuple[dict[str, str], dict[str, Decimal]]:
+    """Validate the ``actions`` mapping shared by :func:`driver_plan` and
+    :func:`driver_plan_frontier`; return ``(kind_factor, kind_cost)`` with
+    costs as ``Decimal(str(x))``. Every violation raises ``ValueError``."""
+    if set(actions) != set(_INTERVENTION_KINDS):
+        raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+
+    kind_factor: dict[str, str] = {}
+    kind_cost: dict[str, Decimal] = {}
+    for kind in _INTERVENTION_KINDS:
+        value = actions[kind]
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        factor, cost = value
+        if not isinstance(factor, str) or factor not in _DRIVER_ATTR_FACTORS:
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        if isinstance(cost, float) and not math.isfinite(cost):
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        cost_value = Decimal(str(cost))
+        if cost_value <= 0:
+            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+        kind_factor[kind] = factor
+        kind_cost[kind] = cost_value
+    if len(set(kind_factor.values())) != len(_INTERVENTION_KINDS):
+        raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+    return kind_factor, kind_cost
+
+
+def _driver_plan_validate_limit(limit) -> Decimal:
+    """Validate one budget limit and return ``Decimal(str(limit))``."""
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+        raise ValueError("limit must be a finite int or float")
+    if isinstance(limit, float) and not math.isfinite(limit):
+        raise ValueError("limit must be finite")
+    limit_value = Decimal(str(limit))
+    if limit_value < 0:
+        raise ValueError("limit must be non-negative")
+    return limit_value
+
+
+def _driver_plan_candidates(
+    by: str,
+    linked: dict[
+        tuple[str, str],
+        tuple[str, Decimal, Decimal, Decimal, Decimal, Decimal, bool],
+    ],
+    kind_factor: dict[str, str],
+    kind_cost: dict[str, Decimal],
+) -> list[tuple[str, Decimal, Decimal, str, Decimal, Decimal, Decimal]]:
+    """One candidate per kind whose linked factor item is ``eligible`` in
+    the report group ``by``."""
+    candidates: list[
+        tuple[str, Decimal, Decimal, str, Decimal, Decimal, Decimal]
+    ] = []
+    for kind in _INTERVENTION_KINDS:
+        factor = kind_factor[kind]
+        metric, effect, low, high, _q, score, eligible = linked[(by, factor)]
+        if eligible:
+            candidates.append(
+                (kind, kind_cost[kind], score, metric, effect, low, high)
+            )
+    return candidates
+
+
+def _driver_plan_best(
+    candidates: list[tuple[str, Decimal, Decimal, str, Decimal, Decimal, Decimal]],
+    limit_value: Decimal,
+) -> tuple[
+    Decimal, Decimal, tuple[str, ...], dict[str, Decimal], Decimal, Decimal
+]:
+    """Enumerate every candidate subset costing at most ``limit_value`` and
+    return the winner as ``(cost, priority, pick, effects, low, high)``.
+
+    Selection, the ``score / cost`` priority and effect/range accumulation
+    match :func:`driver_plan` exactly; comparisons run on the unquantized
+    values."""
+    zero = Decimal(0)
+    best_total_cost = zero
+    best_priority: Decimal | None = None
+    best_pick: tuple[str, ...] = ()
+    best_effects = {metric: zero for metric in _KIND_IMPACT_METRICS}
+    best_low = zero
+    best_high = zero
+    for mask in range(1 << len(candidates)):
+        chosen = [
+            candidates[index]
+            for index in range(len(candidates))
+            if mask & (1 << index)
+        ]
+        total_cost = sum((candidate[1] for candidate in chosen), zero)
+        if total_cost > limit_value:
+            continue
+        priority = sum(
+            (candidate[2] / candidate[1] for candidate in chosen), zero
+        )
+        pick = tuple(sorted(candidate[0] for candidate in chosen))
+        better = (
+            best_priority is None
+            or priority > best_priority
+            or (
+                priority == best_priority
+                and (
+                    total_cost < best_total_cost
+                    or (
+                        total_cost == best_total_cost
+                        and pick < best_pick
+                    )
+                )
+            )
+        )
+        if not better:
+            continue
+        best_priority = priority
+        best_total_cost = total_cost
+        best_pick = pick
+        effects = {metric: zero for metric in _KIND_IMPACT_METRICS}
+        range_low = zero
+        range_high = zero
+        for _kind, _cost, _score, metric, effect, low, high in chosen:
+            effects[metric] += effect
+            range_low += low
+            range_high += high
+        best_effects = effects
+        best_low = range_low
+        best_high = range_high
+
+    return (
+        best_total_cost,
+        best_priority if best_priority is not None else zero,
+        best_pick,
+        best_effects,
+        best_low,
+        best_high,
+    )
+
+
+def _driver_plan_string_array(values) -> str:
+    """Render an iterable of strings as a compact ascending JSON array."""
+    return "[" + ",".join(json.dumps(value, ensure_ascii=False)
+                          for value in values) + "]"
+
+
+def _driver_plan_group_token(
+    by: str,
+    total_cost: Decimal,
+    priority: Decimal,
+    pick: tuple[str, ...],
+    effects: dict[str, Decimal],
+    range_low: Decimal,
+    range_high: Decimal,
+) -> str:
+    """Serialize one ``driver_plan`` group object."""
+    effects_token = (
+        '{"uhi":' + _format6(effects["uhi"])
+        + ',"energy":' + _format6(effects["energy"])
+        + ',"vent":' + _format6(effects["vent"])
+        + "}"
+    )
+    range_token = (
+        '{"low":' + _format6(range_low)
+        + ',"high":' + _format6(range_high)
+        + "}"
+    )
+    return (
+        '{"by":' + json.dumps(by, ensure_ascii=False)
+        + ',"cost":' + _format6(total_cost)
+        + ',"priority":' + _format6(priority)
+        + ',"pick":' + _driver_plan_string_array(pick)
+        + ',"effects":' + effects_token
+        + ',"range":' + range_token
+        + "}"
+    )
+
+
 def driver_plan(report: str, actions: dict, limit) -> str:
     """Pick a budgeted subset of interventions from a driver_link report.
 
@@ -19197,37 +19375,94 @@ def driver_plan(report: str, actions: dict, limit) -> str:
         raise TypeError("report must be a str")
     if not isinstance(actions, dict):
         raise TypeError("actions must be a dict")
-    if set(actions) != set(_INTERVENTION_KINDS):
-        raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+    kind_factor, kind_cost = _driver_plan_validate_actions(actions)
+    limit_value = _driver_plan_validate_limit(limit)
 
-    kind_factor: dict[str, str] = {}
-    kind_cost: dict[str, Decimal] = {}
-    for kind in _INTERVENTION_KINDS:
-        value = actions[kind]
-        if not isinstance(value, tuple) or len(value) != 2:
-            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
-        factor, cost = value
-        if not isinstance(factor, str) or factor not in _DRIVER_ATTR_FACTORS:
-            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
-        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
-            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
-        if isinstance(cost, float) and not math.isfinite(cost):
-            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
-        cost_value = Decimal(str(cost))
-        if cost_value <= 0:
-            raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
-        kind_factor[kind] = factor
-        kind_cost[kind] = cost_value
-    if len(set(kind_factor.values())) != len(_INTERVENTION_KINDS):
-        raise ValueError(_DRIVER_PLAN_ACTIONS_ERROR)
+    _alpha, linked = _driver_plan_report_parse(report)
+    bys = {by for by, _factor in linked}
 
-    if isinstance(limit, bool) or not isinstance(limit, (int, float)):
-        raise ValueError("limit must be a finite int or float")
-    if isinstance(limit, float) and not math.isfinite(limit):
-        raise ValueError("limit must be finite")
-    limit_value = Decimal(str(limit))
-    if limit_value < 0:
-        raise ValueError("limit must be non-negative")
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        group_tokens: list[str] = []
+        for by in _KIND_IMPACT_BYS:
+            if by not in bys:
+                continue
+            candidates = _driver_plan_candidates(
+                by, linked, kind_factor, kind_cost
+            )
+            total_cost, priority, pick, effects, range_low, range_high = (
+                _driver_plan_best(candidates, limit_value)
+            )
+            group_tokens.append(
+                _driver_plan_group_token(
+                    by, total_cost, priority, pick, effects,
+                    range_low, range_high,
+                )
+            )
+
+    return '{"groups":[' + ",".join(group_tokens) + "]}\n"
+
+
+def driver_plan_frontier(report: str, actions: dict, limits: list) -> str:
+    """Trace :func:`driver_plan` optimum picks across ascending limits.
+
+    ``report`` and ``actions`` follow the :func:`driver_plan` contract
+    exactly: ``report`` must be a byte-for-byte canonical
+    :func:`driver_link` JSON output and ``actions`` maps ``green``,
+    ``roof`` and ``material`` to distinct ``(factor, cost)`` pairs.
+    ``limits`` is a non-empty list whose elements are finite
+    non-boolean non-negative int/float values, pairwise distinct under
+    ``Decimal(str(x))`` comparison. A non-string ``report``, a non-dict
+    ``actions`` or a non-list ``limits`` raises ``TypeError``; every
+    other violation raises ``ValueError``.
+
+    The limits are processed in ascending order and the region/window
+    groups are solved independently, each with the same enumeration and
+    preference rules as :func:`driver_plan` on the unquantized values.
+    Within a group the first point starts from the state
+    ``priority = 0`` and ``pick = []``; every later point compares with
+    the same group's previous point: ``marginal`` is the point's
+    priority minus the previous value and ``added``/``removed`` are the
+    ascending set differences of its ``pick`` against the previous
+    pick. A point is ``dominated`` when some earlier point of the same
+    group at a strictly smaller limit has both priority greater than or
+    equal to the current priority and cost less than or equal to the
+    current cost.
+
+    Numbers enter as ``Decimal(str(x))`` and the arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
+    UTF-8 JSON string with no spaces and exactly one trailing newline;
+    the top-level key is ``points`` ordered by ascending ``limit`` and
+    each point uses the key order ``limit, groups`` with groups ordered
+    region before window. Each group uses the key order
+    ``by, cost, priority, marginal, pick, added, removed, effects,
+    range, dominated``; ``pick``, ``added`` and ``removed`` are
+    ascending string arrays, ``effects`` is ordered ``uhi, energy,
+    vent``, ``range`` is ordered ``low, high`` and ``dominated`` is a
+    boolean. Every number renders with six decimals, negative zero
+    normalized to ``0.000000``. An empty report still emits one point
+    per limit, each carrying ``groups: []``.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(actions, dict):
+        raise TypeError("actions must be a dict")
+    if not isinstance(limits, list):
+        raise TypeError("limits must be a list")
+    kind_factor, kind_cost = _driver_plan_validate_actions(actions)
+    if not limits:
+        raise ValueError("limits must be a non-empty list")
+    limit_values: list[Decimal] = []
+    seen_limits: set[Decimal] = set()
+    for limit in limits:
+        limit_value = _driver_plan_validate_limit(limit)
+        if limit_value in seen_limits:
+            raise ValueError("limits must be pairwise distinct")
+        seen_limits.add(limit_value)
+        limit_values.append(limit_value)
+    limit_values.sort()
 
     _alpha, linked = _driver_plan_report_parse(report)
     bys = {by for by, _factor in linked}
@@ -19237,104 +19472,85 @@ def driver_plan(report: str, actions: dict, limit) -> str:
         ctx.rounding = ROUND_HALF_EVEN
 
         zero = Decimal(0)
-        group_tokens: list[str] = []
+        # by -> one solved state dict per ascending limit
+        solutions: dict[str, list[dict]] = {}
         for by in _KIND_IMPACT_BYS:
             if by not in bys:
                 continue
-            # One candidate per kind whose linked factor item is eligible.
-            candidates: list[
-                tuple[str, Decimal, Decimal, str, Decimal, Decimal, Decimal]
-            ] = []
-            for kind in _INTERVENTION_KINDS:
-                factor = kind_factor[kind]
-                metric, effect, low, high, _q, score, eligible = linked[
-                    (by, factor)
-                ]
-                if eligible:
-                    candidates.append(
-                        (kind, kind_cost[kind], score, metric, effect,
-                         low, high)
-                    )
-
-            best_priority: Decimal | None = None
-            best_total_cost = zero
-            best_pick: tuple[str, ...] = ()
-            best_effects = {metric: zero for metric in _KIND_IMPACT_METRICS}
-            best_low = zero
-            best_high = zero
-            for mask in range(1 << len(candidates)):
-                chosen = [
-                    candidates[index]
-                    for index in range(len(candidates))
-                    if mask & (1 << index)
-                ]
-                total_cost = sum(
-                    (candidate[1] for candidate in chosen), zero
+            candidates = _driver_plan_candidates(
+                by, linked, kind_factor, kind_cost
+            )
+            states: list[dict] = []
+            previous_priority = zero
+            previous_pick: tuple[str, ...] = ()
+            for limit_value in limit_values:
+                (total_cost, priority, pick, effects,
+                 range_low, range_high) = _driver_plan_best(
+                    candidates, limit_value
                 )
-                if total_cost > limit_value:
+                pick_set = set(pick)
+                added = tuple(sorted(pick_set - set(previous_pick)))
+                removed = tuple(sorted(set(previous_pick) - pick_set))
+                dominated = any(
+                    state["priority"] >= priority
+                    and state["cost"] <= total_cost
+                    for state in states
+                )
+                states.append({
+                    "cost": total_cost,
+                    "priority": priority,
+                    "pick": pick,
+                    "effects": effects,
+                    "low": range_low,
+                    "high": range_high,
+                    "marginal": priority - previous_priority,
+                    "added": added,
+                    "removed": removed,
+                    "dominated": dominated,
+                })
+                previous_priority = priority
+                previous_pick = pick
+            solutions[by] = states
+
+        point_tokens: list[str] = []
+        for index, limit_value in enumerate(limit_values):
+            group_tokens: list[str] = []
+            for by in _KIND_IMPACT_BYS:
+                if by not in bys:
                     continue
-                priority = sum(
-                    (candidate[2] / candidate[1] for candidate in chosen),
-                    zero,
+                state = solutions[by][index]
+                effects_token = (
+                    '{"uhi":' + _format6(state["effects"]["uhi"])
+                    + ',"energy":' + _format6(state["effects"]["energy"])
+                    + ',"vent":' + _format6(state["effects"]["vent"])
+                    + "}"
                 )
-                pick = tuple(sorted(candidate[0] for candidate in chosen))
-                better = (
-                    best_priority is None
-                    or priority > best_priority
-                    or (
-                        priority == best_priority
-                        and (
-                            total_cost < best_total_cost
-                            or (
-                                total_cost == best_total_cost
-                                and pick < best_pick
-                            )
-                        )
-                    )
+                range_token = (
+                    '{"low":' + _format6(state["low"])
+                    + ',"high":' + _format6(state["high"])
+                    + "}"
                 )
-                if not better:
-                    continue
-                best_priority = priority
-                best_total_cost = total_cost
-                best_pick = pick
-                effects = {
-                    metric: zero for metric in _KIND_IMPACT_METRICS
-                }
-                range_low = zero
-                range_high = zero
-                for _kind, _cost, _score, metric, effect, low, high in chosen:
-                    effects[metric] += effect
-                    range_low += low
-                    range_high += high
-                best_effects = effects
-                best_low = range_low
-                best_high = range_high
-
-            pick_token = "[" + ",".join(
-                json.dumps(kind, ensure_ascii=False) for kind in best_pick
-            ) + "]"
-            effects_token = (
-                '{"uhi":' + _format6(best_effects["uhi"])
-                + ',"energy":' + _format6(best_effects["energy"])
-                + ',"vent":' + _format6(best_effects["vent"])
-                + "}"
-            )
-            range_token = (
-                '{"low":' + _format6(best_low)
-                + ',"high":' + _format6(best_high)
-                + "}"
-            )
-            group_tokens.append(
-                '{"by":' + json.dumps(by, ensure_ascii=False)
-                + ',"cost":' + _format6(best_total_cost)
-                + ',"priority":' + _format6(best_priority)
-                + ',"pick":' + pick_token
-                + ',"effects":' + effects_token
-                + ',"range":' + range_token
-                + "}"
+                group_tokens.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"cost":' + _format6(state["cost"])
+                    + ',"priority":' + _format6(state["priority"])
+                    + ',"marginal":' + _format6(state["marginal"])
+                    + ',"pick":' + _driver_plan_string_array(state["pick"])
+                    + ',"added":' + _driver_plan_string_array(state["added"])
+                    + ',"removed":'
+                    + _driver_plan_string_array(state["removed"])
+                    + ',"effects":' + effects_token
+                    + ',"range":' + range_token
+                    + ',"dominated":'
+                    + ("true" if state["dominated"] else "false")
+                    + "}"
+                )
+            point_tokens.append(
+                '{"limit":' + _format6(limit_value)
+                + ',"groups":[' + ",".join(group_tokens) + "]}"
             )
 
-    return '{"groups":[' + ",".join(group_tokens) + "]}\n"
+    return '{"points":[' + ",".join(point_tokens) + "]}\n"
 
 
 _TEMPORAL_LAG_MAX_N = 8
