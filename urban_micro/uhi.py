@@ -19553,6 +19553,361 @@ def driver_plan_frontier(report: str, actions: dict, limits: list) -> str:
     return '{"points":[' + ",".join(point_tokens) + "]}\n"
 
 
+_DRIVER_PLAN_PARETO_WEIGHT_KEYS = ("uhi", "energy", "vent")
+_DRIVER_PLAN_PARETO_WEIGHTS_ERROR = (
+    "weights must be a dict whose keys are exactly uhi, energy and vent, "
+    "each mapping to a finite positive int or float"
+)
+_DRIVER_PLAN_PARETO_LIMIT_ERROR = "limit must be a finite non-negative int or float"
+_DRIVER_PLAN_PARETO_FRONTIER_ERROR = (
+    "frontier must be a driver_plan_frontier JSON output"
+)
+
+
+def _driver_plan_pareto_validate_weights(
+    weights: dict,
+) -> dict[str, Decimal]:
+    """Validate the ``weights`` mapping of :func:`driver_plan_pareto`.
+
+    Keys must be exactly ``uhi``, ``energy`` and ``vent``; each value must
+    be a finite non-boolean positive int/float. Returns the weights as
+    ``Decimal(str(x))``. Every violation raises ``ValueError``."""
+    if set(weights) != set(_DRIVER_PLAN_PARETO_WEIGHT_KEYS):
+        raise ValueError(_DRIVER_PLAN_PARETO_WEIGHTS_ERROR)
+    result: dict[str, Decimal] = {}
+    for key in _DRIVER_PLAN_PARETO_WEIGHT_KEYS:
+        value = weights[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(_DRIVER_PLAN_PARETO_WEIGHTS_ERROR)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(_DRIVER_PLAN_PARETO_WEIGHTS_ERROR)
+        decimal_value = Decimal(str(value))
+        if decimal_value <= 0:
+            raise ValueError(_DRIVER_PLAN_PARETO_WEIGHTS_ERROR)
+        result[key] = decimal_value
+    return result
+
+
+def _driver_plan_pareto_validate_limit(limit) -> Decimal:
+    """Validate one non-negative budget limit and return
+    ``Decimal(str(limit))``; every violation raises ``ValueError``."""
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+        raise ValueError(_DRIVER_PLAN_PARETO_LIMIT_ERROR)
+    if isinstance(limit, float) and not math.isfinite(limit):
+        raise ValueError(_DRIVER_PLAN_PARETO_LIMIT_ERROR)
+    limit_value = Decimal(str(limit))
+    if limit_value < 0:
+        raise ValueError(_DRIVER_PLAN_PARETO_LIMIT_ERROR)
+    return limit_value
+
+
+def _driver_plan_pareto_parse_pick(value) -> tuple[str, ...]:
+    """Validate one frontier ``pick``/``added``/``removed`` array: a list
+    of distinct intervention kinds in strictly ascending order."""
+    if not isinstance(value, list):
+        raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+    for element in value:
+        if not isinstance(element, str) or element not in _INTERVENTION_KINDS:
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+    if any(
+        value[index] >= value[index + 1] for index in range(len(value) - 1)
+    ):
+        raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+    return tuple(value)
+
+
+def _driver_plan_pareto_frontier_parse(raw: str):
+    """Parse one canonical :func:`driver_plan_frontier` output.
+
+    Returns a list of ``(by, entries)`` pairs ordered region before
+    window; each ``entries`` item is one
+    ``(cost, uhi, energy, vent, pick)`` tuple per point, with the
+    metrics taken from the point's effects and ``pick`` an ascending
+    tuple of kind strings. The input must be byte-for-byte identical to
+    a canonical output (key order, escaping, group order, the ascending
+    points and the six-decimal number tokens included); any deviation
+    raises ``ValueError``. Derived fields are carried structurally
+    rather than recomputed, since the producer compares and accumulates
+    unquantized values while the report only carries six-decimal
+    tokens.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"points"}:
+        raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+    raw_points = data["points"]
+    if not isinstance(raw_points, list) or not raw_points:
+        raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+
+    def _parse_group(value):
+        if not isinstance(value, dict) or set(value) != {
+            "by", "cost", "priority", "marginal", "pick", "added",
+            "removed", "effects", "range", "dominated",
+        }:
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        by = value["by"]
+        if by not in _KIND_IMPACT_BYS:
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        cost = value["cost"]
+        priority = value["priority"]
+        marginal = value["marginal"]
+        for number in (cost, priority, marginal):
+            if not isinstance(number, _RankTrajectoryNumber):
+                raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        pick = _driver_plan_pareto_parse_pick(value["pick"])
+        added = _driver_plan_pareto_parse_pick(value["added"])
+        removed = _driver_plan_pareto_parse_pick(value["removed"])
+        effects = value["effects"]
+        if not isinstance(effects, dict) or set(effects) != {
+            "uhi", "energy", "vent"
+        }:
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        uhi = effects["uhi"]
+        energy = effects["energy"]
+        vent = effects["vent"]
+        for number in (uhi, energy, vent):
+            if not isinstance(number, _RankTrajectoryNumber):
+                raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        range_value = value["range"]
+        if not isinstance(range_value, dict) or set(range_value) != {
+            "low", "high"
+        }:
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        low = range_value["low"]
+        high = range_value["high"]
+        for number in (low, high):
+            if not isinstance(number, _RankTrajectoryNumber):
+                raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        if not isinstance(value["dominated"], bool):
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+
+        effects_token = (
+            '{"uhi":' + _format6(uhi)
+            + ',"energy":' + _format6(energy)
+            + ',"vent":' + _format6(vent)
+            + "}"
+        )
+        range_token = (
+            '{"low":' + _format6(low)
+            + ',"high":' + _format6(high)
+            + "}"
+        )
+        token = (
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"cost":' + _format6(cost)
+            + ',"priority":' + _format6(priority)
+            + ',"marginal":' + _format6(marginal)
+            + ',"pick":' + _driver_plan_string_array(pick)
+            + ',"added":' + _driver_plan_string_array(added)
+            + ',"removed":' + _driver_plan_string_array(removed)
+            + ',"effects":' + effects_token
+            + ',"range":' + range_token
+            + ',"dominated":' + ("true" if value["dominated"] else "false")
+            + "}"
+        )
+        return by, (cost, uhi, energy, vent, pick), token
+
+    point_count = 0
+    groups: dict[str, list] = {}
+    point_tokens: list[str] = []
+    previous_limit: Decimal | None = None
+    for point in raw_points:
+        if not isinstance(point, dict) or set(point) != {"limit", "groups"}:
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        point_limit = point["limit"]
+        if not isinstance(point_limit, _RankTrajectoryNumber):
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        if point_limit < 0:
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        if previous_limit is not None and point_limit <= previous_limit:
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        previous_limit = point_limit
+
+        raw_groups = point["groups"]
+        if not isinstance(raw_groups, list):
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+        group_tokens: list[str] = []
+        previous_by_order: int | None = None
+        present_bys: set[str] = set()
+        for raw_group in raw_groups:
+            by, entry, token = _parse_group(raw_group)
+            by_order = 0 if by == "region" else 1
+            if previous_by_order is not None and by_order <= previous_by_order:
+                raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+            previous_by_order = by_order
+            if by in present_bys:
+                raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+            present_bys.add(by)
+            groups.setdefault(by, []).append(entry)
+            group_tokens.append(token)
+        point_tokens.append(
+            '{"limit":' + _format6(point_limit)
+            + ',"groups":[' + ",".join(group_tokens) + "]}"
+        )
+        point_count += 1
+
+    # Every present group must occur in every point; the producer only
+    # ever emits the same group set across points (or groups: [] always).
+    for entries in groups.values():
+        if len(entries) != point_count:
+            raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+
+    canonical = '{"points":[' + ",".join(point_tokens) + "]}"
+    if payload != canonical:
+        raise ValueError(_DRIVER_PLAN_PARETO_FRONTIER_ERROR)
+
+    return [(by, groups[by]) for by in _KIND_IMPACT_BYS if by in groups]
+
+
+def driver_plan_pareto(frontier: str, weights: dict, limit) -> str:
+    """Select non-dominated budgeted combinations from a
+    :func:`driver_plan_frontier` report.
+
+    ``frontier`` must be a byte-for-byte canonical
+    :func:`driver_plan_frontier` JSON output. ``weights`` is a dict whose
+    keys are exactly ``uhi``, ``energy`` and ``vent``; each value is a
+    finite non-boolean positive int/float. ``limit`` is a finite
+    non-boolean non-negative int/float. A non-string ``frontier`` or a
+    non-dict ``weights`` raises ``TypeError``; every other violation
+    raises ``ValueError``.
+
+    Within each reported ``by``, every point of the frontier whose
+    ``cost`` is at most ``limit`` contributes one candidate,
+    de-duplicated by its ``pick`` (the first surviving point, i.e. the
+    one at the lowest limit, is kept). Each candidate carries the
+    objective tuple ``(cost, uhi, energy, -vent)``; candidate A
+    dominates candidate B when every component of A is less than or
+    equal to B's and at least one is strictly less. Only non-dominated
+    combinations are retained. The item ``score`` is the weighted sum
+    ``weights["uhi"] * uhi + weights["energy"] * energy
+    - weights["vent"] * vent``.
+
+    The retained items sort by ascending ``score``, then ascending
+    ``cost``, then lexicographically ascending ``pick``; the first
+    item's ``pick`` is the group's ``recommend`` (``null`` with an empty
+    ``items`` list when no candidate survives).
+
+    Numbers enter as ``Decimal(str(x))`` and the arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context with comparisons on
+    the unquantized values. Returns a compact UTF-8 JSON string with no
+    spaces and exactly one trailing newline; the top-level key order is
+    ``limit, groups`` and each group uses ``by, recommend, items`` with
+    groups ordered region before window. Each item uses the key order
+    ``pick, cost, uhi, energy, vent, score``; ``pick`` and ``recommend``
+    are ascending string arrays (``recommend`` is null only when there
+    are no items). Every number renders with six decimals, negative
+    zero normalized to ``0.000000``.
+    """
+    if not isinstance(frontier, str):
+        raise TypeError("frontier must be a str")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    weight_values = _driver_plan_pareto_validate_weights(weights)
+    limit_value = _driver_plan_pareto_validate_limit(limit)
+
+    parsed_groups = _driver_plan_pareto_frontier_parse(frontier)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        group_tokens: list[str] = []
+        for by, entries in parsed_groups:
+            deduped: dict[tuple[str, ...], tuple] = {}
+            for cost, uhi, energy, vent, pick in entries:
+                if cost > limit_value or pick in deduped:
+                    continue
+                deduped[pick] = (cost, uhi, energy, vent, pick)
+            candidates = list(deduped.values())
+
+            kept: list[tuple] = []
+            for index, candidate in enumerate(candidates):
+                cost_a, uhi_a, energy_a, vent_a, _pick_a = candidate
+                neg_vent_a = -vent_a
+                dominated = False
+                for other_index, other in enumerate(candidates):
+                    if other_index == index:
+                        continue
+                    cost_b, uhi_b, energy_b, vent_b, _pick_b = other
+                    neg_vent_b = -vent_b
+                    if (
+                        cost_b <= cost_a
+                        and uhi_b <= uhi_a
+                        and energy_b <= energy_a
+                        and neg_vent_b <= neg_vent_a
+                        and (
+                            cost_b < cost_a
+                            or uhi_b < uhi_a
+                            or energy_b < energy_a
+                            or neg_vent_b < neg_vent_a
+                        )
+                    ):
+                        dominated = True
+                        break
+                if not dominated:
+                    kept.append(candidate)
+
+            scored = []
+            for cost, uhi, energy, vent, pick in kept:
+                score = (
+                    weight_values["uhi"] * uhi
+                    + weight_values["energy"] * energy
+                    - weight_values["vent"] * vent
+                )
+                scored.append((score, cost, pick, uhi, energy, vent))
+            scored.sort(key=lambda row: (row[0], row[1], row[2]))
+
+            item_tokens: list[str] = []
+            for score, cost, pick, uhi, energy, vent in scored:
+                item_tokens.append(
+                    '{"pick":' + _driver_plan_string_array(pick)
+                    + ',"cost":' + _format6(cost)
+                    + ',"uhi":' + _format6(uhi)
+                    + ',"energy":' + _format6(energy)
+                    + ',"vent":' + _format6(vent)
+                    + ',"score":' + _format6(score)
+                    + "}"
+                )
+            recommend = (
+                _driver_plan_string_array(scored[0][2]) if scored else "null"
+            )
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"recommend":' + recommend
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"limit":' + _format6(limit_value)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
