@@ -93,6 +93,8 @@ __all__ = [
     "hotspot_summary",
     "hotspot_kind_summary",
     "hotspot_kind_priority",
+    "hotspot_kind_portfolio",
+    "kind_impact",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -17204,6 +17206,298 @@ def hotspot_kind_portfolio(report: str, budgets: dict, allow: dict) -> str:
             '{"alpha":' + _format6(alpha)
             + ',"groups":[' + ",".join(group_tokens) + "]}\n"
         )
+
+
+_KIND_IMPACT_ERROR = "report must be a hotspot_kind_portfolio JSON output"
+_KIND_IMPACT_BYS = ("region", "window")
+
+
+def _kind_impact_parse(
+    raw: object,
+) -> tuple[Decimal, list[tuple[str, tuple[str, ...]]]]:
+    """Parse one :func:`hotspot_kind_portfolio` JSON output.
+
+    Returns ``(alpha, groups)`` in canonical group order (region before
+    window); each group is ``(by, pick)`` with ``pick`` the sorted tuple
+    of chosen kinds. The input must be byte-for-byte identical to a
+    canonical output (key order, escaping, spacing, group order and the
+    six-decimal number tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_KIND_IMPACT_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_KIND_IMPACT_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_KIND_IMPACT_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_KIND_IMPACT_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_KIND_IMPACT_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_KIND_IMPACT_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_KIND_IMPACT_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_KIND_IMPACT_ERROR)
+
+    groups: list[tuple[str, tuple[str, ...]]] = []
+    group_tokens: list[str] = []
+    previous_by: int | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {
+            "by", "budget", "cost", "remaining", "score", "pick", "skip",
+        }:
+            raise ValueError(_KIND_IMPACT_ERROR)
+        by = group["by"]
+        budget = group["budget"]
+        cost = group["cost"]
+        remaining = group["remaining"]
+        score = group["score"]
+        raw_pick = group["pick"]
+        raw_skip = group["skip"]
+        if (
+            by not in _KIND_IMPACT_BYS
+            or not isinstance(budget, _RankTrajectoryNumber)
+            or budget < 0
+            or not isinstance(cost, _RankTrajectoryNumber)
+            or cost < 0
+            or cost > budget
+            or not isinstance(remaining, _RankTrajectoryNumber)
+            or remaining < 0
+            or not isinstance(score, _RankTrajectoryNumber)
+            or score < 0
+            or not isinstance(raw_pick, list)
+            or not isinstance(raw_skip, list)
+        ):
+            raise ValueError(_KIND_IMPACT_ERROR)
+        by_order = 0 if by == "region" else 1
+        if previous_by is not None and by_order <= previous_by:
+            raise ValueError(_KIND_IMPACT_ERROR)
+        previous_by = by_order
+
+        pick: list[str] = []
+        for kind in raw_pick:
+            if (
+                not isinstance(kind, str)
+                or not kind
+                or kind not in _INTERVENTION_KINDS
+                or (pick and kind <= pick[-1])
+            ):
+                raise ValueError(_KIND_IMPACT_ERROR)
+            pick.append(kind)
+        pick_tuple = tuple(pick)
+        pick_token = "[" + ",".join(
+            json.dumps(kind, ensure_ascii=False) for kind in pick_tuple
+        ) + "]"
+
+        skip: list[tuple[str, str]] = []
+        previous_skip: str | None = None
+        for entry in raw_skip:
+            if not isinstance(entry, dict) or set(entry) != {"kind", "reason"}:
+                raise ValueError(_KIND_IMPACT_ERROR)
+            kind = entry["kind"]
+            reason = entry["reason"]
+            if (
+                not isinstance(kind, str)
+                or not kind
+                or kind not in _INTERVENTION_KINDS
+                or kind in pick_tuple
+                or (previous_skip is not None and kind <= previous_skip)
+                or reason not in ("q", "a", "b", "d")
+            ):
+                raise ValueError(_KIND_IMPACT_ERROR)
+            skip.append((kind, reason))
+            previous_skip = kind
+        skip_token = "[" + ",".join(
+            '{"kind":' + json.dumps(kind, ensure_ascii=False)
+            + ',"reason":' + json.dumps(reason, ensure_ascii=False)
+            + "}"
+            for kind, reason in skip
+        ) + "]"
+
+        groups.append((by, pick_tuple))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"budget":' + _format6(budget)
+            + ',"cost":' + _format6(cost)
+            + ',"remaining":' + _format6(remaining)
+            + ',"score":' + _format6(score)
+            + ',"pick":' + pick_token
+            + ',"skip":' + skip_token
+            + "}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_KIND_IMPACT_ERROR)
+    return alpha, groups
+
+
+def kind_impact(report: str, data: dict) -> str:
+    """Apply a :func:`hotspot_kind_portfolio` pick to per-panel baselines.
+
+    ``report`` must be a byte-for-byte :func:`hotspot_kind_portfolio`
+    JSON output and ``data`` a dict whose keys are every
+    ``(by, key)`` tuple of the reported dimensions: ``by`` is
+    ``"region"`` or ``"window"`` and ``key`` a non-empty string, with the
+    set of ``by`` values exactly the report's group dimensions. Each
+    value is a ``(base, effects)`` two-tuple: ``base`` is a
+    ``(uhi, energy, vent)`` triple of finite non-boolean int/float
+    numbers and ``effects`` a dict whose keys are exactly the three
+    intervention kinds ``green``, ``roof`` and ``material``, each value a
+    same-order ``(uhi, energy, vent)`` triple. A non-string ``report`` or
+    a non-dict ``data`` raises ``TypeError``; every other violation
+    raises ``ValueError``. An empty report is accepted only with
+    ``data == {}``.
+
+    For every entry ``change`` is the componentwise sum of the
+    ``effects`` of the group's picked kinds and ``post = base + change``.
+    Numbers enter as ``Decimal(str(x))`` and all sums run under a
+    precision-1000, ROUND_HALF_EVEN local context on the unquantized
+    values.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups``, each
+    group uses ``by, items`` and each item uses
+    ``key, pick, uhi, energy, vent``. The ``uhi``, ``energy`` and
+    ``vent`` fields are each a ``[base, post, change]`` array of numbers
+    rendered with exactly six decimals, negative zero normalized to
+    ``0.000000``; ``pick`` renders as a JSON string array. Groups sort
+    region before window and items by ascending key; an empty report
+    yields ``groups`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dict")
+    alpha, groups = _kind_impact_parse(report)
+
+    report_bys = {by for by, _pick in groups}
+    if not groups and data:
+        raise ValueError("an empty report accepts only data == {}")
+
+    # by -> {key: (base triple, effects triple per kind)}
+    panels: dict[str, dict[str, tuple]] = {}
+    for entry_key, entry_value in data.items():
+        if not isinstance(entry_key, tuple) or len(entry_key) != 2:
+            raise ValueError("data keys must be (by, key) tuples")
+        by, key = entry_key
+        if by not in _KIND_IMPACT_BYS or not isinstance(key, str) or not key:
+            raise ValueError(
+                "data keys must be (by, key) with by region/window and a"
+                " non-empty key"
+            )
+        if by not in report_bys:
+            raise ValueError("data by set must match the report groups")
+        if not isinstance(entry_value, tuple) or len(entry_value) != 2:
+            raise ValueError("data values must be (base, effects) tuples")
+        base, effects = entry_value
+        if not isinstance(base, tuple) or len(base) != 3:
+            raise ValueError("base must be a (uhi, energy, vent) triple")
+        if not isinstance(effects, dict) or set(effects) != set(
+            _INTERVENTION_KINDS
+        ):
+            raise ValueError(
+                "effects keys must be exactly green, roof and material"
+            )
+        base_values = tuple(
+            _validate_finite_number(component, "base") for component in base
+        )
+        effect_values: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
+        for kind in _INTERVENTION_KINDS:
+            triple = effects[kind]
+            if not isinstance(triple, tuple) or len(triple) != 3:
+                raise ValueError(
+                    "each effect must be a (uhi, energy, vent) triple"
+                )
+            effect_values[kind] = tuple(
+                _validate_finite_number(component, "effect")
+                for component in triple
+            )
+        bucket = panels.setdefault(by, {})
+        if key in bucket:
+            raise ValueError(f"duplicate (by, key) data entry: {entry_key!r}")
+        bucket[key] = (base_values, effect_values)
+
+    if set(panels) != report_bys:
+        raise ValueError("data by set must match the report groups")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        group_tokens: list[str] = []
+        for by, pick in groups:
+            item_tokens: list[str] = []
+            for key in sorted(panels[by]):
+                base_values, effect_values = panels[by][key]
+                change_values = [Decimal(0), Decimal(0), Decimal(0)]
+                for kind in pick:
+                    triple = effect_values[kind]
+                    for component in range(3):
+                        change_values[component] += triple[component]
+                triples: list[str] = []
+                for component in range(3):
+                    base_component = base_values[component]
+                    change_component = change_values[component]
+                    post_component = base_component + change_component
+                    triples.append(
+                        "["
+                        + _format6(base_component)
+                        + ","
+                        + _format6(post_component)
+                        + ","
+                        + _format6(change_component)
+                        + "]"
+                    )
+                pick_token = "[" + ",".join(
+                    json.dumps(kind, ensure_ascii=False) for kind in pick
+                ) + "]"
+                item_tokens.append(
+                    '{"key":' + json.dumps(key, ensure_ascii=False)
+                    + ',"pick":' + pick_token
+                    + ',"uhi":' + triples[0]
+                    + ',"energy":' + triples[1]
+                    + ',"vent":' + triples[2]
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
 
 
 _TEMPORAL_LAG_MAX_N = 8
