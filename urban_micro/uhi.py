@@ -97,6 +97,7 @@ __all__ = [
     "kind_impact",
     "kind_impact_summary",
     "driver_attr",
+    "driver_attr_stability",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -18075,6 +18076,261 @@ def driver_attr(report: str, data: dict) -> str:
     return (
         '{"alpha":' + _format6(alpha)
         + ',"items":[' + ",".join(item_tokens) + "]}\n"
+    )
+
+
+_DRIVER_ATTR_STABILITY_ERROR = "report must be a driver_attr JSON output"
+
+
+def _driver_attr_output_parse(
+    raw: object,
+) -> tuple[Decimal, list[tuple[str, str, int, Decimal, bool, str]]]:
+    """Parse one canonical :func:`driver_attr` JSON output.
+
+    Returns ``(alpha, items)`` where each item is
+    ``(by, factor, n, effect, reject, direction)`` and items keep the
+    canonical region-before-window order. The input must be
+    byte-for-byte identical to a canonical output (key order, escaping,
+    item order and the six-decimal number tokens included); any
+    deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_DRIVER_ATTR_STABILITY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "items"}:
+        raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+    alpha = data["alpha"]
+    raw_items = data["items"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_items, list)
+    ):
+        raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+
+    items: list[tuple[str, str, int, Decimal, bool, str]] = []
+    item_tokens: list[str] = []
+    previous_by: int | None = None
+    for item in raw_items:
+        if not isinstance(item, dict) or set(item) != {
+            "by", "factor", "n", "effect", "p", "q", "reject", "direction",
+        }:
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        by = item["by"]
+        factor = item["factor"]
+        n = item["n"]
+        effect = item["effect"]
+        p_value = item["p"]
+        q_value = item["q"]
+        reject = item["reject"]
+        direction = item["direction"]
+        if by not in _KIND_IMPACT_BYS or factor not in _DRIVER_ATTR_FACTORS:
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        by_order = 0 if by == "region" else 1
+        if previous_by is not None and by_order <= previous_by:
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        previous_by = by_order
+        if (
+            isinstance(n, bool)
+            or not isinstance(n, int)
+            or not 1 <= n <= _DRIVER_ATTR_MAX_N
+        ):
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        if not isinstance(effect, _RankTrajectoryNumber):
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        if not isinstance(p_value, _RankTrajectoryNumber):
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        if not isinstance(q_value, _RankTrajectoryNumber):
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        if not isinstance(reject, bool):
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        if direction not in ("down", "up", "flat"):
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        items.append((by, factor, n, effect, reject, direction))
+        item_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"factor":' + json.dumps(factor, ensure_ascii=False)
+            + ',"n":' + str(n)
+            + ',"effect":' + _format6(effect)
+            + ',"p":' + _format6(p_value)
+            + ',"q":' + _format6(q_value)
+            + ',"reject":' + ("true" if reject else "false")
+            + ',"direction":' + json.dumps(direction, ensure_ascii=False)
+            + "}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"items":[' + ",".join(item_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+
+    return alpha, items
+
+
+def driver_attr_stability(reports: dict) -> str:
+    """Aggregate repeated :func:`driver_attr` reports into per-dimension,
+    per-factor selection stability statistics.
+
+    ``reports`` is a dict of at least two entries; every key must be a
+    non-empty string and every value a byte-for-byte canonical
+    :func:`driver_attr` JSON output (``alpha, items`` shape with one
+    picked item per ``by``). All reports must share one ``alpha`` and
+    one set of ``by`` dimensions; each report also carries exactly one
+    item per reported ``by``. A non-dict ``reports`` raises
+    ``TypeError``; every other violation raises ``ValueError``.
+
+    Within each ``by`` and ``factor`` (station, lst, morph, cover in that
+    order), ``n`` is the number of reports in which that factor was the
+    picked factor for the ``by`` and ``frequency = n / R`` with ``R`` the
+    report count. When ``n`` is zero, ``direction`` is ``flat`` and
+    ``consistency``, ``significant``, ``low`` and ``high`` are all zero;
+    otherwise ``direction`` is the modal picked direction among those
+    ``n`` selections with ties resolved down, up, flat in that order,
+    ``consistency`` is the modal direction's share ``n_direction / n``,
+    ``significant`` is the share whose item ``reject`` is true and
+    ``low``/``high`` are the minimum/maximum picked ``effect``.
+
+    Numbers enter as ``Decimal(str(x))`` and the frequency, consistency
+    and significance ratios run under a precision-1000, ROUND_HALF_EVEN
+    local context. Returns a compact UTF-8 JSON string with no spaces and
+    exactly one trailing newline; the top-level key order is
+    ``alpha, groups`` and each group uses ``by, items`` while each item
+    uses ``factor, n, frequency, direction, consistency, low, high,
+    significant``. Groups sort region before window and items in
+    station/lst/morph/cover order; ``n`` renders as an integer and
+    strings render verbatim while every other number renders with six
+    decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if len(reports) < 2:
+        raise ValueError("reports must hold at least two entries")
+    for key in reports:
+        if not isinstance(key, str) or not key:
+            raise ValueError("reports keys must be non-empty strings")
+
+    parsed_reports: list[
+        tuple[Decimal, dict[str, tuple[str, int, Decimal, bool, str]]]
+    ] = []
+    alpha: Decimal | None = None
+    by_set: frozenset[str] | None = None
+    for raw in reports.values():
+        report_alpha, items = _driver_attr_output_parse(raw)
+        if alpha is None:
+            alpha = report_alpha
+        elif report_alpha != alpha:
+            raise ValueError("all reports must share one alpha")
+        per_by = {
+            by: (factor, n, effect, reject, direction)
+            for by, factor, n, effect, reject, direction in items
+        }
+        if len(per_by) != len(items):
+            raise ValueError(_DRIVER_ATTR_STABILITY_ERROR)
+        if by_set is None:
+            by_set = frozenset(per_by)
+        elif frozenset(per_by) != by_set:
+            raise ValueError("all reports must share the same by set")
+        parsed_reports.append((report_alpha, per_by))
+    assert alpha is not None and by_set is not None
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        report_count = Decimal(len(parsed_reports))
+        group_tokens: list[str] = []
+        for by in _KIND_IMPACT_BYS:
+            if by not in by_set:
+                continue
+            picks = [per_by[by] for _report_alpha, per_by in parsed_reports]
+            item_tokens: list[str] = []
+            for factor in _DRIVER_ATTR_FACTORS:
+                selected = [
+                    (effect, reject, direction)
+                    for picked_factor, _n, effect, reject, direction in picks
+                    if picked_factor == factor
+                ]
+                n = len(selected)
+                frequency = Decimal(n) / report_count
+                if n == 0:
+                    direction = "flat"
+                    consistency = Decimal(0)
+                    significant = Decimal(0)
+                    low = Decimal(0)
+                    high = Decimal(0)
+                else:
+                    counts = {
+                        name: sum(
+                            1
+                            for _effect, _reject, picked_direction in selected
+                            if picked_direction == name
+                        )
+                        for name in ("down", "up", "flat")
+                    }
+                    # Ties resolve down, up, flat in that order.
+                    direction_order = ("down", "up", "flat")
+                    direction = min(
+                        direction_order,
+                        key=lambda name: (
+                            -counts[name],
+                            direction_order.index(name),
+                        ),
+                    )
+                    consistency = Decimal(counts[direction]) / Decimal(n)
+                    significant = Decimal(
+                        sum(1 for _effect, reject, _d in selected if reject)
+                    ) / Decimal(n)
+                    effects = [effect for effect, _reject, _d in selected]
+                    low = min(effects)
+                    high = max(effects)
+                item_tokens.append(
+                    '{"factor":' + json.dumps(factor, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"frequency":' + _format6(frequency)
+                    + ',"direction":' + json.dumps(direction, ensure_ascii=False)
+                    + ',"consistency":' + _format6(consistency)
+                    + ',"low":' + _format6(low)
+                    + ',"high":' + _format6(high)
+                    + ',"significant":' + _format6(significant)
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
     )
 
 
