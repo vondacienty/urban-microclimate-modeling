@@ -16868,6 +16868,337 @@ def hotspot_kind_priority(report: str, cost: dict) -> str:
         )
 
 
+_HOTSPOT_KIND_PORTFOLIO_ERROR = (
+    "report must be a hotspot_kind_priority JSON output"
+)
+
+
+def _hotspot_kind_priority_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[
+        tuple[
+            str,
+            list[
+                tuple[
+                    str, int, Decimal, Decimal, Decimal, Decimal, bool
+                ]
+            ],
+        ]
+    ],
+]:
+    """Parse one :func:`hotspot_kind_priority` JSON output.
+
+    Returns ``(alpha, groups)`` in canonical group order (region before
+    window); each group is ``(by, items)`` with items in canonical
+    (ascending rank) order, each item holding
+    ``(kind, n, change, q, cost, score, eligible)``. The input must be
+    byte-for-byte identical to a canonical output (key order, escaping,
+    spacing, group and item order and the six-decimal number tokens
+    included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+
+    groups: list[
+        tuple[str, list[tuple[str, int, Decimal, Decimal, Decimal, Decimal, bool]]]
+    ] = []
+    group_tokens: list[str] = []
+    previous_by: int | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"by", "items"}:
+            raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+        by = group["by"]
+        raw_items = group["items"]
+        if by not in ("region", "window") or not isinstance(raw_items, list):
+            raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+        by_order = 0 if by == "region" else 1
+        if previous_by is not None and by_order <= previous_by:
+            raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+        previous_by = by_order
+        # A by dimension without a tested kind is omitted, so a present
+        # group always holds at least one item.
+        if not raw_items:
+            raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+
+        items: list[
+            tuple[str, int, Decimal, Decimal, Decimal, Decimal, bool]
+        ] = []
+        item_tokens: list[str] = []
+        previous_rank: int | None = None
+        kinds_seen: set[str] = set()
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {
+                "kind", "n", "change", "q", "cost", "score",
+                "eligible", "rank",
+            }:
+                raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+            kind = item["kind"]
+            n = item["n"]
+            change = item["change"]
+            q = item["q"]
+            cost = item["cost"]
+            score = item["score"]
+            eligible = item["eligible"]
+            rank = item["rank"]
+            if (
+                not isinstance(kind, str)
+                or not kind
+                or kind not in _INTERVENTION_KINDS
+                or kind in kinds_seen
+                or isinstance(n, bool)
+                or not isinstance(n, int)
+                or n < 1
+                or n > _HOTSPOT_KIND_SUMMARY_MAX_PANELS
+                or not isinstance(change, _RankTrajectoryNumber)
+                or not isinstance(q, _RankTrajectoryNumber)
+                or q < 0
+                or q > 1
+                or not isinstance(cost, _RankTrajectoryNumber)
+                or cost <= 0
+                or not isinstance(score, _RankTrajectoryNumber)
+                or score < 0
+                or not isinstance(eligible, bool)
+                or isinstance(rank, bool)
+                or not isinstance(rank, int)
+                or rank < 1
+                or rank > len(raw_items)
+                or (previous_rank is not None and rank <= previous_rank)
+            ):
+                raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+            previous_rank = rank
+            kinds_seen.add(kind)
+            items.append((kind, n, change, q, cost, score, eligible))
+            item_tokens.append(
+                '{"kind":' + json.dumps(kind, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"change":' + _format6(change)
+                + ',"q":' + _format6(q)
+                + ',"cost":' + _format6(cost)
+                + ',"score":' + _format6(score)
+                + ',"eligible":' + ("true" if eligible else "false")
+                + ',"rank":' + str(rank)
+                + "}"
+            )
+
+        groups.append((by, items))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_HOTSPOT_KIND_PORTFOLIO_ERROR)
+    return alpha, groups
+
+
+def hotspot_kind_portfolio(report: str, budgets: dict, allow: dict) -> str:
+    """Pick a score-maximizing kind portfolio per ``by`` group of a
+    :func:`hotspot_kind_priority` report under a per-group budget.
+
+    ``report`` must be a byte-for-byte :func:`hotspot_kind_priority` JSON
+    output. ``budgets`` and ``allow`` are dicts whose key sets are both
+    exactly the report's ``by`` dimensions. Budget values are
+    non-negative finite non-boolean int/float numbers; each ``allow``
+    value is a duplicate-free list of that group's intervention kinds
+    and may be empty. A non-string ``report`` or a non-dict ``budgets``
+    or ``allow`` raises ``TypeError``; every other violation raises
+    ``ValueError``. An empty report is accepted only with
+    ``budgets == allow == {}``.
+
+    Within each group every subset of the kinds that are both
+    ``eligible`` in the report and listed in ``allow`` is enumerated;
+    subsets whose total cost exceeds the group's budget are discarded and
+    the empty subset is always feasible. The winner ranks by descending
+    total score, then ascending total cost, then lexicographically
+    ascending picked kinds; ``remaining`` is ``budget - cost``. Each
+    non-selected kind gets a ``reason`` in that order: ``q`` when it is
+    not eligible, ``a`` when it is not in ``allow``, ``b`` when adding
+    it to the chosen kinds would exceed the budget, and ``d`` otherwise.
+
+    Numbers enter as ``Decimal(str(x))`` and the subset sums and every
+    comparison run under a precision-1000, ROUND_HALF_EVEN local context
+    on the unquantized values. Returns a compact UTF-8 JSON string with
+    no spaces and exactly one trailing newline; the top-level key order
+    is ``alpha, groups``, each group uses
+    ``by, budget, cost, remaining, score, pick, skip`` and each skip
+    item uses ``kind, reason``. Groups sort region before window and
+    ``pick`` and ``skip`` sort by ascending kind; ``pick`` renders as a
+    string array and every number renders with six decimals, negative
+    zero normalized to ``0.000000``. A report without groups yields
+    ``groups`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(budgets, dict):
+        raise TypeError("budgets must be a dict")
+    if not isinstance(allow, dict):
+        raise TypeError("allow must be a dict")
+    alpha, groups = _hotspot_kind_priority_parse(report)
+
+    group_keys = {by for by, _items in groups}
+    if set(budgets) != group_keys:
+        raise ValueError("budgets keys must be every report by dimension")
+    if set(allow) != group_keys:
+        raise ValueError("allow keys must be every report by dimension")
+
+    budget_values: dict[str, Decimal] = {}
+    for by in group_keys:
+        number = _validate_finite_number(budgets[by], "budgets")
+        if number < 0:
+            raise ValueError("budgets values must be non-negative")
+        budget_values[by] = number
+
+    allowed: dict[str, set[str]] = {}
+    for by, items in groups:
+        group_kinds = {kind for kind, *_ in items}
+        value = allow[by]
+        if not isinstance(value, list):
+            raise ValueError("allow values must be lists")
+        members: set[str] = set()
+        for kind in value:
+            if not isinstance(kind, str) or kind not in group_kinds:
+                raise ValueError(
+                    "allow values must be duplicate-free lists of that"
+                    " group's kinds"
+                )
+            if kind in members:
+                raise ValueError(
+                    "allow values must be duplicate-free lists of that"
+                    " group's kinds"
+                )
+            members.add(kind)
+        allowed[by] = members
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        group_tokens: list[str] = []
+        for by, items in groups:
+            budget = budget_values[by]
+            group_allow = allowed[by]
+            candidates = [
+                (kind, cost, score)
+                for kind, _n, _change, _q, cost, score, eligible in items
+                if eligible and kind in group_allow
+            ]
+
+            best_picks: tuple[str, ...] = ()
+            best_cost = Decimal(0)
+            best_score = Decimal(0)
+            for mask in range(1 << len(candidates)):
+                total_cost = Decimal(0)
+                total_score = Decimal(0)
+                chosen: list[str] = []
+                for index, (kind, cost, score) in enumerate(candidates):
+                    if (mask >> index) & 1:
+                        total_cost += cost
+                        total_score += score
+                        chosen.append(kind)
+                if total_cost > budget:
+                    continue
+                chosen.sort()
+                if (
+                    -total_score,
+                    total_cost,
+                    chosen,
+                ) < (
+                    -best_score,
+                    best_cost,
+                    list(best_picks),
+                ):
+                    best_picks = tuple(chosen)
+                    best_cost = total_cost
+                    best_score = total_score
+
+            chosen_set = set(best_picks)
+            remaining = budget - best_cost
+
+            skip: list[tuple[str, str]] = []
+            for kind, _n, _change, _q, cost, _score, eligible in items:
+                if kind in chosen_set:
+                    continue
+                if not eligible:
+                    reason = "q"
+                elif kind not in group_allow:
+                    reason = "a"
+                elif best_cost + cost > budget:
+                    reason = "b"
+                else:
+                    reason = "d"
+                skip.append((kind, reason))
+            skip.sort(key=lambda item: item[0])
+
+            pick_token = "[" + ",".join(
+                json.dumps(kind, ensure_ascii=False) for kind in best_picks
+            ) + "]"
+            skip_token = "[" + ",".join(
+                '{"kind":' + json.dumps(kind, ensure_ascii=False)
+                + ',"reason":' + json.dumps(reason, ensure_ascii=False)
+                + "}"
+                for kind, reason in skip
+            ) + "]"
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"budget":' + _format6(budget)
+                + ',"cost":' + _format6(best_cost)
+                + ',"remaining":' + _format6(remaining)
+                + ',"score":' + _format6(best_score)
+                + ',"pick":' + pick_token
+                + ',"skip":' + skip_token
+                + "}"
+            )
+
+        return (
+            '{"alpha":' + _format6(alpha)
+            + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+        )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
