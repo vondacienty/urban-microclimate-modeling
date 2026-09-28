@@ -98,6 +98,7 @@ __all__ = [
     "kind_impact_summary",
     "driver_attr",
     "driver_attr_stability",
+    "driver_attr_stability_summary",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -18327,6 +18328,259 @@ def driver_attr_stability(reports: dict) -> str:
                 '{"by":' + json.dumps(by, ensure_ascii=False)
                 + ',"items":[' + ",".join(item_tokens) + "]}"
             )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_DRIVER_ATTR_STABILITY_SUMMARY_ERROR = (
+    "report must be a driver_attr_stability JSON output"
+)
+
+
+def _validate_unit_threshold(value: object, name: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite int or float in [0, 1]")
+    # Every int is finite; guard the float range check separately.
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    threshold = Decimal(str(value))
+    if not Decimal(0) <= threshold <= Decimal(1):
+        raise ValueError(f"{name} must be in [0, 1]")
+    return threshold
+
+
+def _driver_attr_stability_output_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[tuple[str, list[tuple[str, int, Decimal, str, Decimal, Decimal, Decimal, Decimal]]]],
+]:
+    """Parse one canonical :func:`driver_attr_stability` JSON output.
+
+    Returns ``(alpha, groups)`` where each group is ``(by, items)`` and
+    every item is an ``(factor, n, frequency, direction, consistency,
+    low, high, significant)`` tuple. Groups keep the canonical
+    region-before-window order and items the station/lst/morph/cover
+    order. The input must be byte-for-byte identical to a canonical
+    output (key order, escaping, group/item order and the six-decimal
+    number tokens included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+
+    groups: list[
+        tuple[str, list[tuple[str, int, Decimal, str, Decimal, Decimal, Decimal, Decimal]]]
+    ] = []
+    group_tokens: list[str] = []
+    previous_by: int | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"by", "items"}:
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+        by = group["by"]
+        raw_items = group["items"]
+        if by not in _KIND_IMPACT_BYS or not isinstance(raw_items, list):
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+        by_order = 0 if by == "region" else 1
+        if previous_by is not None and by_order <= previous_by:
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+        previous_by = by_order
+
+        items: list[
+            tuple[str, int, Decimal, str, Decimal, Decimal, Decimal, Decimal]
+        ] = []
+        item_tokens: list[str] = []
+        previous_factor: int | None = None
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {
+                "factor", "n", "frequency", "direction",
+                "consistency", "low", "high", "significant",
+            }:
+                raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+            factor = item["factor"]
+            n = item["n"]
+            frequency = item["frequency"]
+            direction = item["direction"]
+            consistency = item["consistency"]
+            low = item["low"]
+            high = item["high"]
+            significant = item["significant"]
+            if factor not in _DRIVER_ATTR_FACTORS:
+                raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+            factor_order = _DRIVER_ATTR_FACTORS.index(factor)
+            if previous_factor is not None and factor_order <= previous_factor:
+                raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+            previous_factor = factor_order
+            if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+            if direction not in ("down", "up", "flat"):
+                raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+            for number in (frequency, consistency, low, high, significant):
+                if not isinstance(number, _RankTrajectoryNumber):
+                    raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+            items.append(
+                (factor, n, frequency, direction, consistency, low, high,
+                 significant)
+            )
+            item_tokens.append(
+                '{"factor":' + json.dumps(factor, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"frequency":' + _format6(frequency)
+                + ',"direction":' + json.dumps(direction, ensure_ascii=False)
+                + ',"consistency":' + _format6(consistency)
+                + ',"low":' + _format6(low)
+                + ',"high":' + _format6(high)
+                + ',"significant":' + _format6(significant)
+                + "}"
+            )
+        groups.append((by, items))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_ERROR)
+
+    return alpha, groups
+
+
+def driver_attr_stability_summary(
+    report: str,
+    *,
+    min_frequency: float = 0.5,
+    min_consistency: float = 0.75,
+    min_significant: float = 0.5,
+) -> str:
+    """Re-render one :func:`driver_attr_stability` report with
+    thresholded stability and interval flags.
+
+    ``report`` must be a byte-for-byte canonical
+    :func:`driver_attr_stability` JSON output. ``min_frequency``,
+    ``min_consistency`` and ``min_significant`` are keyword-only
+    thresholds (defaults ``0.5``, ``0.75`` and ``0.5``); each must be a
+    finite non-boolean int/float in the closed interval ``[0, 1]``. A
+    non-string ``report`` raises ``TypeError``; every other violation
+    raises ``ValueError``.
+
+    With ``n`` the item's pick count and its parsed ``low``/``high``
+    effect range, ``conflict`` is true exactly when ``n > 0`` and
+    ``consistency < 1`` while ``cross_zero`` is true exactly when
+    ``n > 0`` and ``low <= 0 <= high``. An item is ``stable`` only when
+    ``n > 0``, ``frequency >= min_frequency``, ``consistency >=
+    min_consistency``, ``significant >= min_significant``, its
+    ``direction`` is not ``flat`` and its interval does not cross zero.
+    Every comparison uses the parsed values as ``Decimal(str(x))``.
+
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups`` and
+    each group uses ``by, items`` while each item uses
+    ``factor, direction, frequency, consistency, significant, low,
+    high, stable, conflict, cross_zero``. Groups sort region before
+    window and items in station/lst/morph/cover order; every number
+    renders with six decimals, negative zero normalized to
+    ``0.000000``, and the three flags render as booleans.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    min_frequency_value = _validate_unit_threshold(
+        min_frequency, "min_frequency"
+    )
+    min_consistency_value = _validate_unit_threshold(
+        min_consistency, "min_consistency"
+    )
+    min_significant_value = _validate_unit_threshold(
+        min_significant, "min_significant"
+    )
+    alpha, groups = _driver_attr_stability_output_parse(report)
+
+    zero = Decimal(0)
+    one = Decimal(1)
+    group_tokens: list[str] = []
+    for by, items in groups:
+        item_tokens: list[str] = []
+        for (
+            factor,
+            n,
+            frequency,
+            direction,
+            consistency,
+            low,
+            high,
+            significant,
+        ) in items:
+            selected = n > 0
+            conflict = selected and consistency < one
+            cross_zero = selected and low <= zero <= high
+            stable = (
+                selected
+                and frequency >= min_frequency_value
+                and consistency >= min_consistency_value
+                and significant >= min_significant_value
+                and direction != "flat"
+                and not cross_zero
+            )
+            item_tokens.append(
+                '{"factor":' + json.dumps(factor, ensure_ascii=False)
+                + ',"direction":' + json.dumps(direction, ensure_ascii=False)
+                + ',"frequency":' + _format6(frequency)
+                + ',"consistency":' + _format6(consistency)
+                + ',"significant":' + _format6(significant)
+                + ',"low":' + _format6(low)
+                + ',"high":' + _format6(high)
+                + ',"stable":' + ("true" if stable else "false")
+                + ',"conflict":' + ("true" if conflict else "false")
+                + ',"cross_zero":' + ("true" if cross_zero else "false")
+                + "}"
+            )
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
 
     return (
         '{"alpha":' + _format6(alpha)
