@@ -18612,6 +18612,481 @@ def driver_attr_stability_summary(
     )
 
 
+_KIND_IMPACT_SUMMARY_LINK_ERROR = (
+    "report must be a kind_impact_summary JSON output"
+)
+_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR = (
+    "report must be a driver_attr_stability_summary JSON output"
+)
+
+
+def _driver_attr_stability_summary_output_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[
+        tuple[
+            str,
+            list[
+                tuple[
+                    str, Decimal, Decimal, Decimal, Decimal, Decimal, bool,
+                    bool, bool,
+                ]
+            ],
+        ]
+    ],
+]:
+    """Parse one canonical :func:`driver_attr_stability_summary` output.
+
+    Returns ``(alpha, groups)`` in canonical region-before-window order;
+    each group is ``(by, items)`` and each item is
+    ``(factor, frequency, consistency, significant, low, high, stable,
+    conflict, cross_zero)`` keeping the canonical station/lst/morph/cover
+    item order. The input must be byte-for-byte identical to a canonical
+    output (key order, escaping, group and item order and the
+    six-decimal number tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+
+    groups: list[
+        tuple[
+            str,
+            list[
+                tuple[
+                    str, Decimal, Decimal, Decimal, Decimal, Decimal, bool,
+                    bool, bool,
+                ]
+            ],
+        ]
+    ] = []
+    group_tokens: list[str] = []
+    previous_by: int | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"by", "items"}:
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+        by = group["by"]
+        raw_items = group["items"]
+        if by not in _KIND_IMPACT_BYS or not isinstance(raw_items, list):
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+        by_order = 0 if by == "region" else 1
+        if previous_by is not None and by_order <= previous_by:
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+        previous_by = by_order
+        if len(raw_items) != len(_DRIVER_ATTR_FACTORS):
+            raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+
+        items: list[
+            tuple[
+                str, Decimal, Decimal, Decimal, Decimal, Decimal, bool,
+                bool, bool,
+            ]
+        ] = []
+        item_tokens: list[str] = []
+        previous_factor: int | None = None
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {
+                "factor", "direction", "frequency", "consistency",
+                "significant", "low", "high", "stable", "conflict",
+                "cross_zero",
+            }:
+                raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+            factor = item["factor"]
+            direction = item["direction"]
+            frequency = item["frequency"]
+            consistency = item["consistency"]
+            significant = item["significant"]
+            low = item["low"]
+            high = item["high"]
+            stable = item["stable"]
+            conflict = item["conflict"]
+            cross_zero = item["cross_zero"]
+            if factor not in _DRIVER_ATTR_FACTORS:
+                raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+            factor_order = _DRIVER_ATTR_FACTORS.index(factor)
+            if (
+                previous_factor is not None
+                and factor_order <= previous_factor
+            ):
+                raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+            previous_factor = factor_order
+            for number in (frequency, consistency, significant, low, high):
+                if not isinstance(number, _RankTrajectoryNumber):
+                    raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+            if direction not in ("down", "up", "flat"):
+                raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+            for flag in (stable, conflict, cross_zero):
+                if not isinstance(flag, bool):
+                    raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+            items.append(
+                (
+                    factor, frequency, consistency, significant, low, high,
+                    stable, conflict, cross_zero,
+                )
+            )
+            item_tokens.append(
+                '{"factor":' + json.dumps(factor, ensure_ascii=False)
+                + ',"direction":' + json.dumps(direction, ensure_ascii=False)
+                + ',"frequency":' + _format6(frequency)
+                + ',"consistency":' + _format6(consistency)
+                + ',"significant":' + _format6(significant)
+                + ',"low":' + _format6(low)
+                + ',"high":' + _format6(high)
+                + ',"stable":' + ("true" if stable else "false")
+                + ',"conflict":' + ("true" if conflict else "false")
+                + ',"cross_zero":' + ("true" if cross_zero else "false")
+                + "}"
+            )
+        groups.append((by, items))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_DRIVER_ATTR_STABILITY_SUMMARY_LINK_ERROR)
+
+    return alpha, groups
+
+
+def _kind_impact_summary_output_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    list[
+        tuple[
+            str,
+            list[tuple[str, Decimal, Decimal, Decimal, Decimal, bool]],
+        ]
+    ],
+]:
+    """Parse one canonical :func:`kind_impact_summary` JSON output.
+
+    Returns ``(alpha, groups)`` in canonical region-before-window order;
+    each group is ``(by, items)`` and each item is
+    ``(metric, base, post, change, q, reject)`` keeping the canonical
+    uhi/energy/vent item order. The input must be byte-for-byte identical
+    to a canonical output (key order, escaping, group and item order and
+    the six-decimal number tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "items"}:
+        raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+    alpha = data["alpha"]
+    raw_items = data["items"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_items, list)
+    ):
+        raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+
+    groups: dict[str, list[tuple[str, Decimal, Decimal, Decimal, Decimal, bool]]] = {}
+    item_tokens: list[str] = []
+    previous_by: int | None = None
+    previous_metric: int | None = None
+    for item in raw_items:
+        if not isinstance(item, dict) or set(item) != {
+            "by", "metric", "n", "base", "post", "change", "p", "q",
+            "reject",
+        }:
+            raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+        by = item["by"]
+        metric = item["metric"]
+        n = item["n"]
+        base = item["base"]
+        post = item["post"]
+        change = item["change"]
+        p_value = item["p"]
+        q_value = item["q"]
+        reject = item["reject"]
+        if by not in _KIND_IMPACT_BYS or metric not in _KIND_IMPACT_METRICS:
+            raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+        by_order = 0 if by == "region" else 1
+        metric_order = _KIND_IMPACT_METRICS.index(metric)
+        if previous_by is not None and by_order < previous_by:
+            raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+        if by_order == previous_by:
+            if previous_metric is None or metric_order <= previous_metric:
+                raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+        previous_by = by_order
+        previous_metric = metric_order
+        if (
+            isinstance(n, bool)
+            or not isinstance(n, int)
+            or not 1 <= n <= _KIND_IMPACT_SUMMARY_MAX_N
+        ):
+            raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+        for number in (base, post, change, p_value, q_value):
+            if not isinstance(number, _RankTrajectoryNumber):
+                raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+        if not isinstance(reject, bool):
+            raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+        groups.setdefault(by, []).append(
+            (metric, base, post, change, q_value, reject)
+        )
+        item_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"metric":' + json.dumps(metric, ensure_ascii=False)
+            + ',"n":' + str(n)
+            + ',"base":' + _format6(base)
+            + ',"post":' + _format6(post)
+            + ',"change":' + _format6(change)
+            + ',"p":' + _format6(p_value)
+            + ',"q":' + _format6(q_value)
+            + ',"reject":' + ("true" if reject else "false")
+            + "}"
+        )
+
+    # Every reported by carries one item per metric (uhi, energy, vent).
+    for by, by_items in groups.items():
+        if len(by_items) != len(_KIND_IMPACT_METRICS):
+            raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"items":[' + ",".join(item_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_KIND_IMPACT_SUMMARY_LINK_ERROR)
+
+    return alpha, [(by, groups[by]) for by in _KIND_IMPACT_BYS if by in groups]
+
+
+_DRIVER_LINK_VALUES = (
+    "uhi-", "uhi+", "energy-", "energy+", "vent-", "vent+",
+)
+
+
+def driver_link(s: str, i: str, links: dict) -> str:
+    """Link stable driver factors to significant kind-impact metrics.
+
+    ``s`` must be a byte-for-byte canonical
+    :func:`driver_attr_stability_summary` JSON output and ``i`` a
+    byte-for-byte canonical :func:`kind_impact_summary` JSON output; both
+    reports must share one ``alpha`` and one set of ``by`` dimensions.
+    ``links`` is a dict whose keys are exactly the four factors
+    ``station``, ``lst``, ``morph`` and ``cover``; every value is one of
+    ``uhi-``, ``uhi+``, ``energy-``, ``energy+``, ``vent-``, ``vent+``,
+    naming the metric a factor links to with the ``-``/``+`` suffix
+    requiring a down/up ``change``. A non-string ``s`` or ``i`` or a
+    non-dict ``links`` raises ``TypeError``; every other violation raises
+    ``ValueError``.
+
+    For every reported ``by`` and factor, the factor's stability-summary
+    item joins the impact-summary item of the linked metric. An item is
+    ``eligible`` only when the stability item's ``stable`` flag and the
+    impact item's ``reject`` flag are both true and the impact
+    ``change`` points in the linked direction (negative for ``-``,
+    positive for ``+``); a zero change matches neither direction. Its
+    ``score`` is ``abs(change) * (1 - q)`` when eligible and ``0``
+    otherwise, with ``q`` the impact item's BH-adjusted value. Within
+    each group ranks start at 1, ordered by eligible first, then
+    descending score, then station/lst/morph/cover factor order.
+
+    Numbers enter as ``Decimal(str(x))`` and the score arithmetic and
+    every comparison run under a precision-1000, ROUND_HALF_EVEN local
+    context on the unquantized parsed values. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``alpha, groups``, each group uses
+    ``by, items`` and each item uses
+    ``factor, metric, effect, low, high, q, score, eligible, rank`` with
+    ``effect`` echoing the linked impact item's ``change`` and ``q`` its
+    BH-adjusted value, while ``low``/``high`` echo the factor's
+    stability-summary effect bounds. Groups sort region before window
+    and items by rank; ``rank`` renders as an integer and ``eligible``
+    as a boolean while every other number renders with six decimals,
+    negative zero normalized to ``0.000000``. Reports without groups
+    yield ``groups`` empty.
+    """
+    if not isinstance(s, str):
+        raise TypeError("s must be a str")
+    if not isinstance(i, str):
+        raise TypeError("i must be a str")
+    if not isinstance(links, dict):
+        raise TypeError("links must be a dict")
+
+    s_alpha, s_groups = _driver_attr_stability_summary_output_parse(s)
+    i_alpha, i_groups = _kind_impact_summary_output_parse(i)
+
+    if s_alpha != i_alpha:
+        raise ValueError("s and i must share one alpha")
+    s_bys = {by for by, _items in s_groups}
+    i_bys = {by for by, _items in i_groups}
+    if s_bys != i_bys:
+        raise ValueError("s and i must share one by set")
+    if set(links) != set(_DRIVER_ATTR_FACTORS):
+        raise ValueError(
+            "links keys must be exactly station, lst, morph, cover"
+        )
+    link_by_factor: dict[str, tuple[str, int]] = {}
+    for factor in _DRIVER_ATTR_FACTORS:
+        value = links[factor]
+        if not isinstance(value, str) or value not in _DRIVER_LINK_VALUES:
+            raise ValueError(
+                "links values must be one of "
+                "uhi-, uhi+, energy-, energy+, vent-, vent+"
+            )
+        sign = -1 if value.endswith("-") else 1
+        link_by_factor[factor] = (value[:-1], sign)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (by, factor) -> (stable flag, effect low, effect high) straight
+        # from the parsed stability summary.
+        stability_cells: dict[tuple[str, str], tuple[bool, Decimal, Decimal]] = {}
+        for by, items in s_groups:
+            for (
+                factor,
+                _frequency,
+                _consistency,
+                _significant,
+                low,
+                high,
+                stable,
+                _conflict,
+                _cross_zero,
+            ) in items:
+                stability_cells[(by, factor)] = (stable, low, high)
+
+        impact_cells: dict[tuple[str, str], tuple[Decimal, Decimal, Decimal, Decimal, bool]] = {
+            (by, metric): (base, post, change, q_value, reject)
+            for by, items in i_groups
+            for metric, base, post, change, q_value, reject in items
+        }
+
+        group_tokens: list[str] = []
+        one = Decimal(1)
+        for by, _items in s_groups:
+            ranked: list[
+                tuple[str, str, Decimal, Decimal, Decimal, Decimal, Decimal, bool]
+            ] = []
+            for factor in _DRIVER_ATTR_FACTORS:
+                metric, sign = link_by_factor[factor]
+                _base, _post, change, q_value, reject = impact_cells[(by, metric)]
+                stable, low, high = stability_cells[(by, factor)]
+                if sign < 0:
+                    direction_match = change < 0
+                else:
+                    direction_match = change > 0
+                eligible = stable and reject and direction_match
+                if eligible:
+                    score = abs(change) * (one - q_value)
+                else:
+                    score = Decimal(0)
+                ranked.append(
+                    (factor, metric, change, low, high, q_value, score, eligible)
+                )
+            ranked.sort(
+                key=lambda item: (
+                    not item[7],
+                    -item[6],
+                    _DRIVER_ATTR_FACTORS.index(item[0]),
+                )
+            )
+
+            item_tokens: list[str] = []
+            for rank, (
+                factor, metric, effect, low, high, q_value, score, eligible
+            ) in enumerate(ranked, start=1):
+                item_tokens.append(
+                    '{"factor":' + json.dumps(factor, ensure_ascii=False)
+                    + ',"metric":' + json.dumps(metric, ensure_ascii=False)
+                    + ',"effect":' + _format6(effect)
+                    + ',"low":' + _format6(low)
+                    + ',"high":' + _format6(high)
+                    + ',"q":' + _format6(q_value)
+                    + ',"score":' + _format6(score)
+                    + ',"eligible":' + ("true" if eligible else "false")
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(s_alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
 _TEMPORAL_LAG_MAX_N = 8
 
 
