@@ -19767,6 +19767,87 @@ def _driver_plan_pareto_parse(
     return points
 
 
+def _driver_plan_pareto_select(
+    points: list[
+        tuple[
+            Decimal,
+            list[
+                tuple[
+                    str, Decimal, Decimal, Decimal, Decimal, tuple[str, ...]
+                ]
+            ],
+        ]
+    ],
+    weight_values: dict[str, Decimal],
+    limit_value: Decimal,
+) -> dict[
+    str,
+    list[
+        tuple[Decimal, Decimal, tuple[str, ...], Decimal, Decimal, Decimal]
+    ]
+]:
+    """Gather, de-duplicate and rank the admissible combinations for one
+    limit exactly as :func:`driver_plan_pareto` does.
+
+    Returns one survivor list per reported ``by``; each survivor is
+    ``(score, cost, pick, uhi, energy, vent)`` sorted by ascending
+    ``(score, cost, pick)``. Runs inside the caller's precision-1000
+    ROUND_HALF_EVEN context and compares unquantized values.
+    """
+    # by -> pick -> (cost, uhi, energy, vent); the ascending point
+    # order makes the first occurrence the smallest-limit one.
+    collected: dict[str, dict[tuple[str, ...], tuple[Decimal, ...]]] = {}
+    for _point_limit, point_groups in points:
+        for by, cost, uhi, energy, vent, pick in point_groups:
+            combinations = collected.setdefault(by, {})
+            if cost <= limit_value and pick not in combinations:
+                combinations[pick] = (cost, uhi, energy, vent)
+
+    survivors_by: dict[
+        str,
+        list[
+            tuple[Decimal, Decimal, tuple[str, ...], Decimal, Decimal,
+                  Decimal]
+        ]
+    ] = {}
+    for by in _KIND_IMPACT_BYS:
+        if by not in collected:
+            continue
+        vectors = {
+            pick: (cost, uhi, energy, -vent)
+            for pick, (cost, uhi, energy, vent) in collected[by].items()
+        }
+        survivors: list[
+            tuple[Decimal, Decimal, tuple[str, ...], Decimal, Decimal,
+                  Decimal]
+        ] = []
+        for pick, vector in vectors.items():
+            cost, uhi, energy, neg_vent = vector
+            dominated = any(
+                other_pick != pick
+                and all(
+                    other[position] <= vector[position]
+                    for position in range(4)
+                )
+                and any(
+                    other[position] < vector[position]
+                    for position in range(4)
+                )
+                for other_pick, other in vectors.items()
+            )
+            if dominated:
+                continue
+            score = (
+                weight_values["uhi"] * uhi
+                + weight_values["energy"] * energy
+                + weight_values["vent"] * neg_vent
+            )
+            survivors.append((score, cost, pick, uhi, energy, -neg_vent))
+        survivors.sort(key=lambda row: (row[0], row[1], row[2]))
+        survivors_by[by] = survivors
+    return survivors_by
+
+
 def driver_plan_pareto(frontier: str, weights: dict, limit) -> str:
     """Select non-dominated plan combinations from a frontier report.
 
@@ -19827,53 +19908,15 @@ def driver_plan_pareto(frontier: str, weights: dict, limit) -> str:
         ctx.prec = _MODEL_PRECISION
         ctx.rounding = ROUND_HALF_EVEN
 
-        # by -> pick -> (cost, uhi, energy, vent); the ascending point
-        # order makes the first occurrence the smallest-limit one.
-        collected: dict[
-            str, dict[tuple[str, ...], tuple[Decimal, ...]]
-        ] = {}
-        for _point_limit, point_groups in points:
-            for by, cost, uhi, energy, vent, pick in point_groups:
-                combinations = collected.setdefault(by, {})
-                if cost <= limit_value and pick not in combinations:
-                    combinations[pick] = (cost, uhi, energy, vent)
+        survivors_by = _driver_plan_pareto_select(
+            points, weight_values, limit_value
+        )
 
         group_tokens: list[str] = []
         for by in _KIND_IMPACT_BYS:
-            if by not in collected:
+            if by not in survivors_by:
                 continue
-            vectors = {
-                pick: (cost, uhi, energy, -vent)
-                for pick, (cost, uhi, energy, vent) in collected[by].items()
-            }
-            survivors: list[
-                tuple[Decimal, Decimal, tuple[str, ...], Decimal, Decimal,
-                      Decimal]
-            ] = []
-            for pick, vector in vectors.items():
-                cost, uhi, energy, neg_vent = vector
-                dominated = any(
-                    other_pick != pick
-                    and all(
-                        other[position] <= vector[position]
-                        for position in range(4)
-                    )
-                    and any(
-                        other[position] < vector[position]
-                        for position in range(4)
-                    )
-                    for other_pick, other in vectors.items()
-                )
-                if dominated:
-                    continue
-                score = (
-                    weight_values["uhi"] * uhi
-                    + weight_values["energy"] * energy
-                    + weight_values["vent"] * neg_vent
-                )
-                survivors.append((score, cost, pick, uhi, energy, -neg_vent))
-            survivors.sort(key=lambda row: (row[0], row[1], row[2]))
-
+            survivors = survivors_by[by]
             item_tokens: list[str] = []
             for score, cost, pick, uhi, energy, vent in survivors:
                 item_tokens.append(
@@ -19899,6 +19942,187 @@ def driver_plan_pareto(frontier: str, weights: dict, limit) -> str:
         '{"limit":' + _format6(limit_value)
         + ',"groups":[' + ",".join(group_tokens) + "]}\n"
     )
+
+
+def pareto_stability(frontier: str, weights: dict, limits: list) -> str:
+    """Aggregate :func:`driver_plan_pareto` recommendations across weight
+    scenarios and ascending budget limits.
+
+    ``frontier`` must be a byte-for-byte canonical
+    :func:`driver_plan_frontier` JSON output. ``weights`` holds at least
+    two scenarios: every key is a non-empty string scenario name and
+    every value is a dict whose keys are exactly ``uhi``, ``energy`` and
+    ``vent`` with finite non-boolean positive int/float values.
+    ``limits`` is a non-empty list of finite non-boolean non-negative
+    int/float values, pairwise distinct under ``Decimal(str(x))``
+    comparison. A non-string ``frontier``, a non-dict ``weights``, a
+    non-list ``limits`` or a non-dict scenario value raises
+    ``TypeError``; every other violation raises ``ValueError``.
+
+    The limits are processed in ascending order. At each limit every
+    scenario runs the original Pareto selection independently; for each
+    ``by`` the non-null recommendations are tallied and the pick
+    recommended by the most scenarios wins, ties resolved by the
+    lexicographically first pick, with ``stability`` the winning count
+    divided by the number of scenarios. When every scenario recommends
+    nothing, ``recommend`` is ``null``, ``stability`` is ``1`` and
+    ``items`` is ``[]``. ``switch`` is true exactly when the current
+    recommendation (``null`` included) differs from the same ``by``'s
+    recommendation at the previous limit; the first point never
+    switches. Each item carries one distinct non-null recommended pick
+    with ``frequency`` its recommendation count divided by the scenario
+    count alongside the pick's frontier ``uhi``, ``energy`` and
+    ``vent``; items sort by descending ``frequency`` and ascending
+    ``pick``.
+
+    Numbers enter as ``Decimal(str(x))`` and the ratios and selection
+    arithmetic run under a precision-1000, ROUND_HALF_EVEN local context
+    with comparisons on the unquantized values. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key is ``points`` ordered by ascending ``limit`` and each
+    point uses ``limit, groups`` with groups ordered region before
+    window. Each group uses ``by, recommend, stability, switch, items``
+    and each item ``pick, frequency, uhi, energy, vent``; ``recommend``
+    and ``pick`` are ascending string arrays (or ``null``) and
+    ``switch`` is a boolean. Every number renders with six decimals,
+    negative zero normalized to ``0.000000``; an empty report emits one
+    point per limit with ``groups: []``.
+    """
+    if not isinstance(frontier, str):
+        raise TypeError("frontier must be a str")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(limits, list):
+        raise TypeError("limits must be a list")
+    if len(weights) < 2:
+        raise ValueError("weights must hold at least two entries")
+    weight_values_by_name: dict[str, dict[str, Decimal]] = {}
+    for name, scenario in weights.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("weights keys must be non-empty strings")
+        if not isinstance(scenario, dict):
+            raise TypeError("each weights value must be a dict")
+        if set(scenario) != set(_KIND_IMPACT_METRICS):
+            raise ValueError(
+                "weights values must have exactly uhi, energy and vent keys"
+            )
+        scenario_values: dict[str, Decimal] = {}
+        for metric in _KIND_IMPACT_METRICS:
+            weight = scenario[metric]
+            if isinstance(weight, bool) or not isinstance(
+                weight, (int, float)
+            ):
+                raise ValueError("weight values must be finite int or float")
+            if isinstance(weight, float) and not math.isfinite(weight):
+                raise ValueError("weight values must be finite")
+            weight_value = Decimal(str(weight))
+            if weight_value <= 0:
+                raise ValueError("weight values must be positive")
+            scenario_values[metric] = weight_value
+        weight_values_by_name[name] = scenario_values
+    if not limits:
+        raise ValueError("limits must be a non-empty list")
+    limit_values: list[Decimal] = []
+    seen_limits: set[Decimal] = set()
+    for limit in limits:
+        limit_value = _driver_plan_validate_limit(limit)
+        if limit_value in seen_limits:
+            raise ValueError("limits must be pairwise distinct")
+        seen_limits.add(limit_value)
+        limit_values.append(limit_value)
+    limit_values.sort()
+
+    points = _driver_plan_pareto_parse(frontier)
+    present_bys = [
+        by
+        for by in _KIND_IMPACT_BYS
+        if any(
+            by == group[0]
+            for _point_limit, point_groups in points
+            for group in point_groups
+        )
+    ]
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        weight_count = Decimal(len(weight_values_by_name))
+        point_tokens: list[str] = []
+        previous_recommend: dict[str, tuple[str, ...] | None] = {}
+        for point_index, limit_value in enumerate(limit_values):
+            # by -> pick -> (uhi, energy, vent, recommendation count)
+            tally_by: dict[
+                str, dict[tuple[str, ...], tuple[Decimal, Decimal, Decimal, int]]
+            ] = {by: {} for by in present_bys}
+            for scenario_values in weight_values_by_name.values():
+                survivors_by = _driver_plan_pareto_select(
+                    points, scenario_values, limit_value
+                )
+                for by in present_bys:
+                    survivors = survivors_by.get(by, [])
+                    if not survivors:
+                        continue
+                    _score, _cost, pick, uhi, energy, vent = survivors[0]
+                    tally = tally_by[by]
+                    if pick in tally:
+                        _u, _e, _v, count = tally[pick]
+                        tally[pick] = (uhi, energy, vent, count + 1)
+                    else:
+                        tally[pick] = (uhi, energy, vent, 1)
+
+            group_tokens: list[str] = []
+            for by in present_bys:
+                tally = tally_by[by]
+                if not tally:
+                    recommend_pick: tuple[str, ...] | None = None
+                    stability = Decimal(1)
+                    item_tokens: list[str] = []
+                else:
+                    recommend_pick = min(
+                        tally, key=lambda pick: (-tally[pick][3], pick)
+                    )
+                    _u, _e, _v, win_count = tally[recommend_pick]
+                    stability = Decimal(win_count) / weight_count
+                    item_tokens = []
+                    for pick in sorted(
+                        tally, key=lambda value: (-tally[value][3], value)
+                    ):
+                        uhi, energy, vent, count = tally[pick]
+                        frequency = Decimal(count) / weight_count
+                        item_tokens.append(
+                            '{"pick":'
+                            + _driver_plan_string_array(pick)
+                            + ',"frequency":' + _format6(frequency)
+                            + ',"uhi":' + _format6(uhi)
+                            + ',"energy":' + _format6(energy)
+                            + ',"vent":' + _format6(vent)
+                            + "}"
+                        )
+                switched = (
+                    point_index > 0
+                    and recommend_pick != previous_recommend[by]
+                )
+                recommend = (
+                    _driver_plan_string_array(recommend_pick)
+                    if recommend_pick is not None
+                    else "null"
+                )
+                group_tokens.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"recommend":' + recommend
+                    + ',"stability":' + _format6(stability)
+                    + ',"switch":' + ("true" if switched else "false")
+                    + ',"items":[' + ",".join(item_tokens) + "]}"
+                )
+                previous_recommend[by] = recommend_pick
+
+            point_tokens.append(
+                '{"limit":' + _format6(limit_value)
+                + ',"groups":[' + ",".join(group_tokens) + "]}"
+            )
+
+    return '{"points":[' + ",".join(point_tokens) + "]}\n"
 
 
 _TEMPORAL_LAG_MAX_N = 8
