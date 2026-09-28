@@ -100,6 +100,7 @@ __all__ = [
     "driver_attr_stability",
     "driver_attr_stability_summary",
     "driver_link",
+    "driver_plan",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -19003,6 +19004,292 @@ def driver_link(s: str, i: str, links: dict) -> str:
         '{"alpha":' + _format6(alpha_s)
         + ',"groups":[' + ",".join(group_tokens) + "]}\n"
     )
+
+
+_DRIVER_PLAN_REPORT_ERROR = "report must be a driver_link JSON output"
+
+
+def _driver_plan_report_parse(
+    raw: object,
+) -> list[tuple[str, dict[str, tuple[str, Decimal, Decimal, Decimal,
+                                      Decimal, Decimal, bool]]]]:
+    """Parse one canonical :func:`driver_link` output.
+
+    Returns a list of ``(by, items)`` pairs in report order; ``items``
+    maps each factor to ``(metric, effect, low, high, q, score,
+    eligible)``. The input must be byte-for-byte identical to a
+    canonical output (key order, escaping, group and item order and the
+    six-decimal number tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_DRIVER_PLAN_REPORT_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+
+    groups: list[tuple[str, dict]] = []
+    group_tokens: list[str] = []
+    previous_by: int | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"by", "items"}:
+            raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+        by = group["by"]
+        raw_items = group["items"]
+        if by not in _KIND_IMPACT_BYS or not isinstance(raw_items, list):
+            raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+        by_order = 0 if by == "region" else 1
+        if previous_by is not None and by_order <= previous_by:
+            raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+        previous_by = by_order
+        if len(raw_items) != len(_DRIVER_ATTR_FACTORS):
+            raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+
+        items: dict[str, tuple] = {}
+        item_tokens: list[str] = []
+        for rank, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict) or set(item) != {
+                "factor", "metric", "effect", "low", "high", "q",
+                "score", "eligible", "rank",
+            }:
+                raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+            factor = item["factor"]
+            metric = item["metric"]
+            effect = item["effect"]
+            low = item["low"]
+            high = item["high"]
+            q_value = item["q"]
+            score = item["score"]
+            eligible = item["eligible"]
+            item_rank = item["rank"]
+            if (
+                factor not in _DRIVER_ATTR_FACTORS
+                or factor in items
+                or metric not in _KIND_IMPACT_METRICS
+            ):
+                raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+            for number in (effect, low, high, q_value, score):
+                if not isinstance(number, _RankTrajectoryNumber):
+                    raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+            if not isinstance(eligible, bool):
+                raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+            if (
+                isinstance(item_rank, bool)
+                or not isinstance(item_rank, int)
+                or item_rank != rank
+            ):
+                raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+            items[factor] = (
+                metric, effect, low, high, q_value, score, eligible
+            )
+            item_tokens.append(
+                '{"factor":' + json.dumps(factor, ensure_ascii=False)
+                + ',"metric":' + json.dumps(metric, ensure_ascii=False)
+                + ',"effect":' + _format6(effect)
+                + ',"low":' + _format6(low)
+                + ',"high":' + _format6(high)
+                + ',"q":' + _format6(q_value)
+                + ',"score":' + _format6(score)
+                + ',"eligible":' + ("true" if eligible else "false")
+                + ',"rank":' + str(item_rank)
+                + "}"
+            )
+        groups.append((by, items))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_DRIVER_PLAN_REPORT_ERROR)
+
+    return groups
+
+
+def driver_plan(report: str, actions: dict, limit: float) -> str:
+    """Plan a per-dimension intervention portfolio from a
+    :func:`driver_link` report under a cost limit.
+
+    ``report`` must be a byte-for-byte canonical :func:`driver_link`
+    JSON output. ``actions`` is a dict whose keys are exactly ``green``,
+    ``roof`` and ``material``; each value is a ``(factor, cost)`` tuple
+    with ``factor`` one of ``station``, ``lst``, ``morph`` or ``cover``
+    (the three factors must be distinct) and ``cost`` a positive finite
+    non-boolean int/float. ``limit`` is a non-negative finite
+    non-boolean int/float. A non-string ``report`` or a non-dict
+    ``actions`` raises ``TypeError``; every other violation raises
+    ``ValueError``.
+
+    Within each reported ``by`` group only the kinds whose linked factor
+    item is ``eligible`` take part. Every subset of those kinds whose
+    total cost does not exceed ``limit`` is enumerated (the empty
+    subset is always feasible) and the subsets rank by descending
+    ``sum(score / cost)``, then ascending total cost, then ascending
+    lexicographic order of the sorted kind list. The chosen subset's
+    item ``effect`` values accumulate per linked metric into ``uhi``,
+    ``energy`` and ``vent`` and the item ``low``/``high`` values
+    accumulate into the ``range`` interval; empty sums are zero.
+
+    Numbers enter as ``Decimal(str(x))`` and all sums, ratios and
+    comparisons run under a precision-1000, ROUND_HALF_EVEN local
+    context on the unquantized values. Returns a compact UTF-8 JSON
+    string with no spaces and exactly one trailing newline; the
+    top-level key is ``groups``, each group uses
+    ``by, cost, priority, pick, effects, range``, ``effects`` uses
+    ``uhi, energy, vent`` and ``range`` uses ``low, high``. Groups keep
+    region before window and ``pick`` renders as an ascending JSON
+    string array. Every number renders with exactly six decimals,
+    negative zero normalized to ``0.000000``. A report without groups
+    yields ``groups`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(actions, dict):
+        raise TypeError("actions must be a dict")
+    groups = _driver_plan_report_parse(report)
+
+    if set(actions) != set(_INTERVENTION_KINDS):
+        raise ValueError(
+            "actions keys must be exactly green, roof and material"
+        )
+    kind_factor: dict[str, str] = {}
+    kind_cost: dict[str, Decimal] = {}
+    factors_seen: set[str] = set()
+    for kind in _INTERVENTION_KINDS:
+        value = actions[kind]
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise ValueError("actions values must be (factor, cost) tuples")
+        factor, cost = value
+        if factor not in _DRIVER_ATTR_FACTORS:
+            raise ValueError(
+                "actions factors must be station, lst, morph or cover"
+            )
+        if factor in factors_seen:
+            raise ValueError("actions factors must be distinct")
+        factors_seen.add(factor)
+        cost_value = _validate_finite_number(cost, "cost")
+        if cost_value <= 0:
+            raise ValueError("actions costs must be positive")
+        kind_factor[kind] = factor
+        kind_cost[kind] = cost_value
+
+    budget = _validate_finite_number(limit, "limit")
+    if budget < 0:
+        raise ValueError("limit must be non-negative")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        group_tokens: list[str] = []
+        for by, items in groups:
+            candidates = [
+                kind
+                for kind in _INTERVENTION_KINDS
+                if items[kind_factor[kind]][6]
+            ]
+
+            best_kinds: tuple[str, ...] = ()
+            best_cost = Decimal(0)
+            best_priority = Decimal(0)
+            for mask in range(1 << len(candidates)):
+                total_cost = Decimal(0)
+                total_priority = Decimal(0)
+                chosen: list[str] = []
+                for index, kind in enumerate(candidates):
+                    if (mask >> index) & 1:
+                        score = items[kind_factor[kind]][5]
+                        total_cost += kind_cost[kind]
+                        total_priority += score / kind_cost[kind]
+                        chosen.append(kind)
+                if total_cost > budget:
+                    continue
+                chosen.sort()
+                if (
+                    -total_priority,
+                    total_cost,
+                    chosen,
+                ) < (
+                    -best_priority,
+                    best_cost,
+                    list(best_kinds),
+                ):
+                    best_kinds = tuple(chosen)
+                    best_cost = total_cost
+                    best_priority = total_priority
+
+            effects = {
+                metric: Decimal(0) for metric in _KIND_IMPACT_METRICS
+            }
+            low_total = Decimal(0)
+            high_total = Decimal(0)
+            for kind in best_kinds:
+                metric, effect, low, high, _q, _score, _eligible = items[
+                    kind_factor[kind]
+                ]
+                effects[metric] += effect
+                low_total += low
+                high_total += high
+
+            pick_token = "[" + ",".join(
+                json.dumps(kind, ensure_ascii=False) for kind in best_kinds
+            ) + "]"
+            effects_token = "{" + ",".join(
+                json.dumps(metric, ensure_ascii=False)
+                + ":" + _format6(effects[metric])
+                for metric in _KIND_IMPACT_METRICS
+            ) + "}"
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"cost":' + _format6(best_cost)
+                + ',"priority":' + _format6(best_priority)
+                + ',"pick":' + pick_token
+                + ',"effects":' + effects_token
+                + ',"range":{"low":' + _format6(low_total)
+                + ',"high":' + _format6(high_total) + "}"
+                + "}"
+            )
+
+        return '{"groups":[' + ",".join(group_tokens) + "]}\n"
 
 
 _TEMPORAL_LAG_MAX_N = 8
