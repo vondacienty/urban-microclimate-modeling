@@ -21432,6 +21432,358 @@ def pareto_region_compare(rows: list, *, alpha: float = 0.05) -> str:
     )
 
 
+_PARETO_REGION_STABILITY_ERROR = (
+    "report must be a pareto_region_compare JSON output"
+)
+
+# Region stability aggregates 2..16 time-period reports; fewer than two
+# periods give no stability signal and more than sixteen is a contract error.
+_PARETO_REGION_STABILITY_MIN_REPORTS = 2
+_PARETO_REGION_STABILITY_MAX_REPORTS = 16
+
+
+def _pareto_region_compare_output_parse(raw: object) -> tuple[
+    Decimal,
+    dict[
+        tuple[str, ...],
+        dict[tuple[str, str, int], tuple[Decimal, bool, int]],
+    ],
+]:
+    """Parse one canonical :func:`pareto_region_compare` JSON output.
+
+    Returns ``(alpha, groups)`` mapping each pick to its tests keyed by
+    ``(a, b, metric_index)`` with ``(diff, reject, rank)``. The input
+    must be byte-for-byte identical to a canonical output (key order,
+    escaping, group and test order and the six-decimal number tokens
+    included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_PARETO_REGION_STABILITY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+
+    groups: dict[
+        tuple[str, ...],
+        dict[tuple[str, str, int], tuple[Decimal, bool, int]],
+    ] = {}
+    group_tokens: list[str] = []
+    previous_pick: tuple[str, ...] | None = None
+    for raw_group in raw_groups:
+        if not isinstance(raw_group, dict) or set(raw_group) != {
+            "pick", "tests"
+        }:
+            raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+        raw_pick = raw_group["pick"]
+        raw_tests = raw_group["tests"]
+        pick = _rank_pick(raw_pick, _PARETO_REGION_STABILITY_ERROR)
+        if not isinstance(raw_tests, list):
+            raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+        if previous_pick is not None and pick <= previous_pick:
+            raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+        previous_pick = pick
+
+        test_records: dict[
+            tuple[str, str, int], tuple[Decimal, bool, int]
+        ] = {}
+        test_tokens: list[str] = []
+        previous_metric: int | None = None
+        block_rank = 0
+        for test in raw_tests:
+            if not isinstance(test, dict) or set(test) != {
+                "a", "b", "metric", "n_a", "n_b", "diff", "p", "q",
+                "reject", "rank",
+            }:
+                raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            a = test["a"]
+            b = test["b"]
+            metric = test["metric"]
+            n_a = test["n_a"]
+            n_b = test["n_b"]
+            diff = test["diff"]
+            p_value = test["p"]
+            q_value = test["q"]
+            reject = test["reject"]
+            rank = test["rank"]
+            if not isinstance(a, str) or not isinstance(b, str) or a >= b:
+                raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            if metric not in _PARETO_ATTR_METRICS:
+                raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            metric_index = _PARETO_ATTR_METRICS.index(metric)
+            for n_value in (n_a, n_b):
+                if (
+                    isinstance(n_value, bool)
+                    or not isinstance(n_value, int)
+                    or n_value < 1
+                ):
+                    raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            for number in (diff, p_value, q_value):
+                if not isinstance(number, _RankTrajectoryNumber):
+                    raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            if not isinstance(reject, bool):
+                raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            if (
+                isinstance(rank, bool)
+                or not isinstance(rank, int)
+                or rank < 1
+            ):
+                raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            # Tests sort by metric order then ascending rank; ranks restart
+            # at one within every (pick, metric) block and stay consecutive.
+            if (
+                previous_metric is not None
+                and metric_index < previous_metric
+            ):
+                raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            if metric_index != previous_metric:
+                block_rank = 0
+            if rank != block_rank + 1:
+                raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            block_rank = rank
+            previous_metric = metric_index
+            identity = (a, b, metric_index)
+            if identity in test_records:
+                raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+            test_records[identity] = (diff, reject, rank)
+            test_tokens.append(
+                '{"a":' + json.dumps(a, ensure_ascii=False)
+                + ',"b":' + json.dumps(b, ensure_ascii=False)
+                + ',"metric":' + json.dumps(metric, ensure_ascii=False)
+                + ',"n_a":' + str(n_a)
+                + ',"n_b":' + str(n_b)
+                + ',"diff":' + _format6(diff)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if reject else "false")
+                + ',"rank":' + str(rank)
+                + "}"
+            )
+        groups[pick] = test_records
+        group_tokens.append(
+            '{"pick":' + _driver_plan_string_array(pick)
+            + ',"tests":[' + ",".join(test_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_PARETO_REGION_STABILITY_ERROR)
+
+    return alpha, groups
+
+
+def pareto_region_stability(reports: dict) -> str:
+    """Aggregate repeated :func:`pareto_region_compare` reports across
+    time periods into per-pick, per-pair test stability statistics.
+
+    ``reports`` is a dict of 2 to 16 entries; every key must be a
+    non-empty string naming a time period and every value a
+    byte-for-byte canonical :func:`pareto_region_compare` JSON output.
+    All reports must share one ``alpha`` and one set of test identities
+    ``(a, b, metric)`` -- every ``(pick, a, b, metric)`` test must appear
+    in every report, with regions and picks taken verbatim. A non-dict
+    ``reports`` raises ``TypeError``; every other violation raises
+    ``ValueError``. Reports without tests are legal and yield
+    ``"groups": []``.
+
+    With ``N`` the number of periods, each identity's ``mean`` is the
+    mean of its per-period ``diff`` values. ``direction`` is ``down``,
+    ``up`` or ``flat`` according as ``mean`` is negative, positive or
+    zero. ``consistency`` is the share of periods whose ``diff`` points
+    the same way (negative when ``mean`` is negative, positive when
+    positive; when ``mean`` is zero it is the share whose ``diff`` is
+    zero) and ``significant`` is the share whose test rejects.
+
+    Within each ``(pick, metric)`` the tests are ranked by descending
+    ``significant``, then descending ``consistency``, then descending
+    ``abs(mean)``, then ascending ``a`` and ``b``, with ranks starting
+    at one.
+
+    Numbers enter as ``Decimal(str(x))`` and the mean, consistency and
+    significance ratios run under a precision-1000, ROUND_HALF_EVEN
+    local context, compared throughout on their original values.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups``, each
+    group uses ``pick, items`` and each item uses
+    ``a, b, mean, direction, consistency, significant, rank``. Groups
+    sort by ascending ``pick`` and items by rank within
+    ``uhi``/``energy``/``vent`` metric blocks; ``pick`` renders as an
+    ascending string array, ``rank`` as a JSON integer while every
+    other number renders with six decimals, negative zero normalized to
+    ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not (
+        _PARETO_REGION_STABILITY_MIN_REPORTS
+        <= len(reports)
+        <= _PARETO_REGION_STABILITY_MAX_REPORTS
+    ):
+        raise ValueError(
+            "reports must hold between "
+            f"{_PARETO_REGION_STABILITY_MIN_REPORTS} and "
+            f"{_PARETO_REGION_STABILITY_MAX_REPORTS} entries"
+        )
+    for key in reports:
+        if not isinstance(key, str) or not key:
+            raise ValueError("reports keys must be non-empty strings")
+
+    parsed_reports: list[
+        dict[
+            tuple[str, ...],
+            dict[tuple[str, str, int], tuple[Decimal, bool, int]],
+        ]
+    ] = []
+    alpha: Decimal | None = None
+    identities_by_pick: dict[
+        tuple[str, ...], set[tuple[str, str, int]]
+    ] = {}
+    for raw in reports.values():
+        report_alpha, groups = _pareto_region_compare_output_parse(raw)
+        if alpha is None:
+            alpha = report_alpha
+        elif report_alpha != alpha:
+            raise ValueError("all reports must share one alpha")
+        for pick, tests in groups.items():
+            identities = set(tests)
+            if pick in identities_by_pick:
+                if identities != identities_by_pick[pick]:
+                    raise ValueError(
+                        "all reports must share the same "
+                        "(pick, a, b, metric) test identities"
+                    )
+            else:
+                identities_by_pick[pick] = identities
+        for pick in identities_by_pick:
+            if pick not in groups:
+                raise ValueError(
+                    "all reports must share the same "
+                    "(pick, a, b, metric) test identities"
+                )
+        parsed_reports.append(groups)
+    assert alpha is not None
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        period_count = Decimal(len(parsed_reports))
+        group_tokens: list[str] = []
+        for pick in sorted(identities_by_pick):
+            item_tokens: list[str] = []
+            for metric_index, metric_name in enumerate(_PARETO_ATTR_METRICS):
+                metric_identities = sorted(
+                    identity
+                    for identity in identities_by_pick[pick]
+                    if identity[2] == metric_index
+                )
+                stats: list[
+                    tuple[str, str, Decimal, str, Decimal, Decimal]
+                ] = []
+                for identity in metric_identities:
+                    a, b, _metric_index = identity
+                    diffs = [
+                        groups[pick][identity][0]
+                        for groups in parsed_reports
+                    ]
+                    rejects = [
+                        groups[pick][identity][1]
+                        for groups in parsed_reports
+                    ]
+                    total = Decimal(0)
+                    for diff in diffs:
+                        total += diff
+                    mean = total / period_count
+                    if mean < 0:
+                        direction = "down"
+                        same = sum(1 for diff in diffs if diff < 0)
+                    elif mean > 0:
+                        direction = "up"
+                        same = sum(1 for diff in diffs if diff > 0)
+                    else:
+                        direction = "flat"
+                        same = sum(1 for diff in diffs if diff == 0)
+                    consistency = Decimal(same) / period_count
+                    significant = Decimal(
+                        sum(1 for reject in rejects if reject)
+                    ) / period_count
+                    stats.append(
+                        (a, b, mean, direction, consistency, significant)
+                    )
+                # Descending significant, consistency, abs(mean), then
+                # ascending a and b.
+                ordered = sorted(
+                    stats,
+                    key=lambda item: (
+                        -item[5],
+                        -item[4],
+                        -abs(item[2]),
+                        item[0],
+                        item[1],
+                    ),
+                )
+                for rank, (
+                    a, b, mean, direction, consistency, significant
+                ) in enumerate(ordered, start=1):
+                    item_tokens.append(
+                        '{"a":' + json.dumps(a, ensure_ascii=False)
+                        + ',"b":' + json.dumps(b, ensure_ascii=False)
+                        + ',"mean":' + _format6(mean)
+                        + ',"direction":'
+                        + json.dumps(direction, ensure_ascii=False)
+                        + ',"consistency":' + _format6(consistency)
+                        + ',"significant":' + _format6(significant)
+                        + ',"rank":' + str(rank)
+                        + "}"
+                    )
+            group_tokens.append(
+                '{"pick":' + _driver_plan_string_array(pick)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
 def effect_matrix_temporal_lag_report(
     rows: list,
     *,
