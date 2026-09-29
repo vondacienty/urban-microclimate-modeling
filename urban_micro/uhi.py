@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections.abc import Mapping
-from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
+from decimal import (
+    ROUND_CEILING,
+    ROUND_FLOOR,
+    ROUND_HALF_EVEN,
+    Decimal,
+    localcontext,
+)
 from fractions import Fraction
 from itertools import combinations, permutations
 import json
@@ -19190,13 +19196,24 @@ def _driver_plan_validate_actions(
     return kind_factor, kind_cost
 
 
+def _driver_plan_number(value) -> Decimal:
+    """Return ``Decimal(str(value))`` semantics without going through
+    ``str(int)``: an int (already type-checked non-boolean) builds the
+    Decimal directly so arbitrarily large ints never hit the integer
+    string conversion limit and never round-trip through a float; a float
+    uses ``str`` so the shortest round-trip representation is kept."""
+    if isinstance(value, int):
+        return Decimal(value)
+    return Decimal(str(value))
+
+
 def _driver_plan_validate_limit(limit) -> Decimal:
     """Validate one budget limit and return ``Decimal(str(limit))``."""
     if isinstance(limit, bool) or not isinstance(limit, (int, float)):
         raise ValueError("limit must be a finite int or float")
     if isinstance(limit, float) and not math.isfinite(limit):
         raise ValueError("limit must be finite")
-    limit_value = Decimal(str(limit))
+    limit_value = _driver_plan_number(limit)
     if limit_value < 0:
         raise ValueError("limit must be non-negative")
     return limit_value
@@ -19901,7 +19918,7 @@ def driver_plan_pareto(frontier: str, weights: dict, limit) -> str:
             raise ValueError("weight values must be finite int or float")
         if isinstance(weight, float) and not math.isfinite(weight):
             raise ValueError("weight values must be finite")
-        weight_value = Decimal(str(weight))
+        weight_value = _driver_plan_number(weight)
         if weight_value <= 0:
             raise ValueError("weight values must be positive")
         weight_values[metric] = weight_value
@@ -19951,6 +19968,104 @@ def driver_plan_pareto(frontier: str, weights: dict, limit) -> str:
     )
 
 
+def _pareto_prepare(
+    frontier: str,
+    weights: dict,
+    limits: list,
+    *,
+    max_sets: int | None,
+) -> tuple[
+    list,
+    list[tuple[str, dict[str, Decimal]]],
+    list[Decimal],
+]:
+    """Validate and parse the shared arguments of :func:`pareto_stability`
+    and :func:`pareto_bootstrap`.
+
+    The ``frontier``, ``weights`` and ``limits`` contract is identical to
+    :func:`pareto_stability`; ``max_sets`` optionally caps the number of
+    weight sets (the bootstrap requires 2..8). Returns the parsed frontier
+    points, the ordered ``(name, weight_values)`` sets and the ascending
+    distinct limit values.
+    """
+    if not isinstance(frontier, str):
+        raise TypeError("frontier must be a str")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(limits, list):
+        raise TypeError("limits must be a list")
+    if len(weights) < 2:
+        raise ValueError("weights must hold at least two entries")
+    if max_sets is not None and len(weights) > max_sets:
+        raise ValueError(f"weights must hold at most {max_sets} entries")
+
+    weight_sets: list[tuple[str, dict[str, Decimal]]] = []
+    for name, raw_weights in weights.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("weights keys must be non-empty strings")
+        if not isinstance(raw_weights, dict):
+            raise TypeError("each weights value must be a dict")
+        if set(raw_weights) != set(_KIND_IMPACT_METRICS):
+            raise ValueError(
+                "each weights dict must be keyed exactly uhi, energy and vent"
+            )
+        weight_values: dict[str, Decimal] = {}
+        for metric in _KIND_IMPACT_METRICS:
+            weight = raw_weights[metric]
+            if isinstance(weight, bool) or not isinstance(
+                weight, (int, float)
+            ):
+                raise ValueError("weight values must be finite int or float")
+            if isinstance(weight, float) and not math.isfinite(weight):
+                raise ValueError("weight values must be finite")
+            weight_value = _driver_plan_number(weight)
+            if weight_value <= 0:
+                raise ValueError("weight values must be positive")
+            weight_values[metric] = weight_value
+        weight_sets.append((name, weight_values))
+
+    if not limits:
+        raise ValueError("limits must be non-empty")
+    limit_values: list[Decimal] = []
+    seen_limits: set[Decimal] = set()
+    for limit in limits:
+        limit_value = _driver_plan_validate_limit(limit)
+        if limit_value in seen_limits:
+            raise ValueError("limits must be pairwise distinct")
+        seen_limits.add(limit_value)
+        limit_values.append(limit_value)
+    limit_values.sort()
+
+    points = _driver_plan_pareto_parse(frontier)
+    return points, weight_sets, limit_values
+
+
+def _pareto_limit_recommendations(
+    points: list,
+    weight_sets: list[tuple[str, dict[str, Decimal]]],
+    limit_value: Decimal,
+) -> dict[str, list[tuple[str, ...] | None]]:
+    """Run every weight set's Pareto selection at ``limit_value`` and return
+    ``by -> [pick | None]`` in weight-set order (``None`` is a null
+    recommendation). The caller owns the Decimal context."""
+    runs = {
+        name: _driver_plan_pareto_results(points, weight_values, limit_value)
+        for name, weight_values in weight_sets
+    }
+    bys = [
+        by
+        for by in _KIND_IMPACT_BYS
+        if any(by in run for run in runs.values())
+    ]
+    return {
+        by: [
+            runs[name][by][0] if by in runs[name] else None
+            for name, _weight_values in weight_sets
+        ]
+        for by in bys
+    }
+
+
 def pareto_stability(frontier: str, weights: dict, limits: list) -> str:
     """Aggregate :func:`driver_plan_pareto` recommendations across weight
     sets and budget limits into selection stability statistics.
@@ -19993,53 +20108,9 @@ def pareto_stability(frontier: str, weights: dict, limits: list) -> str:
     six decimals, negative zero normalized to ``0.000000``, and ``switch``
     is a JSON boolean.
     """
-    if not isinstance(frontier, str):
-        raise TypeError("frontier must be a str")
-    if not isinstance(weights, dict):
-        raise TypeError("weights must be a dict")
-    if not isinstance(limits, list):
-        raise TypeError("limits must be a list")
-    if len(weights) < 2:
-        raise ValueError("weights must hold at least two entries")
-
-    weight_sets: list[tuple[str, dict[str, Decimal]]] = []
-    for name, raw_weights in weights.items():
-        if not isinstance(name, str) or not name:
-            raise ValueError("weights keys must be non-empty strings")
-        if not isinstance(raw_weights, dict):
-            raise TypeError("each weights value must be a dict")
-        if set(raw_weights) != set(_KIND_IMPACT_METRICS):
-            raise ValueError(
-                "each weights dict must be keyed exactly uhi, energy and vent"
-            )
-        weight_values: dict[str, Decimal] = {}
-        for metric in _KIND_IMPACT_METRICS:
-            weight = raw_weights[metric]
-            if isinstance(weight, bool) or not isinstance(
-                weight, (int, float)
-            ):
-                raise ValueError("weight values must be finite int or float")
-            if isinstance(weight, float) and not math.isfinite(weight):
-                raise ValueError("weight values must be finite")
-            weight_value = Decimal(str(weight))
-            if weight_value <= 0:
-                raise ValueError("weight values must be positive")
-            weight_values[metric] = weight_value
-        weight_sets.append((name, weight_values))
-
-    if not limits:
-        raise ValueError("limits must be non-empty")
-    limit_values: list[Decimal] = []
-    seen_limits: set[Decimal] = set()
-    for limit in limits:
-        limit_value = _driver_plan_validate_limit(limit)
-        if limit_value in seen_limits:
-            raise ValueError("limits must be pairwise distinct")
-        seen_limits.add(limit_value)
-        limit_values.append(limit_value)
-    limit_values.sort()
-
-    points = _driver_plan_pareto_parse(frontier)
+    points, weight_sets, limit_values = _pareto_prepare(
+        frontier, weights, limits, max_sets=None
+    )
 
     with localcontext() as ctx:
         ctx.prec = _MODEL_PRECISION
@@ -20126,6 +20197,161 @@ def pareto_stability(frontier: str, weights: dict, limits: list) -> str:
             )
 
     return '{"points":[' + ",".join(point_tokens) + "]}\n"
+
+
+_PARETO_BOOTSTRAP_MAX_SETS = 8
+
+
+def _pareto_bootstrap_interval(
+    n: int, r: int, alpha: Decimal
+) -> tuple[Decimal, Decimal]:
+    """Percentile bootstrap interval for the winner-vote proportion.
+
+    The ``n ** n`` with-replacement resamples are enumerated implicitly:
+    each resampled weight set independently lands on one of the ``r``
+    winner votes, so the winner count ``K`` is ``Binomial(n, r/n)`` and
+    vote count ``k`` occurs ``C(n,k) r**k (n-r)**(n-k)`` times among the
+    ``n**n`` sequences -- the same sorted proportions and order statistics
+    as the explicit enumeration, in O(n) work. The lower statistic is the
+    value at index ``floor((N-1)*alpha)`` and the upper at
+    ``ceil((N-1)*(1-alpha))``; the caller owns the Decimal context.
+    """
+    total = n ** n
+    span = Decimal(total - 1)
+    lower_index = (span * alpha).to_integral_value(rounding=ROUND_FLOOR)
+    upper_index = (
+        span * (Decimal(1) - alpha)
+    ).to_integral_value(rounding=ROUND_CEILING)
+    cumulative = 0
+    lower_k: int | None = None
+    upper_k: int | None = None
+    for k in range(n + 1):
+        cumulative += math.comb(n, k) * r ** k * (n - r) ** (n - k)
+        count = Decimal(cumulative)
+        if lower_k is None and count > lower_index:
+            lower_k = k
+        if upper_k is None and count > upper_index:
+            upper_k = k
+    return Decimal(lower_k) / Decimal(n), Decimal(upper_k) / Decimal(n)
+
+
+def _pareto_bootstrap_p(n: int, r: int) -> Decimal:
+    """Two-sided exact p-value ``min(1, 2*sum_{k<=min(r,n-r)} C(n,k)/2**n)``."""
+    tail = sum(math.comb(n, k) for k in range(min(r, n - r) + 1))
+    return min(Decimal(1), Decimal(2 * tail) / Decimal(2 ** n))
+
+
+def pareto_bootstrap(
+    frontier: str,
+    weights: dict,
+    limits: list,
+    *,
+    confidence: float = 0.95,
+) -> str:
+    """Bootstrap the :func:`pareto_stability` winner at every limit and
+    ``by`` by enumerating all with-replacement weight-set resamples.
+
+    The ``frontier``, ``weights`` and ``limits`` contract -- including the
+    ``TypeError``/``ValueError`` split -- is inherited from
+    :func:`pareto_stability`, except ``weights`` must hold between 2 and 8
+    sets inclusive. ``confidence`` is a finite non-boolean int/float with
+    ``0 < confidence < 1``; any other value raises ``ValueError``.
+
+    For each limit and ``by`` each weight set contributes one Pareto
+    recommendation (``null`` when nothing is admissible). The non-null pick
+    occurring most often is the ``pick``, ties resolved by ascending
+    lexicographic pick; with ``n`` the number of weight sets and ``r`` the
+    winner's vote count. When every recommendation is null, ``pick`` is
+    ``null`` and ``lower``, ``upper`` and ``p`` are all 1. Otherwise all
+    ``n**n`` sequences of with-replacement weight-set indices are
+    enumerated and the winner-vote proportions sorted: with
+    ``N = n**n`` and ``a = (1-confidence)/2`` the interval endpoints are
+    the proportions at indices ``floor((N-1)*a)`` and
+    ``ceil((N-1)*(1-a))``, while
+    ``p = min(1, 2*sum_{k=0..min(r,n-r)} C(n,k)/2**n)``.
+
+    Numbers enter as ``Decimal(str(x))`` and the arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``confidence, points``, each point uses
+    ``limit, groups`` and each group uses
+    ``by, pick, n, lower, upper, p``. Points follow ascending limits,
+    groups order region before window, ``pick`` is an ascending string
+    array (or ``null``), ``n`` is an integer and ``confidence``,
+    ``lower``, ``upper`` and ``p`` render with six decimals, negative zero
+    normalized to ``0.000000``.
+    """
+    points, weight_sets, limit_values = _pareto_prepare(
+        frontier, weights, limits, max_sets=_PARETO_BOOTSTRAP_MAX_SETS
+    )
+
+    if isinstance(confidence, bool) or not isinstance(
+        confidence, (int, float)
+    ):
+        raise ValueError("confidence must be a finite int or float")
+    if isinstance(confidence, float) and not math.isfinite(confidence):
+        raise ValueError("confidence must be finite")
+    confidence_value = _driver_plan_number(confidence)
+    if not (Decimal(0) < confidence_value < Decimal(1)):
+        raise ValueError("confidence must satisfy 0 < confidence < 1")
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        n = len(weight_sets)
+        alpha = (Decimal(1) - confidence_value) / Decimal(2)
+        point_tokens: list[str] = []
+        for limit_value in limit_values:
+            recommendations = _pareto_limit_recommendations(
+                points, weight_sets, limit_value
+            )
+
+            group_tokens: list[str] = []
+            for by in _KIND_IMPACT_BYS:
+                if by not in recommendations:
+                    continue
+                picks = recommendations[by]
+                counts: dict[tuple[str, ...], int] = {}
+                for recommend_pick in picks:
+                    if recommend_pick is None:
+                        continue
+                    counts[recommend_pick] = (
+                        counts.get(recommend_pick, 0) + 1
+                    )
+
+                if not counts:
+                    pick_token = "null"
+                    lower = upper = p_value = Decimal(1)
+                else:
+                    winner = min(
+                        counts,
+                        key=lambda pick: (-counts[pick], pick),
+                    )
+                    pick_token = _driver_plan_string_array(winner)
+                    r = counts[winner]
+                    lower, upper = _pareto_bootstrap_interval(n, r, alpha)
+                    p_value = _pareto_bootstrap_p(n, r)
+
+                group_tokens.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"pick":' + pick_token
+                    + ',"n":' + str(n)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + ',"p":' + _format6(p_value)
+                    + "}"
+                )
+
+            point_tokens.append(
+                '{"limit":' + _format6(limit_value)
+                + ',"groups":[' + ",".join(group_tokens) + "]}"
+            )
+
+    return (
+        '{"confidence":' + _format6(confidence_value)
+        + ',"points":[' + ",".join(point_tokens) + "]}\n"
+    )
 
 
 _TEMPORAL_LAG_MAX_N = 8
