@@ -108,6 +108,7 @@ __all__ = [
     "driver_link",
     "driver_plan",
     "pareto_attr",
+    "pareto_attr_stability",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -20568,6 +20569,213 @@ def pareto_attr(rows: list, *, alpha: float = 0.05) -> str:
                 + ',"window":' + json.dumps(w, ensure_ascii=False)
                 + ',"pick":' + _driver_plan_string_array(p)
                 + ',"n":' + str(n)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+def pareto_attr_stability(rows: list, *, alpha: float = 0.05) -> str:
+    """Cross-window sign-flip attribution stability for Pareto-pick levels.
+
+    ``rows`` follows the exact same contract as :func:`pareto_attr`: a list
+    of strict ``(r, w, t, p, u, e, v)`` seven-tuples, unique
+    ``(r, w, t, p)`` tuples, at most 16 rows sharing one
+    ``(r, w, p)`` key, ``alpha`` a finite non-boolean number with
+    ``0 < alpha <= 1``; ``rows`` not being a list raises ``TypeError`` and
+    every other contract violation raises ``ValueError``.
+
+    The three metrics are first averaged within every ``(r, w, p)`` group,
+    producing one window mean per distinct ``w``. Those means are then
+    grouped by ``(r, p)``: with ``x`` the per-window means, ``n`` their
+    count (the number of distinct windows for that ``(r, p)``), ``n > 16``
+    raises ``ValueError``, and ``mean`` and the exact two-sided sign-flip
+    ``p`` reuse the same definitions as :func:`pareto_attr`. ``direction``
+    is ``"down"``/``"up"``/``"flat"`` according as ``mean`` is negative,
+    positive or zero. ``consistency`` is the share of windows whose ``x``
+    has the same sign as ``mean``; when ``mean`` is zero it is the share of
+    windows with ``x == 0``. For ``n == 1`` ``se`` is zero; otherwise
+    ``se = sqrt(sum((x - mean) ** 2) / (n * (n - 1)))`` and
+    ``lower``/``upper`` are ``mean +/- 1.96 * se``.
+
+    All ``3 * number_of_groups`` tests share one global
+    Benjamini-Hochberg pass, exactly as in :func:`pareto_attr`: they rank
+    ascending by ``(p, r, p, metric order)`` and rank ``j`` (1-based) gets
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha`` compared on the unquantized values.
+
+    Numbers enter as ``Decimal(str(x))`` and arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
+    UTF-8 JSON string with no spaces and exactly one trailing newline;
+    the top-level key order is ``alpha, groups``, each group uses
+    ``region, pick, items`` and each item uses
+    ``metric, n, direction, mean, consistency, se, lower, upper, p, q,
+    reject``. Groups sort by ascending ``r``/``p`` and items by
+    ``uhi``, ``energy``, ``vent``; ``pick`` is a string array, ``n`` a JSON
+    integer and ``reject`` a JSON boolean, while ``alpha``, ``mean``,
+    ``consistency``, ``se``, ``lower``, ``upper``, ``p`` and ``q`` render
+    with six decimals, negative zero normalized to ``0.000000``. An empty
+    ``rows`` list yields ``"groups": []``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    # First pass: validate rows and collect the raw metrics within every
+    # (r, w, p) window group.
+    window_rows: dict[
+        tuple[str, str, tuple[str, ...]],
+        list[tuple[Decimal, Decimal, Decimal]],
+    ] = {}
+    seen: set[tuple[object, ...]] = set()
+    for row in rows:
+        r, w, t, p, u_value, e_value, v_value = _pareto_attr_validate_row(row)
+        unique_key = (r, w, t, p)
+        if unique_key in seen:
+            raise ValueError(f"duplicate (r, w, t, p) tuple: {unique_key!r}")
+        seen.add(unique_key)
+        window_rows.setdefault((r, w, p), []).append(
+            (u_value, e_value, v_value)
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # Average within each (r, w, p) window, then collect one window mean
+        # per distinct w under the (r, p) stability key.
+        stability_windows: dict[
+            tuple[str, tuple[str, ...]],
+            list[tuple[Decimal, Decimal, Decimal]],
+        ] = {}
+        for (r, w, p), members in window_rows.items():
+            window_n = len(members)
+            if window_n > _PERMUTATION_MAX_N:
+                raise ValueError(
+                    f"group {(r, w, p)!r} has {window_n} rows; pareto_attr "
+                    f"requires at most {_PERMUTATION_MAX_N} rows per group"
+                )
+            window_means: list[Decimal] = []
+            for metric_index in range(3):
+                total = Decimal(0)
+                for member in members:
+                    total += member[metric_index]
+                window_means.append(total / window_n)
+            stability_windows.setdefault((r, p), []).append(
+                (window_means[0], window_means[1], window_means[2])
+            )
+
+        # group key -> (n, [(direction, mean, consistency, se, lower, upper,
+        # p) per metric in uhi/energy/vent order])
+        stats: dict[
+            tuple[str, tuple[str, ...]],
+            tuple[
+                int,
+                list[tuple[str, Decimal, Decimal, Decimal, Decimal,
+                            Decimal, Decimal]],
+            ],
+        ] = {}
+        for key, windows in stability_windows.items():
+            n = len(windows)
+            if n > _PERMUTATION_MAX_N:
+                raise ValueError(
+                    f"group {key!r} spans {n} windows; pareto_attr_stability "
+                    f"requires at most {_PERMUTATION_MAX_N} windows per group"
+                )
+            metric_stats: list[
+                tuple[str, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal]
+            ] = []
+            for metric_index in range(3):
+                values = [window[metric_index] for window in windows]
+                total = Decimal(0)
+                for value in values:
+                    total += value
+                mean = total / n
+                if mean < 0:
+                    direction = "down"
+                    same_sign = sum(1 for value in values if value < 0)
+                elif mean > 0:
+                    direction = "up"
+                    same_sign = sum(1 for value in values if value > 0)
+                else:
+                    direction = "flat"
+                    same_sign = sum(1 for value in values if value == 0)
+                consistency = Decimal(same_sign) / n
+                p_value = _pareto_attr_sign_p(values)
+                if n == 1:
+                    se = Decimal(0)
+                else:
+                    squared = Decimal(0)
+                    for value in values:
+                        deviation = value - mean
+                        squared += deviation * deviation
+                    se = (squared / (n * (n - 1))).sqrt()
+                lower = mean - Decimal("1.96") * se
+                upper = mean + Decimal("1.96") * se
+                metric_stats.append(
+                    (direction, mean, consistency, se, lower, upper, p_value)
+                )
+            stats[key] = (n, metric_stats)
+
+        # Global Benjamini-Hochberg over every (group, metric) test, ranked
+        # by (p, r, p, metric order); accumulate N * p_l / l as a running
+        # minimum from the top rank down.
+        ranked = sorted(
+            (
+                p_value,
+                key[0],
+                key[1],
+                metric_index,
+            )
+            for key, (_n, metric_stats) in stats.items()
+            for metric_index, (
+                _direction, _mean, _consistency, _se, _lower, _upper, p_value
+            ) in enumerate(metric_stats)
+        )
+        count = len(ranked)
+        q_values: dict[
+            tuple[tuple[str, tuple[str, ...]], int], Decimal
+        ] = {}
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            p_value, r, p, metric_index = ranked[rank - 1]
+            candidate = Decimal(count) * p_value / rank
+            if candidate < running:
+                running = candidate
+            q_values[((r, p), metric_index)] = running
+
+        group_tokens: list[str] = []
+        for key in sorted(stats):
+            r, p = key
+            n, metric_stats = stats[key]
+            item_tokens: list[str] = []
+            for metric_index, metric_name in enumerate(_PARETO_ATTR_METRICS):
+                (direction, mean, consistency, se, lower, upper,
+                 p_value) = metric_stats[metric_index]
+                q_value = q_values[(key, metric_index)]
+                reject = q_value <= alpha_value
+                item_tokens.append(
+                    '{"metric":' + json.dumps(metric_name, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"direction":' + json.dumps(direction, ensure_ascii=False)
+                    + ',"mean":' + _format6(mean)
+                    + ',"consistency":' + _format6(consistency)
+                    + ',"se":' + _format6(se)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + "}"
+                )
+            group_tokens.append(
+                '{"region":' + json.dumps(r, ensure_ascii=False)
+                + ',"pick":' + _driver_plan_string_array(p)
                 + ',"items":[' + ",".join(item_tokens) + "]}"
             )
 
