@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections.abc import Mapping
-from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, localcontext
+from decimal import (
+    ROUND_CEILING,
+    ROUND_FLOOR,
+    ROUND_HALF_EVEN,
+    Decimal,
+    localcontext,
+)
 from fractions import Fraction
 from itertools import combinations, permutations
 import json
@@ -19951,6 +19957,108 @@ def driver_plan_pareto(frontier: str, weights: dict, limit) -> str:
     )
 
 
+def _pareto_validate_weight_sets(
+    weights: object,
+    *,
+    max_sets: int | None = None,
+) -> list[tuple[str, dict[str, Decimal]]]:
+    """Validate the ``weights`` argument shared by :func:`pareto_stability`
+    and :func:`pareto_bootstrap`: a dict of at least two (and at most
+    ``max_sets`` when given) non-empty-string keys mapping to
+    :func:`driver_plan_pareto` weight dicts whose values are positive
+    finite non-boolean int/floats, entered as ``Decimal(str(x))``."""
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if len(weights) < 2:
+        raise ValueError("weights must hold at least two entries")
+    if max_sets is not None and len(weights) > max_sets:
+        raise ValueError(f"weights must hold at most {max_sets} entries")
+
+    weight_sets: list[tuple[str, dict[str, Decimal]]] = []
+    for name, raw_weights in weights.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("weights keys must be non-empty strings")
+        if not isinstance(raw_weights, dict):
+            raise TypeError("each weights value must be a dict")
+        if set(raw_weights) != set(_KIND_IMPACT_METRICS):
+            raise ValueError(
+                "each weights dict must be keyed exactly uhi, energy and vent"
+            )
+        weight_values: dict[str, Decimal] = {}
+        for metric in _KIND_IMPACT_METRICS:
+            weight = raw_weights[metric]
+            if isinstance(weight, bool) or not isinstance(
+                weight, (int, float)
+            ):
+                raise ValueError("weight values must be finite int or float")
+            if isinstance(weight, float) and not math.isfinite(weight):
+                raise ValueError("weight values must be finite")
+            weight_value = Decimal(str(weight))
+            if weight_value <= 0:
+                raise ValueError("weight values must be positive")
+            weight_values[metric] = weight_value
+        weight_sets.append((name, weight_values))
+    return weight_sets
+
+
+def _pareto_validate_limits(limits: object) -> list[Decimal]:
+    """Validate the ``limits`` argument shared by the Pareto aggregate
+    reports: a non-empty list of finite non-boolean non-negative
+    int/floats, pairwise distinct as ``Decimal(str(x))``, returned sorted."""
+    if not isinstance(limits, list):
+        raise TypeError("limits must be a list")
+    if not limits:
+        raise ValueError("limits must be non-empty")
+    limit_values: list[Decimal] = []
+    seen_limits: set[Decimal] = set()
+    for limit in limits:
+        limit_value = _driver_plan_validate_limit(limit)
+        if limit_value in seen_limits:
+            raise ValueError("limits must be pairwise distinct")
+        seen_limits.add(limit_value)
+        limit_values.append(limit_value)
+    limit_values.sort()
+    return limit_values
+
+
+def _driver_plan_pareto_precision(
+    weight_sets: list[tuple[str, dict[str, Decimal]]],
+    limit_values: list[Decimal],
+    points: list[
+        tuple[
+            Decimal,
+            list[
+                tuple[
+                    str, Decimal, Decimal, Decimal, Decimal, tuple[str, ...]
+                ]
+            ],
+        ]
+    ]
+    | None = None,
+) -> int:
+    """Decimal precision wide enough that multiplying arbitrarily large
+    ``Decimal(str(x))`` weights by the frontier's six-decimal effects never
+    loses the digits that order the scores. Always at least
+    ``_MODEL_PRECISION`` (1000)."""
+    weight_digits = 0
+    for _name, weight_values in weight_sets:
+        for weight_value in weight_values.values():
+            weight_digits = max(weight_digits, len(weight_value.as_tuple().digits))
+    effect_digits = 0
+    for number in limit_values:
+        effect_digits = max(effect_digits, len(number.as_tuple().digits))
+    if points is not None:
+        for _point_limit, point_groups in points:
+            for _by, cost, uhi, energy, vent, _pick in point_groups:
+                for number in (cost, uhi, energy, vent):
+                    effect_digits = max(
+                        effect_digits, len(number.as_tuple().digits)
+                    )
+    # Each score is a weight*effect product summed three ways; allow the
+    # full product width plus headroom for the addition carry.
+    return max(_MODEL_PRECISION, weight_digits + effect_digits + 8)
+
+
 def pareto_stability(frontier: str, weights: dict, limits: list) -> str:
     """Aggregate :func:`driver_plan_pareto` recommendations across weight
     sets and budget limits into selection stability statistics.
@@ -19982,10 +20090,12 @@ def pareto_stability(frontier: str, weights: dict, limits: list) -> str:
     descending ``frequency`` and ascending ``pick``.
 
     Numbers enter as ``Decimal(str(x))`` and the ratios run under a
-    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
-    UTF-8 JSON string with no spaces and exactly one trailing newline;
-    the top-level key order is ``points`` and each point uses
-    ``limit, groups`` while each group uses
+    precision-1000-or-wider, ROUND_HALF_EVEN local context (the precision
+    widens to keep arbitrary-magnitude weights and limits exact), so
+    arbitrarily large int weights and limits never pass through ``float``.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``points`` and each point
+    uses ``limit, groups`` while each group uses
     ``by, recommend, stability, switch, items`` and each item uses
     ``pick, frequency, uhi, energy, vent``. Points follow ascending
     limits, groups order region before window and ``recommend``/``pick``
@@ -19999,50 +20109,15 @@ def pareto_stability(frontier: str, weights: dict, limits: list) -> str:
         raise TypeError("weights must be a dict")
     if not isinstance(limits, list):
         raise TypeError("limits must be a list")
-    if len(weights) < 2:
-        raise ValueError("weights must hold at least two entries")
-
-    weight_sets: list[tuple[str, dict[str, Decimal]]] = []
-    for name, raw_weights in weights.items():
-        if not isinstance(name, str) or not name:
-            raise ValueError("weights keys must be non-empty strings")
-        if not isinstance(raw_weights, dict):
-            raise TypeError("each weights value must be a dict")
-        if set(raw_weights) != set(_KIND_IMPACT_METRICS):
-            raise ValueError(
-                "each weights dict must be keyed exactly uhi, energy and vent"
-            )
-        weight_values: dict[str, Decimal] = {}
-        for metric in _KIND_IMPACT_METRICS:
-            weight = raw_weights[metric]
-            if isinstance(weight, bool) or not isinstance(
-                weight, (int, float)
-            ):
-                raise ValueError("weight values must be finite int or float")
-            if isinstance(weight, float) and not math.isfinite(weight):
-                raise ValueError("weight values must be finite")
-            weight_value = Decimal(str(weight))
-            if weight_value <= 0:
-                raise ValueError("weight values must be positive")
-            weight_values[metric] = weight_value
-        weight_sets.append((name, weight_values))
-
-    if not limits:
-        raise ValueError("limits must be non-empty")
-    limit_values: list[Decimal] = []
-    seen_limits: set[Decimal] = set()
-    for limit in limits:
-        limit_value = _driver_plan_validate_limit(limit)
-        if limit_value in seen_limits:
-            raise ValueError("limits must be pairwise distinct")
-        seen_limits.add(limit_value)
-        limit_values.append(limit_value)
-    limit_values.sort()
+    weight_sets = _pareto_validate_weight_sets(weights)
+    limit_values = _pareto_validate_limits(limits)
 
     points = _driver_plan_pareto_parse(frontier)
 
     with localcontext() as ctx:
-        ctx.prec = _MODEL_PRECISION
+        ctx.prec = _driver_plan_pareto_precision(
+            weight_sets, limit_values, points
+        )
         ctx.rounding = ROUND_HALF_EVEN
 
         weight_count = Decimal(len(weight_sets))
@@ -20128,7 +20203,176 @@ def pareto_stability(frontier: str, weights: dict, limits: list) -> str:
     return '{"points":[' + ",".join(point_tokens) + "]}\n"
 
 
-_TEMPORAL_LAG_MAX_N = 8
+def _pareto_bootstrap_p_value(n: int, r: int) -> Decimal:
+    """Two-sided exact sign-test p-value for the modal pick:
+    ``min(1, 2 * sum_{k=0..min(r,n-r)} C(n,k) / 2**n)``."""
+    tail = sum(math.comb(n, k) for k in range(min(r, n - r) + 1))
+    p_value = Decimal(2) * Decimal(tail) / Decimal(1 << n)
+    return min(Decimal(1), p_value)
+
+
+def pareto_bootstrap(
+    frontier: str,
+    weights: dict,
+    limits: list,
+    *,
+    confidence: float = 0.95,
+) -> str:
+    """Bootstrap the :func:`pareto_stability` modal-pick selection and emit
+    an exact confidence interval on its vote share.
+
+    ``frontier``, ``weights`` and ``limits`` follow the :func:`pareto_stability`
+    contract exactly, except ``weights`` must hold between two and eight
+    weight sets. ``confidence`` must be a finite non-boolean int/float with
+    ``0 < confidence < 1``; ``bool`` and out-of-range values raise
+    ``ValueError``. Type and contract violations on the first three
+    arguments raise as in :func:`pareto_stability`; every other violation
+    raises ``ValueError``.
+
+    For each limit and ``by``, every weight set contributes one
+    recommendation and the modal non-null pick wins, ties resolved by
+    ascending lexicographic pick (identical to :func:`pareto_stability`).
+    With ``n`` the number of weight sets and ``r`` the winner's vote count,
+    the all-null case renders ``pick: null`` with
+    ``lower = upper = p = 1``; otherwise the ``n ** n`` ordered index
+    sequences sampled with replacement are enumerated: each contributes
+    the proportion of its ``n`` draws equal to ``pick`` and the resulting
+    ``N = n ** n`` proportions are sorted. Exactly ``C(n, k) * r ** k *
+    (n - r) ** (n - k)`` sequences share the value ``k / n``, so the
+    sorted distribution is enumerated as those ordered blocks rather than
+    materialized. With ``a = (1 - confidence) / 2`` (the confidence itself
+    enters as ``Decimal(str(confidence))``), ``lower`` is the value at
+    zero-based index ``floor((N - 1) * a)`` and ``upper`` at
+    ``ceil((N - 1) * (1 - a))`` of the sorted distribution. ``p`` is the
+    two-sided exact sign-test value
+    ``min(1, 2 * sum_{k=0..min(r,n-r)} C(n,k) / 2**n)``.
+
+    Numbers enter as ``Decimal(str(x))`` and the arithmetic runs under a
+    precision-1000-or-wider, ROUND_HALF_EVEN local context. Returns a
+    compact UTF-8 JSON string with no spaces and exactly one trailing
+    newline; the top-level key order is ``confidence, points``, each point
+    uses ``limit, groups`` and each group uses ``by, pick, n, lower, upper,
+    p``. Points follow ascending limits, groups order region before window
+    and ``pick`` is ``null`` or an ascending string array; ``n`` is a JSON
+    integer while ``confidence``, ``limit``, ``lower``, ``upper`` and ``p``
+    render with six decimals, negative zero normalized to ``0.000000``.
+    """
+    if not isinstance(frontier, str):
+        raise TypeError("frontier must be a str")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if not isinstance(limits, list):
+        raise TypeError("limits must be a list")
+    weight_sets = _pareto_validate_weight_sets(weights, max_sets=8)
+    limit_values = _pareto_validate_limits(limits)
+    if isinstance(confidence, bool) or not isinstance(
+        confidence, (int, float)
+    ):
+        raise ValueError("confidence must be a finite int or float")
+    if isinstance(confidence, float) and not math.isfinite(confidence):
+        raise ValueError("confidence must be finite")
+    confidence_value = Decimal(str(confidence))
+    if not Decimal(0) < confidence_value < Decimal(1):
+        raise ValueError("confidence must satisfy 0 < confidence < 1")
+
+    points = _driver_plan_pareto_parse(frontier)
+
+    with localcontext() as ctx:
+        ctx.prec = _driver_plan_pareto_precision(
+            weight_sets, limit_values, points
+        )
+        ctx.rounding = ROUND_HALF_EVEN
+
+        n = len(weight_sets)
+        total = n**n
+        alpha = (Decimal(1) - confidence_value) / Decimal(2)
+        lower_index = int(
+            (Decimal(total - 1) * alpha).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        )
+        upper_index = int(
+            (Decimal(total - 1) * (Decimal(1) - alpha)).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+
+        def quantile_at(index: int, r_votes: int) -> Decimal:
+            """Value at zero-based ``index`` of the sorted n**n distribution
+            of ``k / n`` block multiplicities ``C(n,k) r**k (n-r)**(n-k)``.
+            """
+            remaining = index
+            for k in range(n + 1):
+                multiplicity = (
+                    math.comb(n, k)
+                    * r_votes**k
+                    * (n - r_votes) ** (n - k)
+                )
+                if remaining < multiplicity:
+                    return Decimal(k) / Decimal(n)
+                remaining -= multiplicity
+            raise AssertionError("bootstrap quantile index out of range")
+
+        point_tokens: list[str] = []
+        for limit_value in limit_values:
+            runs = {
+                name: _driver_plan_pareto_results(
+                    points, weight_values, limit_value
+                )
+                for name, weight_values in weight_sets
+            }
+            bys = [
+                by
+                for by in _KIND_IMPACT_BYS
+                if any(by in run for run in runs.values())
+            ]
+
+            group_tokens: list[str] = []
+            for by in bys:
+                counts: dict[tuple[str, ...], int] = {}
+                for name, _weight_values in weight_sets:
+                    run = runs[name]
+                    if by not in run:
+                        continue
+                    recommend_pick, _survivors = run[by]
+                    if recommend_pick is None:
+                        continue
+                    counts[recommend_pick] = counts.get(recommend_pick, 0) + 1
+
+                if not counts:
+                    pick_token = "null"
+                    lower = upper = p_value = Decimal(1)
+                else:
+                    winner = min(
+                        counts,
+                        key=lambda candidate: (-counts[candidate], candidate),
+                    )
+                    r_votes = counts[winner]
+                    pick_token = _driver_plan_string_array(winner)
+                    lower = quantile_at(lower_index, r_votes)
+                    upper = quantile_at(upper_index, r_votes)
+                    p_value = _pareto_bootstrap_p_value(n, r_votes)
+
+                group_tokens.append(
+                    '{"by":' + json.dumps(by, ensure_ascii=False)
+                    + ',"pick":' + pick_token
+                    + ',"n":' + str(n)
+                    + ',"lower":' + _format6(lower)
+                    + ',"upper":' + _format6(upper)
+                    + ',"p":' + _format6(p_value)
+                    + "}"
+                )
+
+            point_tokens.append(
+                '{"limit":' + _format6(limit_value)
+                + ',"groups":[' + ",".join(group_tokens) + "]}"
+            )
+
+    return (
+        '{"confidence":' + _format6(confidence_value)
+        + ',"points":[' + ",".join(point_tokens) + "]}\n"
+    )
+
 
 
 def effect_matrix_temporal_lag_report(
