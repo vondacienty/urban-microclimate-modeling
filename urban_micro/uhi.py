@@ -115,6 +115,7 @@ __all__ = [
     "region_attr",
     "region_attr_layer_report",
     "region_attr_layer_stability",
+    "region_attr_layer_trend",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -22922,6 +22923,208 @@ def region_attr_layer_stability(reports: dict) -> str:
                     + ',"high":' + _format6(high)
                     + ',"significant":' + _format6(significant)
                     + ',"changes":' + str(changes)
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(
+                    _REGION_ATTR_FACTORS[by_order], ensure_ascii=False
+                )
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_REGION_ATTR_LAYER_TREND_STATUSES = ("持续", "增强", "减弱", "翻转", "不活跃")
+
+
+def region_attr_layer_trend(reports: dict) -> str:
+    """Aggregate repeated :func:`region_attr_layer_report` outputs over
+    named windows into per-identity trend statistics.
+
+    ``reports`` is a dict of 2 to 16 entries; every key must be a
+    non-empty string naming a window and every value a byte-for-byte
+    canonical :func:`region_attr_layer_report` JSON output. All reports
+    must share one ``alpha`` and one set of tested
+    ``(by, key, pick, factor)`` identities (reports with empty groups
+    are allowed, but then every report must be empty). A non-dict
+    ``reports`` raises ``TypeError``; every other violation raises
+    ``ValueError``.
+
+    Windows are processed in ascending key order. For every identity,
+    ``y`` is the sequence of window ``mean`` values and ``b`` the
+    sequence of ``reject`` flags; with ``n`` the number of windows,
+    ``share`` is the proportion of windows with ``b`` true, ``changes``
+    is the number of times ``b`` flips between adjacent windows and
+    ``slope`` is the ordinary-least-squares slope of ``y`` against
+    ``x = 0..n-1``. The ``status`` is decided in order: ``changes > 0``
+    yields ``翻转``; otherwise a positive/negative ``slope`` yields
+    ``增强``/``减弱``; ``slope = 0`` with ``share = 1`` yields ``持续``;
+    anything else yields ``不活跃``. Within each group items are ranked
+    by the status order 持续, 增强, 减弱, 翻转, 不活跃, then descending
+    ``share``, descending ``|slope|``, ascending ``pick`` and the
+    weather/morph/cover factor order, with ``rank`` starting at 1.
+
+    Numbers enter as ``Decimal(str(x))`` and the statistics run under a
+    precision-1000, ROUND_HALF_EVEN local context; status decisions and
+    ordering compare the unquantized values. Returns a compact UTF-8
+    JSON string with no spaces and exactly one trailing newline; the
+    top-level key order is ``alpha, groups``, each group uses
+    ``by, key, items`` and each item uses
+    ``pick, factor, n, slope, share, changes, status, rank``. Groups
+    sort by the weather/morph/cover factor order then ``key`` and items
+    by ``rank``; ``pick`` is an ascending string array, ``n``,
+    ``changes`` and ``rank`` render as JSON integers while ``alpha``,
+    ``slope`` and ``share`` render with six decimals, negative zero
+    normalized to ``0.000000``. Empty identities yield ``groups=[]``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not _REGION_ATTR_LAYER_REPORTS_MIN <= len(reports) <= (
+        _REGION_ATTR_LAYER_REPORTS_MAX
+    ):
+        raise ValueError(
+            "reports must hold between "
+            f"{_REGION_ATTR_LAYER_REPORTS_MIN} and "
+            f"{_REGION_ATTR_LAYER_REPORTS_MAX} entries"
+        )
+    for name in reports:
+        if not isinstance(name, str) or not name:
+            raise ValueError("reports keys must be non-empty strings")
+
+    alpha: Decimal | None = None
+    identities: frozenset[tuple[str, str, tuple[str, ...], str]] | None = (
+        None
+    )
+    # window -> identity -> (mean, reject)
+    parsed_windows: dict[
+        str, dict[
+            tuple[str, str, tuple[str, ...], str], tuple[Decimal, bool]
+        ]
+    ] = {}
+    for name in reports:
+        report_alpha, entries = _region_attr_layer_output_parse_full(
+            reports[name]
+        )
+        if alpha is None:
+            alpha = report_alpha
+        elif report_alpha != alpha:
+            raise ValueError("all reports must share one alpha")
+        window_identities = frozenset(entries)
+        if identities is None:
+            identities = window_identities
+        elif window_identities != identities:
+            raise ValueError(
+                "all reports must share the same "
+                "(by, key, pick, factor) identities"
+            )
+        parsed_windows[name] = {
+            identity: (mean, reject)
+            for identity, (_n, mean, reject) in entries.items()
+        }
+    assert alpha is not None and identities is not None
+
+    window_names = sorted(reports)
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (by order, key, pick, factor order)
+        #     -> (n, slope, share, changes, status)
+        stats: dict[
+            tuple[int, str, tuple[str, ...], int],
+            tuple[int, Decimal, Decimal, int, str],
+        ] = {}
+        for by, key, pick, factor in identities:
+            means: list[Decimal] = []
+            rejects: list[bool] = []
+            for name in window_names:
+                mean, reject = parsed_windows[name][
+                    (by, key, pick, factor)
+                ]
+                means.append(mean)
+                rejects.append(reject)
+            n = len(means)
+            share = Decimal(sum(1 for flag in rejects if flag)) / (
+                Decimal(n)
+            )
+            changes = sum(
+                1
+                for index in range(n - 1)
+                if rejects[index] != rejects[index + 1]
+            )
+            mean_x = Decimal(n - 1) / Decimal(2)
+            total_y = Decimal(0)
+            for value in means:
+                total_y += value
+            mean_y = total_y / Decimal(n)
+            sxy = Decimal(0)
+            sxx = Decimal(0)
+            for index, value in enumerate(means):
+                centered_x = Decimal(index) - mean_x
+                sxy += centered_x * (value - mean_y)
+                sxx += centered_x * centered_x
+            slope = sxy / sxx
+            if changes > 0:
+                status = "翻转"
+            elif slope > 0:
+                status = "增强"
+            elif slope < 0:
+                status = "减弱"
+            elif share == 1:
+                status = "持续"
+            else:
+                status = "不活跃"
+            stats[
+                (_REGION_ATTR_FACTORS.index(by), key, pick,
+                 _REGION_ATTR_FACTORS.index(factor))
+            ] = (n, slope, share, changes, status)
+
+        group_keys = sorted({
+            (by_order, key)
+            for by_order, key, _pick, _factor_order in stats
+        })
+        group_tokens: list[str] = []
+        for by_order, key in group_keys:
+            ranked = sorted(
+                (
+                    (pick, factor_order)
+                    for b_order, b_key, pick, factor_order in stats
+                    if b_order == by_order and b_key == key
+                ),
+                key=lambda value: (
+                    _REGION_ATTR_LAYER_TREND_STATUSES.index(
+                        stats[(by_order, key, value[0], value[1])][4]
+                    ),
+                    -stats[(by_order, key, value[0], value[1])][2],
+                    -abs(stats[(by_order, key, value[0], value[1])][1]),
+                    value[0],
+                    value[1],
+                ),
+            )
+            item_tokens: list[str] = []
+            for rank, (pick, factor_order) in enumerate(ranked, start=1):
+                n, slope, share, changes, status = stats[
+                    (by_order, key, pick, factor_order)
+                ]
+                item_tokens.append(
+                    '{"pick":' + _driver_plan_string_array(pick)
+                    + ',"factor":'
+                    + json.dumps(
+                        _REGION_ATTR_FACTORS[factor_order],
+                        ensure_ascii=False,
+                    )
+                    + ',"n":' + str(n)
+                    + ',"slope":' + _format6(slope)
+                    + ',"share":' + _format6(share)
+                    + ',"changes":' + str(changes)
+                    + ',"status":'
+                    + json.dumps(status, ensure_ascii=False)
+                    + ',"rank":' + str(rank)
                     + "}"
                 )
             group_tokens.append(
