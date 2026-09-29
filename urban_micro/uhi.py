@@ -114,6 +114,7 @@ __all__ = [
     "pareto_region_stability",
     "region_attr",
     "region_attr_layer_report",
+    "region_attr_layer_stability",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -22585,6 +22586,349 @@ def region_attr_layer_report(reports: dict, layers: dict) -> str:
             group_tokens.append(
                 '{"by":' + json.dumps(by, ensure_ascii=False)
                 + ',"key":' + json.dumps(category, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_REGION_ATTR_LAYER_STABILITY_ERROR = (
+    "reports must map non-empty string keys to region_attr_layer_report "
+    "JSON outputs"
+)
+
+
+def _region_attr_layer_output_parse_full(
+    raw: object,
+) -> tuple[
+    Decimal,
+    dict[tuple[str, str, tuple[str, ...], str], tuple[int, Decimal, bool]],
+]:
+    """Parse one byte-for-byte canonical
+    :func:`region_attr_layer_report` JSON output.
+
+    Returns ``(alpha, entries)`` mapping each
+    ``(by, key, pick, factor)`` identity to ``(n, mean, reject)``. The
+    input must reproduce a canonical output exactly (key order,
+    escaping, group and item order and the six-decimal number tokens
+    included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+
+    entries: dict[
+        tuple[str, str, tuple[str, ...], str], tuple[int, Decimal, bool]
+    ] = {}
+    group_tokens: list[str] = []
+    previous_group: tuple[int, str] | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"by", "key", "items"}:
+            raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+        by = group["by"]
+        key = group["key"]
+        raw_items = group["items"]
+        if (
+            by not in _REGION_ATTR_FACTORS
+            or not isinstance(key, str)
+            or not key
+            or not isinstance(raw_items, list)
+            or not raw_items
+        ):
+            raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+        by_order = _REGION_ATTR_FACTORS.index(by)
+        if previous_group is not None and (
+            by_order, key
+        ) <= previous_group:
+            raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+        previous_group = (by_order, key)
+
+        item_tokens: list[str] = []
+        previous_pick: tuple[str, ...] | None = None
+        previous_factor: int | None = None
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {
+                "pick", "factor", "n", "mean", "p", "q", "reject",
+            }:
+                raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+            raw_pick = item["pick"]
+            factor = item["factor"]
+            n = item["n"]
+            mean = item["mean"]
+            p_value = item["p"]
+            q_value = item["q"]
+            reject = item["reject"]
+            if (
+                not isinstance(raw_pick, list)
+                or not raw_pick
+                or any(
+                    not isinstance(kind, str) or kind not in _INTERVENTION_KINDS
+                    for kind in raw_pick
+                )
+            ):
+                raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+            if any(
+                raw_pick[index] >= raw_pick[index + 1]
+                for index in range(len(raw_pick) - 1)
+            ):
+                raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+            pick = tuple(raw_pick)
+            if (
+                factor not in _REGION_ATTR_FACTORS
+                or isinstance(n, bool)
+                or not isinstance(n, int)
+                or not 1 <= n <= _REGION_ATTR_MAX_N
+                or not isinstance(mean, _RankTrajectoryNumber)
+                or mean < -1
+                or mean > 1
+                or not isinstance(p_value, _RankTrajectoryNumber)
+                or p_value < 0
+                or p_value > 1
+                or not isinstance(q_value, _RankTrajectoryNumber)
+                or q_value < 0
+                or q_value > 1
+                or not isinstance(reject, bool)
+            ):
+                raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+            factor_order = _REGION_ATTR_FACTORS.index(factor)
+            if previous_pick is not None:
+                if pick < previous_pick:
+                    raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+                if pick == previous_pick and (
+                    previous_factor is not None
+                    and factor_order <= previous_factor
+                ):
+                    raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+            previous_pick = pick
+            previous_factor = factor_order
+            if (by, key, pick, factor) in entries:
+                raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+            entries[(by, key, pick, factor)] = (n, mean, reject)
+            item_tokens.append(
+                '{"pick":' + _driver_plan_string_array(pick)
+                + ',"factor":'
+                + json.dumps(factor, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"mean":' + _format6(mean)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if reject else "false")
+                + "}"
+            )
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"key":' + json.dumps(key, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_REGION_ATTR_LAYER_STABILITY_ERROR)
+
+    return alpha, entries
+
+
+def region_attr_layer_stability(reports: dict) -> str:
+    """Aggregate repeated :func:`region_attr_layer_report` outputs over
+    named windows into per-identity stability statistics.
+
+    ``reports`` is a dict of 2 to 16 entries; every key must be a
+    non-empty string naming a window and every value a byte-for-byte
+    canonical :func:`region_attr_layer_report` JSON output. All reports
+    must share one ``alpha`` and one set of tested
+    ``(by, key, pick, factor)`` identities (reports with empty groups
+    are allowed, but then every report must be empty). A non-dict
+    ``reports`` raises ``TypeError``; every other violation raises
+    ``ValueError``.
+
+    Windows are processed in ascending key order. For every identity,
+    ``x`` is the window's six-decimal ``mean`` and ``b`` its
+    ``reject`` flag; with ``n`` the number of windows,
+    ``mean = sum(x) / n``, ``low``/``high`` are the minimum/maximum
+    ``x``, ``significant`` is the proportion of windows with ``b``
+    true and ``changes`` is the number of times ``b`` flips between
+    adjacent windows.
+
+    Numbers enter as ``Decimal(str(x))`` and the means and ratios run
+    under a precision-1000, ROUND_HALF_EVEN local context. Returns a
+    compact UTF-8 JSON string with no spaces and exactly one trailing
+    newline; the top-level key order is ``alpha, groups``, each group
+    uses ``by, key, items`` and each item uses
+    ``pick, factor, n, mean, low, high, significant, changes``. Groups
+    sort by the weather/morph/cover factor order then ``key`` and
+    items by ascending ``pick`` then weather/morph/cover factor order;
+    ``pick`` is an ascending string array, ``n`` and ``changes``
+    render as JSON integers while ``alpha``, ``mean``, ``low``,
+    ``high`` and ``significant`` render with six decimals, negative
+    zero normalized to ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not _REGION_ATTR_LAYER_REPORTS_MIN <= len(reports) <= (
+        _REGION_ATTR_LAYER_REPORTS_MAX
+    ):
+        raise ValueError(
+            "reports must hold between "
+            f"{_REGION_ATTR_LAYER_REPORTS_MIN} and "
+            f"{_REGION_ATTR_LAYER_REPORTS_MAX} entries"
+        )
+    for name in reports:
+        if not isinstance(name, str) or not name:
+            raise ValueError("reports keys must be non-empty strings")
+
+    alpha: Decimal | None = None
+    identities: frozenset[tuple[str, str, tuple[str, ...], str]] | None = (
+        None
+    )
+    # window -> identity -> (mean, reject)
+    parsed_windows: dict[
+        str, dict[
+            tuple[str, str, tuple[str, ...], str], tuple[Decimal, bool]
+        ]
+    ] = {}
+    for name in reports:
+        report_alpha, entries = _region_attr_layer_output_parse_full(
+            reports[name]
+        )
+        if alpha is None:
+            alpha = report_alpha
+        elif report_alpha != alpha:
+            raise ValueError("all reports must share one alpha")
+        window_identities = frozenset(entries)
+        if identities is None:
+            identities = window_identities
+        elif window_identities != identities:
+            raise ValueError(
+                "all reports must share the same "
+                "(by, key, pick, factor) identities"
+            )
+        parsed_windows[name] = {
+            identity: (mean, reject)
+            for identity, (_n, mean, reject) in entries.items()
+        }
+    assert alpha is not None and identities is not None
+
+    window_names = sorted(reports)
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (by order, key, pick, factor order) -> statistics.
+        stats: dict[
+            tuple[int, str, tuple[str, ...], int],
+            tuple[int, Decimal, Decimal, Decimal, Decimal, int],
+        ] = {}
+        for by, key, pick, factor in identities:
+            means: list[Decimal] = []
+            rejects: list[bool] = []
+            for name in window_names:
+                mean, reject = parsed_windows[name][
+                    (by, key, pick, factor)
+                ]
+                means.append(mean)
+                rejects.append(reject)
+            n = len(means)
+            total = Decimal(0)
+            for value in means:
+                total += value
+            mean_value = total / Decimal(n)
+            low = min(means)
+            high = max(means)
+            significant = Decimal(sum(1 for flag in rejects if flag)) / (
+                Decimal(n)
+            )
+            changes = sum(
+                1
+                for index in range(n - 1)
+                if rejects[index] != rejects[index + 1]
+            )
+            stats[
+                (_REGION_ATTR_FACTORS.index(by), key, pick,
+                 _REGION_ATTR_FACTORS.index(factor))
+            ] = (n, mean_value, low, high, significant, changes)
+
+        group_keys = sorted({
+            (by_order, key)
+            for by_order, key, _pick, _factor_order in stats
+        })
+        group_tokens: list[str] = []
+        for by_order, key in group_keys:
+            item_keys = sorted(
+                (
+                    (pick, factor_order)
+                    for b_order, b_key, pick, factor_order in stats
+                    if b_order == by_order and b_key == key
+                ),
+                key=lambda value: (value[0], value[1]),
+            )
+            item_tokens: list[str] = []
+            for pick, factor_order in item_keys:
+                n, mean_value, low, high, significant, changes = stats[
+                    (by_order, key, pick, factor_order)
+                ]
+                item_tokens.append(
+                    '{"pick":' + _driver_plan_string_array(pick)
+                    + ',"factor":'
+                    + json.dumps(
+                        _REGION_ATTR_FACTORS[factor_order],
+                        ensure_ascii=False,
+                    )
+                    + ',"n":' + str(n)
+                    + ',"mean":' + _format6(mean_value)
+                    + ',"low":' + _format6(low)
+                    + ',"high":' + _format6(high)
+                    + ',"significant":' + _format6(significant)
+                    + ',"changes":' + str(changes)
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(
+                    _REGION_ATTR_FACTORS[by_order], ensure_ascii=False
+                )
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
                 + ',"items":[' + ",".join(item_tokens) + "]}"
             )
 
