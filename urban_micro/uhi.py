@@ -109,6 +109,7 @@ __all__ = [
     "driver_plan",
     "pareto_attr",
     "pareto_attr_stability",
+    "pareto_heterogeneity",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -20776,6 +20777,308 @@ def pareto_attr_stability(rows: list, *, alpha: float = 0.05) -> str:
             group_tokens.append(
                 '{"region":' + json.dumps(r, ensure_ascii=False)
                 + ',"pick":' + _driver_plan_string_array(p)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_PARETO_HETEROGENEITY_MAX_M = 10
+
+
+def _pareto_heterogeneity_p(
+    window_means: list[Decimal], sizes: list[int]
+) -> Decimal:
+    """Exact permutation p-value for the heterogeneity statistic.
+
+    The ``m`` positions (already ordered by ascending ``(r, w)``) are
+    assigned to ``k`` regions with fixed sizes ``n_r``; every one of the
+    ``m! / prod(n_r!)`` distinct assignments is visited once, repeated
+    window means staying distinct by position. ``p`` is the share whose
+    recomputed statistic is at least the observed one.
+
+    The window means share one common denominator ``D``, so every statistic
+    is tracked with exact integers: with ``A = lcm(n_r)``, ``a_r = A / n_r``,
+    ``N_r`` the region's sum of position numerators (each ``D`` times its
+    window mean), ``G = sum(a_r N_r)`` and ``d_r = k * a_r * N_r - G``, the
+    ordered statistic ``Q = sum(d_r ** 2)`` equals ``(k * A * D) ** 2 * h``.
+    Adding a value ``z`` to region ``r`` changes ``Q`` by
+    ``k * a_r * z * (2 * d_r + (k - 1) * a_r * z)``, letting the search
+    maintain ``Q`` in constant work per edge; labels with the same
+    coefficient ``a``, remaining capacity and running sum are equivalent
+    and that state is explored once, weighted by the label count.
+    """
+    m = len(window_means)
+    k = len(sizes)
+    denominator = 1
+    ratios = [value.as_integer_ratio() for value in window_means]
+    for _num, den in ratios:
+        denominator = math.lcm(denominator, den)
+    values = [num * (denominator // den) for num, den in ratios]
+
+    lcm_size = sizes[0]
+    for n_r in sizes[1:]:
+        lcm_size = math.lcm(lcm_size, n_r)
+    a = [lcm_size // n_r for n_r in sizes]
+    scale = [k * coefficient for coefficient in a]
+
+    total_count = math.factorial(m)
+    for n_r in sizes:
+        total_count //= math.factorial(n_r)
+
+    # Observed assignment: the ordered positions keep their own regions.
+    region_sums = [0] * k
+    position = 0
+    for region, n_r in enumerate(sizes):
+        region_sums[region] = sum(values[position:position + n_r])
+        position += n_r
+    grand = sum(a[region] * region_sums[region] for region in range(k))
+    observed_q = sum(
+        (scale[region] * region_sums[region] - grand) ** 2
+        for region in range(k)
+    )
+
+    region_sums = [0] * k
+    remaining = list(sizes)
+    grand = 0
+    q_value = 0
+
+    def enumerate_assignments(position: int) -> int:
+        """Returned hit counts weight each label-distinct assignment."""
+        nonlocal grand, q_value
+        if position == m:
+            return 1 if q_value >= observed_q else 0
+        value = values[position]
+        # Equivalent labels (same coefficient a, capacity and running sum)
+        # have isomorphic completion subtrees, so each shared state is
+        # explored once and weighted by the number of labels sharing it.
+        multiplicity: dict[tuple[int, int, int], int] = {}
+        for region in range(k):
+            if remaining[region]:
+                state = (a[region], remaining[region], region_sums[region])
+                multiplicity[state] = multiplicity.get(state, 0) + 1
+        hits = 0
+        seen_states: set[tuple[int, int, int]] = set()
+        for region in range(k):
+            if not remaining[region]:
+                continue
+            state = (a[region], remaining[region], region_sums[region])
+            if state in seen_states:
+                continue
+            seen_states.add(state)
+            deviation = scale[region] * region_sums[region] - grand
+            delta = (
+                k * a[region] * value
+                * (2 * deviation + (k - 1) * a[region] * value)
+            )
+            q_value += delta
+            region_sums[region] += value
+            grand += a[region] * value
+            remaining[region] -= 1
+            hits += multiplicity[state] * enumerate_assignments(position + 1)
+            remaining[region] += 1
+            grand -= a[region] * value
+            region_sums[region] -= value
+            q_value -= delta
+        return hits
+
+    hits = enumerate_assignments(0)
+    return Decimal(hits) / Decimal(total_count)
+
+
+def pareto_heterogeneity(rows: list, *, alpha: float = 0.05) -> str:
+    """Cross-region window-assignment heterogeneity for Pareto-pick levels.
+
+    ``rows`` follows the exact same contract as :func:`pareto_attr`: a list
+    of strict ``(r, w, t, p, u, e, v)`` seven-tuples, unique
+    ``(r, w, t, p)`` tuples, at most 16 rows sharing one ``(r, w, p)``
+    key, ``alpha`` a finite non-boolean number with ``0 < alpha <= 1``;
+    ``rows`` not being a list raises ``TypeError`` and every other contract
+    violation raises ``ValueError``.
+
+    The three metrics are first averaged within every ``(r, w, p)`` group,
+    producing one window mean per distinct ``w``. Those means are then
+    pooled by ``(p, metric)`` across regions: with ``n_r`` the number of
+    windows of region ``r``, ``k`` the region count and ``m = sum(n_r)``
+    the total window count, a pick with fewer than two regions is omitted
+    and ``m > 10`` raises ``ValueError``. With ``mu_r`` the region means,
+    ``mean = sum(mu_r) / k`` and ``h = sum((mu_r - mean) ** 2)``. The
+    exact p-value enumerates every assignment of the ``m`` positions
+    (ordered by ascending ``(r, w)``) to regions with the fixed sizes
+    ``n_r`` — ``m! / prod(n_r!)`` assignments, with repeated window means
+    still counted as distinct positions — recomputes
+    ``h' = sum((mu'_r - mean') ** 2)`` for each assignment and takes
+    ``p = #{h' >= h} / (m! / prod(n_r!))``.
+
+    All tests share one global Benjamini-Hochberg pass, exactly as in
+    :func:`pareto_attr_stability`: they rank ascending by
+    ``(p, p, metric order)`` and rank ``j`` (1-based) gets
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha`` compared on the unquantized values.
+
+    Numbers enter as ``Decimal(str(x))`` and arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
+    UTF-8 JSON string with no spaces and exactly one trailing newline;
+    the top-level key order is ``alpha, groups``, each group uses
+    ``pick, items`` and each item uses
+    ``metric, k, m, mean, h, p, q, reject``. Groups sort by ascending
+    ``p`` and items by ``uhi``, ``energy``, ``vent``; ``pick`` is a
+    string array, ``k`` and ``m`` are JSON integers and ``reject`` a JSON
+    boolean, while ``alpha``, ``mean``, ``h``, ``p`` and ``q`` render with
+    six decimals, negative zero normalized to ``0.000000``. With no
+    qualifying pick the report is ``"groups": []``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    # First pass: validate rows and collect the raw metrics within every
+    # (r, w, p) window group.
+    window_rows: dict[
+        tuple[str, str, tuple[str, ...]],
+        list[tuple[Decimal, Decimal, Decimal]],
+    ] = {}
+    seen: set[tuple[object, ...]] = set()
+    for row in rows:
+        r, w, t, p, u_value, e_value, v_value = _pareto_attr_validate_row(row)
+        unique_key = (r, w, t, p)
+        if unique_key in seen:
+            raise ValueError(f"duplicate (r, w, t, p) tuple: {unique_key!r}")
+        seen.add(unique_key)
+        window_rows.setdefault((r, w, p), []).append(
+            (u_value, e_value, v_value)
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # Average within each (r, w, p) window, walking keys in ascending
+        # (r, w, p) order so per-region window lists are (r, w)-ordered.
+        # Structure: pick -> metric -> region -> window means.
+        pick_regions: dict[
+            tuple[str, ...],
+            dict[str, dict[str, list[Decimal]]],
+        ] = {}
+        for (r, w, p), members in sorted(window_rows.items()):
+            window_n = len(members)
+            if window_n > _PERMUTATION_MAX_N:
+                raise ValueError(
+                    f"group {(r, w, p)!r} has {window_n} rows; pareto_attr "
+                    f"requires at most {_PERMUTATION_MAX_N} rows per group"
+                )
+            by_metric = pick_regions.setdefault(p, {})
+            for metric_index, metric_name in enumerate(_PARETO_ATTR_METRICS):
+                total = Decimal(0)
+                for member in members:
+                    total += member[metric_index]
+                window_mean = total / window_n
+                by_metric.setdefault(metric_name, {}).setdefault(r, []).append(
+                    window_mean
+                )
+
+        # pick -> [(k, m, mean, h, p) per metric in uhi/energy/vent order]
+        stats: dict[
+            tuple[str, ...],
+            list[tuple[int, int, Decimal, Decimal, Decimal]],
+        ] = {}
+        for p in sorted(pick_regions):
+            region_order = sorted(pick_regions[p][_PARETO_ATTR_METRICS[0]])
+            k = len(region_order)
+            if k < 2:
+                continue
+            sizes = [
+                len(pick_regions[p][_PARETO_ATTR_METRICS[0]][r])
+                for r in region_order
+            ]
+            m = sum(sizes)
+            if m > _PARETO_HETEROGENEITY_MAX_M:
+                raise ValueError(
+                    f"pick {p!r} spans {m} windows; pareto_heterogeneity "
+                    f"requires at most {_PARETO_HETEROGENEITY_MAX_M} windows "
+                    "per pick"
+                )
+            metric_stats: list[
+                tuple[int, int, Decimal, Decimal, Decimal]
+            ] = []
+            for metric_name in _PARETO_ATTR_METRICS:
+                window_means: list[Decimal] = []
+                for r in region_order:
+                    window_means.extend(pick_regions[p][metric_name][r])
+                region_sums = [Decimal(0) for _ in range(k)]
+                position = 0
+                for region, n_r in enumerate(sizes):
+                    for _ in range(n_r):
+                        region_sums[region] += window_means[position]
+                        position += 1
+                region_means = [
+                    region_sums[region] / sizes[region]
+                    for region in range(k)
+                ]
+                mean = Decimal(0)
+                for region_mean in region_means:
+                    mean += region_mean
+                mean /= k
+                h = Decimal(0)
+                for region_mean in region_means:
+                    deviation = region_mean - mean
+                    h += deviation * deviation
+                p_value = _pareto_heterogeneity_p(window_means, sizes)
+                metric_stats.append((k, m, mean, h, p_value))
+            stats[p] = metric_stats
+
+        # Global Benjamini-Hochberg over every (pick, metric) test, ranked
+        # by (p, p, metric order); accumulate N * p_l / l as a running
+        # minimum from the top rank down.
+        ranked = sorted(
+            (
+                p_value,
+                key,
+                metric_index,
+            )
+            for key, metric_stats in stats.items()
+            for metric_index, (
+                _k, _m, _mean, _h, p_value
+            ) in enumerate(metric_stats)
+        )
+        count = len(ranked)
+        q_values: dict[
+            tuple[tuple[str, ...], int], Decimal
+        ] = {}
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            p_value, p, metric_index = ranked[rank - 1]
+            candidate = Decimal(count) * p_value / rank
+            if candidate < running:
+                running = candidate
+            q_values[(p, metric_index)] = running
+
+        group_tokens: list[str] = []
+        for p in sorted(stats):
+            metric_stats = stats[p]
+            item_tokens: list[str] = []
+            for metric_index, metric_name in enumerate(_PARETO_ATTR_METRICS):
+                k, m, mean, h, p_value = metric_stats[metric_index]
+                q_value = q_values[(p, metric_index)]
+                reject = q_value <= alpha_value
+                item_tokens.append(
+                    '{"metric":' + json.dumps(metric_name, ensure_ascii=False)
+                    + ',"k":' + str(k)
+                    + ',"m":' + str(m)
+                    + ',"mean":' + _format6(mean)
+                    + ',"h":' + _format6(h)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + "}"
+                )
+            group_tokens.append(
+                '{"pick":' + _driver_plan_string_array(p)
                 + ',"items":[' + ",".join(item_tokens) + "]}"
             )
 
