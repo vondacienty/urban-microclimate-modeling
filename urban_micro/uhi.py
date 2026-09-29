@@ -107,6 +107,7 @@ __all__ = [
     "driver_attr_stability_summary",
     "driver_link",
     "driver_plan",
+    "pareto_attr",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -20373,6 +20374,207 @@ def pareto_bootstrap(
         + ',"points":[' + ",".join(point_tokens) + "]}\n"
     )
 
+
+_PARETO_ATTR_METRICS = ("uhi", "energy", "vent")
+
+
+def _pareto_attr_validate_row(
+    row: object,
+) -> tuple[str, str, int, tuple[str, ...], Decimal, Decimal, Decimal]:
+    """Validate one ``(r, w, t, p, u, e, v)`` seven-tuple."""
+    if not isinstance(row, tuple) or len(row) != 7:
+        raise ValueError("each row must be a (r, w, t, p, u, e, v) seven-tuple")
+    r, w, t, p, u, e, v = row
+    if not isinstance(r, str) or not r:
+        raise ValueError("r must be a non-empty str")
+    if not isinstance(w, str) or not w:
+        raise ValueError("w must be a non-empty str")
+    if isinstance(t, bool) or not isinstance(t, int) or t < 0:
+        raise ValueError("t must be a non-boolean non-negative integer")
+    if not isinstance(p, tuple) or not p:
+        raise ValueError(
+            "p must be a non-empty tuple of 'green', 'roof' or 'material'"
+        )
+    for kind in p:
+        if not isinstance(kind, str) or kind not in _INTERVENTION_KINDS:
+            raise ValueError(
+                "p members must be 'green', 'roof' or 'material'"
+            )
+    if any(p[index] >= p[index + 1] for index in range(len(p) - 1)):
+        raise ValueError("p must be strictly ascending without repeats")
+    u_value = _validate_finite_number(u, "u")
+    e_value = _validate_finite_number(e, "e")
+    v_value = _validate_finite_number(v, "v")
+    return r, w, t, p, u_value, e_value, v_value
+
+
+def _pareto_attr_sign_p(values: list[Decimal]) -> Decimal:
+    """Two-sided sign-flip p-value ``#{|sum(s_i x_i)/n| >= |mean|} / 2**n``.
+
+    ``|sum(s_i x_i)/n| >= |sum(x)/n|`` is equivalent (n > 0) to
+    ``|sum(s_i x_i)| >= |sum(x)|``, so the raw sums are compared and exact
+    ties at the observed sign vector are counted without any division.
+    """
+    n = len(values)
+    total = Decimal(0)
+    for value in values:
+        total += value
+    hits = 0
+    for mask in range(1 << n):
+        signed_sum = Decimal(0)
+        for index, value in enumerate(values):
+            if (mask >> index) & 1:
+                signed_sum -= value
+            else:
+                signed_sum += value
+        if abs(signed_sum) >= abs(total):
+            hits += 1
+    return Decimal(hits) / Decimal(1 << n)
+
+
+def pareto_attr(rows: list, *, alpha: float = 0.05) -> str:
+    """Sign-flip attribution tests for Pareto-pick metric levels.
+
+    ``rows`` is a list of strict ``(r, w, t, p, u, e, v)`` seven-tuples:
+    ``r`` and ``w`` are non-empty strings, ``t`` is a non-boolean
+    non-negative integer, ``p`` is a non-empty tuple whose members are
+    drawn from ``"green"``/``"roof"``/``"material"`` and appear in strictly
+    ascending order without repeats, and ``u`` (uhi), ``e`` (energy) and
+    ``v`` (vent) are finite non-boolean int/float numbers. The
+    ``(r, w, t, p)`` tuples must be unique. ``rows`` not being a list
+    raises ``TypeError``; every other contract violation raises
+    ``ValueError``. ``alpha`` is a finite non-boolean number with
+    ``0 < alpha <= 1``.
+
+    Rows are grouped by ``(r, w, p)``; each group must hold at most 16
+    rows or ``ValueError`` is raised. For every group and each of the
+    three metrics (``uhi``, ``energy``, ``vent`` in that order), with the
+    metric values ``x_i`` and ``n`` the group size, ``mean`` is
+    ``sum(x_i) / n`` and ``p`` is the exact two-sided sign-flip p-value
+    ``2 ** -n * #{|sum(s_i x_i) / n| >= |mean|}`` over all ``2 ** n``
+    sign vectors ``s_i`` in ``{-1, 1}``.
+
+    All ``3 * number_of_groups`` tests share one global
+    Benjamini-Hochberg pass: they rank ascending by
+    ``(p, r, w, p, metric order)`` and rank ``j`` (1-based) gets
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha`` compared on the unquantized values.
+
+    Numbers enter as ``Decimal(str(x))`` and arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
+    UTF-8 JSON string with no spaces and exactly one trailing newline;
+    the top-level key order is ``alpha, groups``, each group uses
+    ``region, window, pick, n, items`` and each item uses
+    ``metric, mean, p, q, reject``. Groups sort by ascending
+    ``r``/``w``/``p`` and items by ``uhi``, ``energy``, ``vent``;
+    ``pick`` is a string array, ``n`` a JSON integer and ``reject`` a
+    JSON boolean, while ``alpha``, ``mean``, ``p`` and ``q`` render with
+    six decimals, negative zero normalized to ``0.000000``. An empty
+    ``rows`` list yields ``"groups": []``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    groups: dict[
+        tuple[str, str, tuple[str, ...]],
+        list[tuple[int, Decimal, Decimal, Decimal]],
+    ] = {}
+    seen: set[tuple[object, ...]] = set()
+    for row in rows:
+        r, w, t, p, u_value, e_value, v_value = _pareto_attr_validate_row(row)
+        unique_key = (r, w, t, p)
+        if unique_key in seen:
+            raise ValueError(f"duplicate (r, w, t, p) tuple: {unique_key!r}")
+        seen.add(unique_key)
+        groups.setdefault((r, w, p), []).append(
+            (t, u_value, e_value, v_value)
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # group key -> (n, [(mean, p) per metric in uhi/energy/vent order])
+        stats: dict[
+            tuple[str, str, tuple[str, ...]],
+            tuple[int, list[tuple[Decimal, Decimal]]],
+        ] = {}
+        for key, members in groups.items():
+            n = len(members)
+            if n > _PERMUTATION_MAX_N:
+                raise ValueError(
+                    f"group {key!r} has {n} rows; pareto_attr requires at "
+                    f"most {_PERMUTATION_MAX_N} rows per group"
+                )
+            metric_stats: list[tuple[Decimal, Decimal]] = []
+            for metric_index in range(3):
+                values = [member[metric_index + 1] for member in members]
+                total = Decimal(0)
+                for value in values:
+                    total += value
+                mean = total / n
+                p_value = _pareto_attr_sign_p(values)
+                metric_stats.append((mean, p_value))
+            stats[key] = (n, metric_stats)
+
+        # Global Benjamini-Hochberg over every (group, metric) test, ranked
+        # by (p, r, w, p, metric order); accumulate N * p_l / l as a running
+        # minimum from the top rank down.
+        ranked = sorted(
+            (
+                p_value,
+                key[0],
+                key[1],
+                key[2],
+                metric_index,
+            )
+            for key, (_n, metric_stats) in stats.items()
+            for metric_index, (_mean, p_value) in enumerate(metric_stats)
+        )
+        count = len(ranked)
+        q_values: dict[
+            tuple[tuple[str, str, tuple[str, ...]], int], Decimal
+        ] = {}
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            p_value, r, w, p, metric_index = ranked[rank - 1]
+            candidate = Decimal(count) * p_value / rank
+            if candidate < running:
+                running = candidate
+            q_values[((r, w, p), metric_index)] = running
+
+        group_tokens: list[str] = []
+        for key in sorted(groups):
+            r, w, p = key
+            n, metric_stats = stats[key]
+            item_tokens: list[str] = []
+            for metric_index, metric_name in enumerate(_PARETO_ATTR_METRICS):
+                mean, p_value = metric_stats[metric_index]
+                q_value = q_values[(key, metric_index)]
+                reject = q_value <= alpha_value
+                item_tokens.append(
+                    '{"metric":' + json.dumps(metric_name, ensure_ascii=False)
+                    + ',"mean":' + _format6(mean)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + "}"
+                )
+            group_tokens.append(
+                '{"region":' + json.dumps(r, ensure_ascii=False)
+                + ',"window":' + json.dumps(w, ensure_ascii=False)
+                + ',"pick":' + _driver_plan_string_array(p)
+                + ',"n":' + str(n)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
 
 
 def effect_matrix_temporal_lag_report(
