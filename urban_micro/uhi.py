@@ -110,6 +110,7 @@ __all__ = [
     "pareto_attr",
     "pareto_attr_stability",
     "pareto_heterogeneity",
+    "pareto_region_compare",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -20383,6 +20384,10 @@ _PARETO_ATTR_METRICS = ("uhi", "energy", "vent")
 # the exact position-enumeration count must stay enumerable.
 _PARETO_HETERO_MAX_M = 10
 
+# A region-comparison pair pools two regions' windows; the exact
+# position-enumeration count must stay enumerable.
+_PARETO_REGION_COMPARE_MAX_M = 10
+
 
 def _pareto_attr_validate_row(
     row: object,
@@ -21124,6 +21129,301 @@ def pareto_heterogeneity(rows: list, *, alpha: float = 0.05) -> str:
             group_tokens.append(
                 '{"pick":' + _driver_plan_string_array(p)
                 + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+def _pareto_region_compare_p(
+    values_a: list[Decimal], values_b: list[Decimal]
+) -> tuple[Decimal, Decimal]:
+    """Exact two-sample position-enumeration comparison.
+
+    Returns ``(diff, p)`` with ``diff = mean_a - mean_b``. The pooled
+    ``n_a + n_b`` window means (region a's first, then region b's, each in
+    ascending-window order) are split between the two sides in every way
+    that gives side a exactly ``n_a`` of them -- the
+    ``C(n_a + n_b, n_a)`` equally likely allocations under
+    exchangeability. For each allocation ``diff' = mean_a' - mean_b'`` is
+    recomputed and ``p`` is the share with ``|diff'| >= |diff|``, ties
+    included.
+
+    With ``S_a`` the sum allocated to side a and ``S`` the pooled total,
+    ``mean_a' = S_a / n_a`` and ``mean_b' = (S - S_a) / n_b``, so
+    ``diff'`` is a strictly increasing affine function of ``S_a``; the
+    ``|diff'| >= |diff|`` test therefore compares the raw integer sums on
+    one shared decimal exponent, exactly as in
+    :func:`_pareto_heterogeneity_p`, without any division rounding.
+    """
+    n_a = len(values_a)
+    n_b = len(values_b)
+    m = n_a + n_b
+    pooled = values_a + values_b
+
+    common_exponent = min(value.as_tuple().exponent for value in pooled)
+    scaled = [int(value.scaleb(-common_exponent)) for value in pooled]
+    total_sum = sum(scaled)
+    observed_a_sum = sum(scaled[:n_a])
+    observed_diff_scaled = (
+        observed_a_sum * n_b - (total_sum - observed_a_sum) * n_a
+    )
+    threshold = abs(observed_diff_scaled)
+
+    hits = 0
+
+    def enumerate_allocations(
+        start: int, chosen: int, sum_a: int
+    ) -> None:
+        nonlocal hits
+        if chosen == n_a:
+            diff_scaled = sum_a * n_b - (total_sum - sum_a) * n_a
+            if abs(diff_scaled) >= threshold:
+                hits += 1
+            return
+        remaining_positions = m - start
+        remaining_choices = n_a - chosen
+        # Positions left to pick from, inclusive of ``start``.
+        if remaining_positions > remaining_choices:
+            enumerate_allocations(start + 1, chosen, sum_a)
+        enumerate_allocations(start + 1, chosen + 1, sum_a + scaled[start])
+
+    enumerate_allocations(0, 0, 0)
+
+    total = math.comb(m, n_a)
+    mean_a = sum(values_a, Decimal(0)) / n_a
+    mean_b = sum(values_b, Decimal(0)) / n_b
+    diff = mean_a - mean_b
+    return diff, Decimal(hits) / Decimal(total)
+
+
+def pareto_region_compare(rows: list, *, alpha: float = 0.05) -> str:
+    """Pairwise cross-region permutation comparisons for Pareto picks.
+
+    ``rows`` follows the exact same contract as :func:`pareto_attr`: a list
+    of strict ``(r, w, t, p, u, e, v)`` seven-tuples, unique
+    ``(r, w, t, p)`` tuples, at most 16 rows sharing one ``(r, w, p)``
+    key, ``alpha`` a finite non-boolean number with ``0 < alpha <= 1``;
+    ``rows`` not being a list raises ``TypeError`` and every other
+    contract violation raises ``ValueError``.
+
+    The three metrics are first averaged within every ``(r, w, p)`` group,
+    producing one window mean per distinct ``w``. Within each pick, every
+    pair of regions ``a < b`` is then compared metric by metric on the two
+    sides' window-mean samples of sizes ``n_a`` and ``n_b``; a pair with
+    ``n_a + n_b > 10`` raises ``ValueError``. With ``mean_a`` and ``mean_b``
+    the two sides' window-mean means, ``diff = mean_a - mean_b``. Under
+    exchangeability the pooled ``n_a + n_b`` positions are assigned to the
+    sides in every equal-capacity split -- ``C(n_a + n_b, n_a)`` equally
+    likely allocations, repeated values counted by position -- and ``p`` is
+    the proportion whose recomputed ``|diff'|`` is at least ``|diff|``.
+
+    All tests share one global Benjamini-Hochberg pass, exactly as in
+    :func:`pareto_heterogeneity`: they rank ascending by
+    ``(p, pick, a, b, metric order)`` and rank ``j`` (1-based) gets
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``; ``reject`` is
+    ``q <= alpha`` compared on the unquantized values. Within each
+    ``(pick, metric)``, ranks are assigned with rejected tests first, then
+    descending ``|diff|``, then ascending ``a`` and ``b``.
+
+    Numbers enter as ``Decimal(str(x))`` and arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
+    UTF-8 JSON string with no spaces and exactly one trailing newline;
+    the top-level key order is ``alpha, groups``, each group uses
+    ``pick, tests`` and each test uses
+    ``a, b, metric, n_a, n_b, diff, p, q, reject, rank``. Groups sort by
+    ascending ``p`` and tests by metric order (``uhi``, ``energy``,
+    ``vent``) then rank; ``pick`` is an ascending string array, ``n_a``,
+    ``n_b`` and ``rank`` are JSON integers and ``reject`` a JSON boolean,
+    while ``alpha``, ``diff``, ``p`` and ``q`` render with six decimals,
+    negative zero normalized to ``0.000000``. An empty ``rows`` list (or
+    no pick with two contributing regions) yields ``"groups": []``.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    # First pass: validate rows and collect the raw metrics within every
+    # (r, w, p) window group.
+    window_rows: dict[
+        tuple[str, str, tuple[str, ...]],
+        list[tuple[Decimal, Decimal, Decimal]],
+    ] = {}
+    seen: set[tuple[object, ...]] = set()
+    for row in rows:
+        r, w, t, p, u_value, e_value, v_value = _pareto_attr_validate_row(row)
+        unique_key = (r, w, t, p)
+        if unique_key in seen:
+            raise ValueError(f"duplicate (r, w, t, p) tuple: {unique_key!r}")
+        seen.add(unique_key)
+        window_rows.setdefault((r, w, p), []).append(
+            (u_value, e_value, v_value)
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # Average within each (r, w, p) window, producing one uhi/energy/vent
+        # window-mean triple per distinct w; then pool the window means by
+        # (p, r) with the windows kept in ascending w order.
+        window_means: dict[
+            tuple[str, str, tuple[str, ...]],
+            tuple[Decimal, Decimal, Decimal],
+        ] = {}
+        for (r, w, p), members in window_rows.items():
+            window_n = len(members)
+            if window_n > _PERMUTATION_MAX_N:
+                raise ValueError(
+                    f"group {(r, w, p)!r} has {window_n} rows; pareto_attr "
+                    f"requires at most {_PERMUTATION_MAX_N} rows per group"
+                )
+            means: list[Decimal] = []
+            for metric_index in range(3):
+                metric_total = Decimal(0)
+                for member in members:
+                    metric_total += member[metric_index]
+                means.append(metric_total / window_n)
+            window_means[(r, w, p)] = (means[0], means[1], means[2])
+
+        # pick -> region -> window triples in ascending w.
+        pick_region_map: dict[
+            tuple[str, ...],
+            dict[str, list[tuple[Decimal, Decimal, Decimal]]],
+        ] = {}
+        for (r, _w, p), means in window_means.items():
+            pick_region_map.setdefault(p, {}).setdefault(r, []).append(means)
+        # pick -> [(r, windows)] in ascending r, windows ascending by the
+        # order they were collected (ascending w).
+        pick_regions: dict[
+            tuple[str, ...],
+            list[tuple[str, list[tuple[Decimal, Decimal, Decimal]]]],
+        ] = {}
+        for p, by_region in pick_region_map.items():
+            ordered_regions = [
+                (r, by_region[r]) for r in sorted(by_region)
+            ]
+            if len(ordered_regions) >= 2:
+                pick_regions[p] = ordered_regions
+
+        # One test record per (pick, a, b, metric):
+        # (p, a, b, metric_index, n_a, n_b, diff, p_value).
+        tests: list[
+            tuple[
+                tuple[str, ...], str, str, int, int, int, Decimal, Decimal
+            ]
+        ] = []
+        for p, ordered_regions in pick_regions.items():
+            for left in range(len(ordered_regions)):
+                a, windows_a = ordered_regions[left]
+                for right in range(left + 1, len(ordered_regions)):
+                    b, windows_b = ordered_regions[right]
+                    n_a = len(windows_a)
+                    n_b = len(windows_b)
+                    if n_a + n_b > _PARETO_REGION_COMPARE_MAX_M:
+                        raise ValueError(
+                            f"pick {p!r} pair {(a, b)!r} pools "
+                            f"{n_a + n_b} windows; pareto_region_compare "
+                            f"requires at most {_PARETO_REGION_COMPARE_MAX_M} "
+                            f"pooled windows"
+                        )
+                    for metric_index in range(3):
+                        values_a = [
+                            window[metric_index] for window in windows_a
+                        ]
+                        values_b = [
+                            window[metric_index] for window in windows_b
+                        ]
+                        diff, p_value = _pareto_region_compare_p(
+                            values_a, values_b
+                        )
+                        tests.append(
+                            (p, a, b, metric_index, n_a, n_b, diff, p_value)
+                        )
+
+        # Global Benjamini-Hochberg over every test, ranked by
+        # (p, pick, a, b, metric order); accumulate N * p_l / l as a running
+        # minimum from the top rank down.
+        ranked = sorted(
+            tests,
+            key=lambda item: (
+                item[7], item[0], item[1], item[2], item[3],
+            ),
+        )
+        count = len(ranked)
+        q_values: dict[
+            tuple[tuple[str, ...], str, str, int], Decimal
+        ] = {}
+        running = Decimal(1)
+        for rank_index in range(count, 0, -1):
+            (p, a, b, metric_index, _n_a, _n_b, _diff,
+             p_value) = ranked[rank_index - 1]
+            candidate = Decimal(count) * p_value / rank_index
+            if candidate < running:
+                running = candidate
+            q_values[(p, a, b, metric_index)] = running
+
+        # Per-(pick, metric) ranks: rejected tests first, then descending
+        # |diff|, then ascending a and b.
+        test_ranks: dict[
+            tuple[tuple[str, ...], str, str, int], int
+        ] = {}
+        for p in pick_regions:
+            for metric_index in range(3):
+                group_tests = [
+                    item for item in tests
+                    if item[0] == p and item[3] == metric_index
+                ]
+                ordered = sorted(
+                    group_tests,
+                    key=lambda item: (
+                        q_values[(p, item[1], item[2], metric_index)]
+                        > alpha_value,
+                        -abs(item[6]),
+                        item[1],
+                        item[2],
+                    ),
+                )
+                for rank, item in enumerate(ordered, start=1):
+                    test_ranks[(p, item[1], item[2], metric_index)] = rank
+
+        group_tokens: list[str] = []
+        for p in sorted(pick_regions):
+            # Tests sort by metric order then rank.
+            group_tests = sorted(
+                (item for item in tests if item[0] == p),
+                key=lambda item: (
+                    item[3],
+                    test_ranks[(p, item[1], item[2], item[3])],
+                ),
+            )
+            test_tokens: list[str] = []
+            for (pick, a, b, metric_index, n_a, n_b, diff,
+                 p_value) in group_tests:
+                q_value = q_values[(p, a, b, metric_index)]
+                reject = q_value <= alpha_value
+                rank = test_ranks[(p, a, b, metric_index)]
+                metric_name = _PARETO_ATTR_METRICS[metric_index]
+                test_tokens.append(
+                    '{"a":' + json.dumps(a, ensure_ascii=False)
+                    + ',"b":' + json.dumps(b, ensure_ascii=False)
+                    + ',"metric":' + json.dumps(metric_name, ensure_ascii=False)
+                    + ',"n_a":' + str(n_a)
+                    + ',"n_b":' + str(n_b)
+                    + ',"diff":' + _format6(diff)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+            group_tokens.append(
+                '{"pick":' + _driver_plan_string_array(p)
+                + ',"tests":[' + ",".join(test_tokens) + "]}"
             )
 
     return (
