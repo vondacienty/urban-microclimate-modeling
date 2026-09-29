@@ -107,6 +107,7 @@ __all__ = [
     "driver_attr_stability_summary",
     "driver_link",
     "driver_plan",
+    "pareto_attr",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -24455,4 +24456,190 @@ def surface_thermal_zone_scenario_report(
             + ',"post":"' + _format6(urban[1] - rural[1]) + '"'
             + ',"delta":"' + _format6(urban[2] - rural[2]) + '"'
             + '}}'
+        )
+
+
+_PARETO_ATTR_METRICS = ("uhi", "energy", "vent")
+_PARETO_ATTR_KINDS = ("green", "roof", "material")
+_PARETO_ATTR_MAX_N = 16
+
+
+def pareto_attr(rows: list, *, alpha: float = 0.05) -> str:
+    """Sign-flip mean tests with a global BH pass over pareto pick groups.
+
+    ``rows`` is a list of strict ``(r, w, t, p, u, e, v)`` seven-tuples:
+    ``r``/``w`` are non-empty strings (region/window), ``t`` is a
+    non-boolean non-negative integer, ``p`` is a non-empty tuple whose
+    members are only ``"green"``, ``"roof"`` and ``"material"`` in strictly
+    ascending order without duplicates, and ``u``/``e``/``v`` are finite
+    non-boolean int/float numbers (the UHI/energy/ventilation metrics).
+    The ``(r, w, t, p)`` quadruple must be unique across rows. ``rows`` not
+    being a list raises ``TypeError``; every other contract violation,
+    including an ``alpha`` that is not a finite non-boolean number with
+    ``0 < alpha <= 1``, raises ``ValueError``.
+
+    Rows are grouped by ``(r, w, p)``; a group with more than 16 rows
+    raises ``ValueError``. With ``n`` the group size and ``x`` the per-row
+    values of a metric, ``mean`` is ``sum(x) / n`` and ``p`` is the exact
+    two-sided sign-flip p-value
+    ``p = 2 ** -n * #{|sum(s_i * x_i) / n| >= |mean|}`` over all
+    ``2 ** n`` sign vectors ``s_i`` in ``{-1, 1}``.
+
+    Every ``(group, metric)`` hypothesis enters one global
+    Benjamini-Hochberg pass ranked ascending by
+    ``(p, r, w, p, metric)`` with metrics in ``uhi``/``energy``/``vent``
+    order: ``q_j = min(1, min_{l >= j}(N * p_l / l))`` and a hypothesis
+    ``reject``s when ``q <= alpha`` (compared on the unquantized values).
+
+    Numbers enter as ``Decimal(str(x))``; means, sign-flip ratios and the
+    BH step run under a precision-1000, ROUND_HALF_EVEN local context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups``, each
+    group uses ``region, window, pick, n, items`` and each item uses
+    ``metric, mean, p, q, reject``. Groups sort ascending by
+    ``(region, window, pick)`` and each group's items sort
+    ``uhi``/``energy``/``vent``; ``pick`` is an array of strings, ``n``
+    renders as an integer and ``reject`` as a boolean while every other
+    number renders with exactly six decimals, negative zero normalized to
+    ``0.000000``. An empty ``rows`` yields ``groups`` empty.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    grouped: dict[tuple[str, str, tuple[str, ...]], list[tuple]] = {}
+    seen: set[tuple[str, str, int, tuple[str, ...]]] = set()
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) != 7:
+            raise ValueError("each row must be an (r, w, t, p, u, e, v) seven-tuple")
+        region, window, timestamp, pick = row[0], row[1], row[2], row[3]
+        if not isinstance(region, str) or not region:
+            raise ValueError("r must be a non-empty string")
+        if not isinstance(window, str) or not window:
+            raise ValueError("w must be a non-empty string")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+            raise ValueError("t must be a non-boolean non-negative integer")
+        if timestamp < 0:
+            raise ValueError("t must be non-negative")
+        if not isinstance(pick, tuple) or not pick:
+            raise ValueError(
+                "p must be a non-empty tuple of green/roof/material members"
+            )
+        previous_kind: str | None = None
+        for kind in pick:
+            if kind not in _PARETO_ATTR_KINDS:
+                raise ValueError("p members must be only green, roof or material")
+            if previous_kind is not None and kind <= previous_kind:
+                raise ValueError("p members must be ascending without duplicates")
+            previous_kind = kind
+        values = tuple(
+            _validate_finite_number(value, name)
+            for value, name in zip(row[4:], _PARETO_ATTR_METRICS)
+        )
+        unique_key = (region, window, timestamp, pick)
+        if unique_key in seen:
+            raise ValueError(f"duplicate (r, w, t, p) row: {unique_key!r}")
+        seen.add(unique_key)
+        grouped.setdefault((region, window, pick), []).append(values)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # group key -> {metric: (n, mean, p)}
+        stats: dict[
+            tuple[str, str, tuple[str, ...]],
+            dict[str, tuple[int, Decimal, Decimal]],
+        ] = {}
+        for group_key, entries in grouped.items():
+            n = len(entries)
+            if n > _PARETO_ATTR_MAX_N:
+                raise ValueError(
+                    f"group {group_key!r} has {n} rows; pareto_attr requires "
+                    f"at most {_PARETO_ATTR_MAX_N} rows per group"
+                )
+            metric_stats: dict[str, tuple[int, Decimal, Decimal]] = {}
+            for metric_index, metric in enumerate(_PARETO_ATTR_METRICS):
+                xs = [entry[metric_index] for entry in entries]
+                total = Decimal(0)
+                for x in xs:
+                    total += x
+                mean = total / n
+
+                # |sum(s_i * x_i) / n| >= |mean| is equivalent (n > 0) to
+                # |sum(s_i * x_i)| >= |sum(x_i)|; compare the raw sums so
+                # exact ties are decided without any division rounding.
+                hits = 0
+                for mask in range(1 << n):
+                    signed_sum = Decimal(0)
+                    for index, x in enumerate(xs):
+                        if (mask >> index) & 1:
+                            signed_sum -= x
+                        else:
+                            signed_sum += x
+                    if abs(signed_sum) >= abs(total):
+                        hits += 1
+                p_value = Decimal(hits) / Decimal(1 << n)
+                metric_stats[metric] = (n, mean, p_value)
+            stats[group_key] = metric_stats
+
+        # One global BH pass over every (group, metric) test: ascending p,
+        # then region, window, pick, then uhi/energy/vent.
+        test_keys: list[tuple[tuple[str, str, tuple[str, ...]], str]] = [
+            (group_key, metric)
+            for group_key, metric_stats in stats.items()
+            for metric in _PARETO_ATTR_METRICS
+        ]
+        test_keys.sort(
+            key=lambda item: (
+                stats[item[0]][item[1]][2],
+                item[0][0],
+                item[0][1],
+                item[0][2],
+                _PARETO_ATTR_METRICS.index(item[1]),
+            )
+        )
+        count = len(test_keys)
+        q_values: dict[tuple[tuple[str, str, tuple[str, ...]], str], Decimal] = {}
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            group_key, metric = test_keys[rank - 1]
+            candidate = (
+                Decimal(count) * stats[group_key][metric][2] / Decimal(rank)
+            )
+            if candidate < running:
+                running = candidate
+            q_values[(group_key, metric)] = min(Decimal(1), running)
+
+        group_tokens: list[str] = []
+        for group_key in sorted(stats):
+            region, window, pick = group_key
+            n = len(grouped[group_key])
+            item_tokens: list[str] = []
+            for metric in _PARETO_ATTR_METRICS:
+                _n, mean, p_value = stats[group_key][metric]
+                q_value = q_values[(group_key, metric)]
+                reject = q_value <= alpha_value
+                item_tokens.append(
+                    '{"metric":' + json.dumps(metric, ensure_ascii=False)
+                    + ',"mean":' + _format6(mean)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + "}"
+                )
+            group_tokens.append(
+                '{"region":' + json.dumps(region, ensure_ascii=False)
+                + ',"window":' + json.dumps(window, ensure_ascii=False)
+                + ',"pick":'
+                + json.dumps(list(pick), ensure_ascii=False, separators=(",", ":"))
+                + ',"n":' + str(n)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+        return (
+            '{"alpha":' + _format6(alpha_value)
+            + ',"groups":[' + ",".join(group_tokens) + "]}\n"
         )
