@@ -112,6 +112,7 @@ __all__ = [
     "pareto_heterogeneity",
     "pareto_region_compare",
     "pareto_region_stability",
+    "region_attr",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -21782,6 +21783,421 @@ def pareto_region_stability(reports: dict) -> str:
                         + ',"rank":' + str(rank)
                         + "}"
                     )
+            group_tokens.append(
+                '{"pick":' + _driver_plan_string_array(pick)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_REGION_ATTR_FACTORS = ("weather", "morph", "cover")
+_REGION_ATTR_MAX_N = 8
+_REGION_ATTR_ERROR = (
+    "report must be a pareto_region_stability JSON output"
+)
+
+
+def _region_attr_stability_output_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    dict[
+        tuple[str, ...],
+        list[tuple[str, str, int, int, Decimal, Decimal, Decimal]],
+    ],
+]:
+    """Parse one canonical :func:`pareto_region_stability` JSON output.
+
+    Returns ``(alpha, groups)`` mapping each pick to its items in the
+    canonical metric-then-rank order; each item is
+    ``(a, b, metric_index, rank, mean, consistency, significant)``. The
+    input must be byte-for-byte identical to a canonical output (key
+    order, escaping, block and rank order and the six-decimal number
+    tokens included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_REGION_ATTR_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_REGION_ATTR_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_REGION_ATTR_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_REGION_ATTR_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_REGION_ATTR_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_REGION_ATTR_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_REGION_ATTR_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_REGION_ATTR_ERROR)
+
+    groups: dict[
+        tuple[str, ...],
+        list[tuple[str, str, int, int, Decimal, Decimal, Decimal]],
+    ] = {}
+    group_tokens: list[str] = []
+    previous_pick: tuple[str, ...] | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"pick", "items"}:
+            raise ValueError(_REGION_ATTR_ERROR)
+        raw_pick = group["pick"]
+        raw_items = group["items"]
+        if not isinstance(raw_pick, list) or not raw_pick or any(
+            not isinstance(kind, str) or kind not in _INTERVENTION_KINDS
+            for kind in raw_pick
+        ):
+            raise ValueError(_REGION_ATTR_ERROR)
+        if any(
+            raw_pick[index] >= raw_pick[index + 1]
+            for index in range(len(raw_pick) - 1)
+        ):
+            raise ValueError(_REGION_ATTR_ERROR)
+        pick = tuple(raw_pick)
+        if previous_pick is not None and pick <= previous_pick:
+            raise ValueError(_REGION_ATTR_ERROR)
+        previous_pick = pick
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError(_REGION_ATTR_ERROR)
+
+        items: list[
+            tuple[str, str, int, int, Decimal, Decimal, Decimal]
+        ] = []
+        item_tokens: list[str] = []
+        pair_sets: dict[int, set[tuple[str, str]]] = {}
+        block = -1
+        expected_rank = 1
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {
+                "a", "b", "mean", "direction", "consistency",
+                "significant", "rank",
+            }:
+                raise ValueError(_REGION_ATTR_ERROR)
+            a = item["a"]
+            b = item["b"]
+            mean = item["mean"]
+            direction = item["direction"]
+            consistency = item["consistency"]
+            significant = item["significant"]
+            rank = item["rank"]
+            if (
+                not isinstance(a, str)
+                or not a
+                or not isinstance(b, str)
+                or not b
+                or a >= b
+                or not isinstance(mean, _RankTrajectoryNumber)
+                or direction not in ("down", "up", "flat")
+                or not isinstance(consistency, _RankTrajectoryNumber)
+                or consistency < 0
+                or consistency > 1
+                or not isinstance(significant, _RankTrajectoryNumber)
+                or significant < 0
+                or significant > 1
+                or isinstance(rank, bool)
+                or not isinstance(rank, int)
+                or rank < 1
+            ):
+                raise ValueError(_REGION_ATTR_ERROR)
+            # Items carry no metric tag: a rank of 1 opens the next
+            # uhi/energy/vent block and ranks run 1..pair count within it.
+            if rank == 1:
+                block += 1
+                expected_rank = 1
+                if block > 2:
+                    raise ValueError(_REGION_ATTR_ERROR)
+            if block < 0 or rank != expected_rank:
+                raise ValueError(_REGION_ATTR_ERROR)
+            expected_rank += 1
+            pair = (a, b)
+            if pair in pair_sets.setdefault(block, set()):
+                raise ValueError(_REGION_ATTR_ERROR)
+            pair_sets[block].add(pair)
+            if mean < 0:
+                canonical_direction = "down"
+            elif mean > 0:
+                canonical_direction = "up"
+            else:
+                canonical_direction = "flat"
+            if direction != canonical_direction:
+                raise ValueError(_REGION_ATTR_ERROR)
+            items.append(
+                (a, b, block, rank, mean, consistency, significant)
+            )
+            item_tokens.append(
+                '{"a":' + json.dumps(a, ensure_ascii=False)
+                + ',"b":' + json.dumps(b, ensure_ascii=False)
+                + ',"mean":' + _format6(mean)
+                + ',"direction":'
+                + json.dumps(canonical_direction, ensure_ascii=False)
+                + ',"consistency":' + _format6(consistency)
+                + ',"significant":' + _format6(significant)
+                + ',"rank":' + str(rank)
+                + "}"
+            )
+
+        # Every non-empty pick carries one uhi/energy/vent block, all over
+        # the same region pairs with per-block ranks a permutation of
+        # 1..pair count in strictly ascending (canonical) order.
+        if set(pair_sets) != {0, 1, 2}:
+            raise ValueError(_REGION_ATTR_ERROR)
+        pair_set = pair_sets[0]
+        for metric_index in (1, 2):
+            if pair_sets[metric_index] != pair_set:
+                raise ValueError(_REGION_ATTR_ERROR)
+
+        groups[pick] = items
+        group_tokens.append(
+            '{"pick":' + _driver_plan_string_array(pick)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_REGION_ATTR_ERROR)
+
+    return alpha, groups
+
+
+def region_attr(report: str, drivers: dict) -> str:
+    """Attribute region stability to weather/morph/cover drivers.
+
+    ``report`` must be a byte-for-byte canonical
+    :func:`pareto_region_stability` JSON output and ``drivers`` a dict
+    whose keys are exactly the report's region names. Each value is a
+    ``(weather, morph, cover)`` three-tuple of finite non-boolean
+    int/float numbers. A non-string ``report`` or a non-dict ``drivers``
+    raises ``TypeError``; every other violation raises ``ValueError``. An
+    empty report is accepted only with ``drivers == {}``.
+
+    Only the ``uhi`` metric items are used. For a region pair ``(a, b)``
+    the factor value is ``x = driver[a][factor] - driver[b][factor]`` and
+    ``y = mean * consistency * significant / rank`` from the report;
+    ``n`` is the number of region pairs in the pick and a pick with more
+    than eight pairs raises ``ValueError``. The Pearson correlation is
+    ``effect = sum((x - x_bar)(y - y_bar)) / sqrt(sum((x - x_bar)**2)
+    sum((y - y_bar)**2))``. If either sum of squares is zero the result
+    is ``(effect, p) = (0, 1)``; otherwise all ``n!`` positional
+    permutations of ``y`` (duplicates counted) are enumerated and ``p``
+    is the proportion with ``|effect'| >= |effect|``.
+
+    Every ``(pick, factor)`` test enters one global Benjamini-Hochberg
+    pass ordered by ascending ``p`` with pick then weather/morph/cover
+    factor order breaking ties:
+    ``q_j = min(1, min_{l >= j}(N * p_l / l))``; a test ``reject``s when
+    ``q`` is no greater than the report's ``alpha``. Within each pick
+    factors are ranked with rejected tests first, then descending
+    ``|effect|``, then weather/morph/cover factor order.
+
+    Numbers enter as ``Decimal(str(x))``; products, correlations,
+    permutation ratios and the BH step run under a precision-1000,
+    ROUND_HALF_EVEN local context and comparisons use the unquantized
+    values. Returns a compact UTF-8 JSON string with no spaces and
+    exactly one trailing newline; the top-level key order is
+    ``alpha, groups``, each group uses ``pick, items`` and each item uses
+    ``factor, n, effect, p, q, reject, rank``. Groups sort by ascending
+    pick and items by rank; ``pick`` is an ascending string array,
+    ``n`` and ``rank`` render as JSON integers and ``reject`` as a JSON
+    boolean while ``alpha``, ``effect``, ``p`` and ``q`` render with six
+    decimals, negative zero normalized to ``0.000000``. A report without
+    groups yields ``groups`` empty.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(drivers, dict):
+        raise TypeError("drivers must be a dict")
+    alpha, groups = _region_attr_stability_output_parse(report)
+
+    report_regions: set[str] = {
+        region
+        for items in groups.values()
+        for a, b, metric, *_ in items
+        if metric == 0
+        for region in (a, b)
+    }
+    if not groups:
+        if drivers:
+            raise ValueError("an empty report accepts only drivers == {}")
+    elif set(drivers) != report_regions:
+        raise ValueError(
+            "drivers keys must be exactly the report region names"
+        )
+
+    factor_values: dict[str, dict[str, Decimal]] = {}
+    for region in drivers:
+        entry = drivers[region]
+        if not isinstance(entry, tuple) or len(entry) != 3:
+            raise ValueError(
+                "drivers values must be (weather, morph, cover) tuples"
+            )
+        factor_values[region] = {
+            factor: _validate_finite_number(value, factor)
+            for factor, value in zip(_REGION_ATTR_FACTORS, entry)
+        }
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # One record per pick, holding the uhi block in ascending
+        # (a, b) pair order: (a, b, rank, mean, consistency, significant).
+        pick_records: dict[
+            tuple[str, ...],
+            list[tuple[str, str, int, Decimal, Decimal, Decimal]],
+        ] = {}
+        for pick, items in groups.items():
+            uhi = [
+                (a, b, rank, mean, consistency, significant)
+                for a, b, metric, rank, mean, consistency, significant
+                in items
+                if metric == 0
+            ]
+            uhi.sort(key=lambda record: (record[0], record[1]))
+            pick_records[pick] = uhi
+
+        # (pick, factor) -> (n, effect, p)
+        tests: dict[
+            tuple[tuple[str, ...], str], tuple[int, Decimal, Decimal]
+        ] = {}
+        ordered: list[tuple[Decimal, tuple[str, ...], int]] = []
+        for pick, records in pick_records.items():
+            n = len(records)
+            if n > _REGION_ATTR_MAX_N:
+                raise ValueError(
+                    "a single pick may hold at most "
+                    f"{_REGION_ATTR_MAX_N} region pairs: {pick!r} holds {n}"
+                )
+            n_decimal = Decimal(n)
+            ys = [
+                mean * consistency * significant / Decimal(rank)
+                for _a, _b, rank, mean, consistency, significant
+                in records
+            ]
+            y_bar = sum(ys, Decimal(0)) / n_decimal
+            syy = sum(
+                (y_value - y_bar) * (y_value - y_bar) for y_value in ys
+            )
+            y_constant = syy == 0
+            for factor_index, factor in enumerate(_REGION_ATTR_FACTORS):
+                xs = [
+                    factor_values[a][factor] - factor_values[b][factor]
+                    for a, b, *_ in records
+                ]
+                x_bar = sum(xs, Decimal(0)) / n_decimal
+                sxx = sum(
+                    (x_value - x_bar) * (x_value - x_bar)
+                    for x_value in xs
+                )
+                if sxx == 0 or y_constant:
+                    effect = Decimal(0)
+                    p = Decimal(1)
+                else:
+                    x_centered = [x_value - x_bar for x_value in xs]
+                    y_centered = [y_value - y_bar for y_value in ys]
+                    sxy = sum(
+                        dx * dy
+                        for dx, dy in zip(x_centered, y_centered)
+                    )
+                    effect = sxy / (sxx * syy).sqrt()
+                    # |effect'| >= |effect| is decided as
+                    # sxy_perm**2 * syy >= sxy**2 * syy_perm (all factors
+                    # positive), which needs no square root and keeps the
+                    # observed self-tie exact.
+                    observed_left = sxy * sxy
+                    tail = 0
+                    for permuted in permutations(y_centered):
+                        permuted_sxy = sum(
+                            dx * dy_permuted
+                            for dx, dy_permuted
+                            in zip(x_centered, permuted)
+                        )
+                        permuted_syy = sum(
+                            dy_permuted * dy_permuted
+                            for dy_permuted in permuted
+                        )
+                        if (
+                            permuted_sxy * permuted_sxy * syy
+                            >= observed_left * permuted_syy
+                        ):
+                            tail += 1
+                    p = Decimal(tail) / Decimal(math.factorial(n))
+                tests[(pick, factor)] = (n, effect, p)
+                ordered.append((p, pick, factor_index))
+
+        # One global BH pass over every (pick, factor) test: ascending p,
+        # then ascending pick, then weather/morph/cover factor order.
+        ordered.sort(key=lambda item: (item[0], item[1], item[2]))
+        tested = len(ordered)
+        q_values: dict[
+            tuple[tuple[str, ...], str], Decimal
+        ] = {}
+        running = Decimal(1)
+        for rank_index in range(tested, 0, -1):
+            p, pick, factor_index = ordered[rank_index - 1]
+            candidate = Decimal(tested) * p / Decimal(rank_index)
+            if candidate < running:
+                running = candidate
+            q_values[(pick, _REGION_ATTR_FACTORS[factor_index])] = min(
+                Decimal(1), running
+            )
+
+        group_tokens: list[str] = []
+        for pick in sorted(pick_records):
+            # Rejected first, then descending |effect|, factor order ties.
+            ranked_factors = sorted(
+                _REGION_ATTR_FACTORS,
+                key=lambda factor: (
+                    0 if q_values[(pick, factor)] <= alpha else 1,
+                    -abs(tests[(pick, factor)][1]),
+                    _REGION_ATTR_FACTORS.index(factor),
+                ),
+            )
+            item_tokens: list[str] = []
+            for rank, factor in enumerate(ranked_factors, start=1):
+                n, effect, p = tests[(pick, factor)]
+                q = q_values[(pick, factor)]
+                reject = q <= alpha
+                item_tokens.append(
+                    '{"factor":' + json.dumps(factor, ensure_ascii=False)
+                    + ',"n":' + str(n)
+                    + ',"effect":' + _format6(effect)
+                    + ',"p":' + _format6(p)
+                    + ',"q":' + _format6(q)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
             group_tokens.append(
                 '{"pick":' + _driver_plan_string_array(pick)
                 + ',"items":[' + ",".join(item_tokens) + "]}"
