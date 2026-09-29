@@ -49,7 +49,7 @@ def _reference(report, drivers):
     payload = json.loads(report)
     alpha = Fraction(str(payload["alpha"]))
 
-    # pick -> uhi records in ascending (a, b) order, each
+    # pick -> uhi records in the stability report's own rank order, each
     # (a, b, rank, y).
     per_pick = {}
     for group in payload["groups"]:
@@ -64,7 +64,6 @@ def _reference(report, drivers):
                     break
                 seen_restart = True
             uhi_items.append(item)
-        ordered = sorted(uhi_items, key=lambda it: (it["a"], it["b"]))
         per_pick[pick] = [
             (
                 item["a"],
@@ -75,7 +74,7 @@ def _reference(report, drivers):
                 * Fraction(str(item["significant"]))
                 / Fraction(item["rank"]),
             )
-            for item in ordered
+            for item in uhi_items
         ]
 
     tests = {}

@@ -113,6 +113,7 @@ __all__ = [
     "pareto_region_compare",
     "pareto_region_stability",
     "region_attr",
+    "region_attr_layer_report",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -22001,8 +22002,11 @@ def region_attr(report: str, drivers: dict) -> str:
     raises ``TypeError``; every other violation raises ``ValueError``. An
     empty report is accepted only with ``drivers == {}``.
 
-    Only the ``uhi`` metric items are used. For a region pair ``(a, b)``
-    the factor value is ``x = driver[a][factor] - driver[b][factor]`` and
+    Only the ``uhi`` metric items are used, taken positionally in the
+    stability report's own rank order -- the pairs are never reordered by
+    ``(a, b)``, so the reported rank sequence is what feeds the
+    correlation. For a region pair ``(a, b)`` the factor value is
+    ``x = driver[a][factor] - driver[b][factor]`` and
     ``y = mean * consistency * significant / rank`` from the report;
     ``n`` is the number of region pairs in the pick and a pick with more
     than eight pairs raises ``ValueError``. The Pearson correlation is
@@ -22070,21 +22074,22 @@ def region_attr(report: str, drivers: dict) -> str:
         ctx.prec = _MODEL_PRECISION
         ctx.rounding = ROUND_HALF_EVEN
 
-        # One record per pick, holding the uhi block in ascending
-        # (a, b) pair order: (a, b, rank, mean, consistency, significant).
+        # One record per pick, holding the uhi block in the stability
+        # report's own rank order:
+        # (a, b, rank, mean, consistency, significant). The pairs are not
+        # reordered by (a, b): the rank ordering is part of the report and
+        # must feed y (and the factor differences) positionally.
         pick_records: dict[
             tuple[str, ...],
             list[tuple[str, str, int, Decimal, Decimal, Decimal]],
         ] = {}
         for pick, items in groups.items():
-            uhi = [
+            pick_records[pick] = [
                 (a, b, rank, mean, consistency, significant)
                 for a, b, metric, rank, mean, consistency, significant
                 in items
                 if metric == 0
             ]
-            uhi.sort(key=lambda record: (record[0], record[1]))
-            pick_records[pick] = uhi
 
         # (pick, factor) -> (n, effect, p)
         tests: dict[
@@ -22200,6 +22205,386 @@ def region_attr(report: str, drivers: dict) -> str:
                 )
             group_tokens.append(
                 '{"pick":' + _driver_plan_string_array(pick)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_REGION_ATTR_LAYER_REPORTS_MIN = 2
+_REGION_ATTR_LAYER_REPORTS_MAX = 16
+_REGION_ATTR_LAYER_ERROR = (
+    "reports must map non-empty string keys to region_attr JSON outputs"
+)
+
+
+def _region_attr_layer_output_parse(raw: object) -> tuple[
+    Decimal, dict[tuple[tuple[str, ...], str], Decimal]
+]:
+    """Parse one byte-for-byte canonical :func:`region_attr` JSON output.
+
+    Returns ``(alpha, effects)`` mapping each ``(pick, factor)`` identity
+    to its six-decimal ``effect``. The input must reproduce a canonical
+    output exactly (key order, escaping, pick and rank order and the
+    six-decimal number tokens included); any deviation raises
+    ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_REGION_ATTR_LAYER_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_REGION_ATTR_LAYER_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_REGION_ATTR_LAYER_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_REGION_ATTR_LAYER_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_REGION_ATTR_LAYER_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_REGION_ATTR_LAYER_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_REGION_ATTR_LAYER_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_REGION_ATTR_LAYER_ERROR)
+
+    effects: dict[tuple[tuple[str, ...], str], Decimal] = {}
+    group_tokens: list[str] = []
+    previous_pick: tuple[str, ...] | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"pick", "items"}:
+            raise ValueError(_REGION_ATTR_LAYER_ERROR)
+        raw_pick = group["pick"]
+        raw_items = group["items"]
+        if not isinstance(raw_pick, list) or not raw_pick or any(
+            not isinstance(kind, str) or kind not in _INTERVENTION_KINDS
+            for kind in raw_pick
+        ):
+            raise ValueError(_REGION_ATTR_LAYER_ERROR)
+        if any(
+            raw_pick[index] >= raw_pick[index + 1]
+            for index in range(len(raw_pick) - 1)
+        ):
+            raise ValueError(_REGION_ATTR_LAYER_ERROR)
+        pick = tuple(raw_pick)
+        if previous_pick is not None and pick <= previous_pick:
+            raise ValueError(_REGION_ATTR_LAYER_ERROR)
+        previous_pick = pick
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError(_REGION_ATTR_LAYER_ERROR)
+
+        item_tokens: list[str] = []
+        seen_factors: set[str] = set()
+        for rank, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict) or set(item) != {
+                "factor", "n", "effect", "p", "q", "reject", "rank",
+            }:
+                raise ValueError(_REGION_ATTR_LAYER_ERROR)
+            factor = item["factor"]
+            n = item["n"]
+            effect = item["effect"]
+            p_value = item["p"]
+            q_value = item["q"]
+            reject = item["reject"]
+            item_rank = item["rank"]
+            if (
+                factor not in _REGION_ATTR_FACTORS
+                or factor in seen_factors
+                or isinstance(n, bool)
+                or not isinstance(n, int)
+                or not 1 <= n <= _REGION_ATTR_MAX_N
+                or not isinstance(effect, _RankTrajectoryNumber)
+                or effect < -1
+                or effect > 1
+                or not isinstance(p_value, _RankTrajectoryNumber)
+                or p_value < 0
+                or p_value > 1
+                or not isinstance(q_value, _RankTrajectoryNumber)
+                or q_value < 0
+                or q_value > 1
+                or not isinstance(reject, bool)
+                or isinstance(item_rank, bool)
+                or not isinstance(item_rank, int)
+                or item_rank != rank
+            ):
+                raise ValueError(_REGION_ATTR_LAYER_ERROR)
+            seen_factors.add(factor)
+            item_tokens.append(
+                '{"factor":' + json.dumps(factor, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"effect":' + _format6(effect)
+                + ',"p":' + _format6(p_value)
+                + ',"q":' + _format6(q_value)
+                + ',"reject":' + ("true" if reject else "false")
+                + ',"rank":' + str(item_rank)
+                + "}"
+            )
+
+        # Exactly the three factors, each once, in some rank order, all
+        # over the same region-pair count.
+        if seen_factors != set(_REGION_ATTR_FACTORS):
+            raise ValueError(_REGION_ATTR_LAYER_ERROR)
+        group_n = {item["n"] for item in raw_items}
+        if len(group_n) != 1:
+            raise ValueError(_REGION_ATTR_LAYER_ERROR)
+        for item in raw_items:
+            effects[(pick, item["factor"])] = item["effect"]
+
+        group_tokens.append(
+            '{"pick":' + _driver_plan_string_array(pick)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_REGION_ATTR_LAYER_ERROR)
+
+    return alpha, effects
+
+
+def region_attr_layer_report(reports: dict, layers: dict) -> str:
+    """Aggregate :func:`region_attr` outputs across named layers.
+
+    ``reports`` is a dict of 2 to 16 entries; every key must be a
+    non-empty string naming a layer and every value a byte-for-byte
+    canonical :func:`region_attr` JSON output. All reports must share one
+    ``alpha`` and one set of tested ``(pick, factor)`` identities
+    (reports with empty groups are allowed, but then every report must be
+    empty). ``layers`` is a dict keyed by exactly the same non-empty
+    layer names; each value is a ``(weather, morph, cover)`` three-tuple
+    of non-empty strings. A non-dict ``reports`` or ``layers`` raises
+    ``TypeError``; every other violation raises ``ValueError``.
+
+    For every ``(layer, category, pick, factor)`` the layer's category
+    string and the report's six-decimal ``effect`` ``x`` are collected;
+    ``n`` is the number of samples and ``mean = sum(x) / n``. All
+    ``2 ** n`` sign vectors are enumerated and ``p`` is the proportion
+    with ``abs(sum(s_i * x_i) / n) >= abs(mean)``, compared on the
+    original values. Every test enters one global Benjamini-Hochberg
+    pass ordered by ``(p, layer order, category, pick, factor order)``
+    where layer order is the ``weather``/``morph``/``cover`` sequence of
+    the layer tuples: ``q_j = min(1, min_{l >= j}(N * p_l / l))`` and a
+    test ``reject``s when ``q`` is no greater than the shared ``alpha``.
+
+    Numbers enter as ``Decimal(str(x))`` and the means, sign ratios and
+    BH step run under a precision-1000, ROUND_HALF_EVEN local context.
+    Returns a compact UTF-8 JSON string with no spaces and exactly one
+    trailing newline; the top-level key order is ``alpha, groups``, each
+    group uses ``by, key, items`` and each item uses
+    ``pick, factor, n, mean, p, q, reject``. Groups sort by the
+    weather/morph/cover layer order then ``key`` and items by ascending
+    ``pick`` then weather/morph/cover factor order; ``pick`` is an
+    ascending string array, ``n`` renders as a JSON integer and
+    ``reject`` as a JSON boolean while ``alpha``, ``mean``, ``p`` and
+    ``q`` render with six decimals, negative zero normalized to
+    ``0.000000``.
+    """
+    if not isinstance(reports, dict):
+        raise TypeError("reports must be a dict")
+    if not isinstance(layers, dict):
+        raise TypeError("layers must be a dict")
+    if not _REGION_ATTR_LAYER_REPORTS_MIN <= len(reports) <= (
+        _REGION_ATTR_LAYER_REPORTS_MAX
+    ):
+        raise ValueError(
+            "reports must hold between "
+            f"{_REGION_ATTR_LAYER_REPORTS_MIN} and "
+            f"{_REGION_ATTR_LAYER_REPORTS_MAX} entries"
+        )
+    for name in reports:
+        if not isinstance(name, str) or not name:
+            raise ValueError("reports keys must be non-empty strings")
+    if set(layers) != set(reports):
+        raise ValueError(
+            "layers keys must be exactly the reports layer names"
+        )
+
+    layer_triples: dict[str, tuple[str, str, str]] = {}
+    for name, triple in layers.items():
+        if not isinstance(triple, tuple) or len(triple) != 3:
+            raise ValueError(
+                "layers values must be (weather, morph, cover) tuples"
+            )
+        if any(not isinstance(value, str) or not value for value in triple):
+            raise ValueError(
+                "layers values must be tuples of three non-empty strings"
+            )
+        layer_triples[name] = triple
+
+    alpha: Decimal | None = None
+    identities: frozenset[tuple[tuple[str, ...], str]] | None = None
+    # layer -> (pick, factor) -> effect
+    parsed_effects: dict[
+        str, dict[tuple[tuple[str, ...], str], Decimal]
+    ] = {}
+    for name, raw in reports.items():
+        report_alpha, effects = _region_attr_layer_output_parse(raw)
+        if alpha is None:
+            alpha = report_alpha
+        elif report_alpha != alpha:
+            raise ValueError("all reports must share one alpha")
+        layer_identities = frozenset(effects)
+        if identities is None:
+            identities = layer_identities
+        elif layer_identities != identities:
+            raise ValueError(
+                "all reports must share the same (pick, factor) identities"
+            )
+        parsed_effects[name] = effects
+    assert alpha is not None and identities is not None
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # (layer order, category, pick, factor index) -> sample effects.
+        samples: dict[
+            tuple[int, str, tuple[str, ...], int], list[Decimal]
+        ] = {}
+        for name in reports:
+            weather, morph, cover = layer_triples[name]
+            for category_index, category in enumerate(
+                (weather, morph, cover)
+            ):
+                for pick, factor in identities:
+                    key = (category_index, category, pick,
+                           _REGION_ATTR_FACTORS.index(factor))
+                    samples.setdefault(key, []).append(
+                        parsed_effects[name][(pick, factor)]
+                    )
+
+        # BH ordering key (p, layer order, category, pick, factor index)
+        # plus the carried statistics.
+        ordered: list[
+            tuple[
+                Decimal, int, str, tuple[str, ...], int, int, Decimal
+            ]
+        ] = []
+        for (category_index, category, pick, factor_index), values in (
+            samples.items()
+        ):
+            n = len(values)
+            n_decimal = Decimal(n)
+            total = Decimal(0)
+            for value in values:
+                total += value
+            mean = total / n_decimal
+            # |sum(s_i x_i) / n| >= |mean| is equivalent (n > 0) to
+            # |sum(s_i x_i)| >= |total|; compare the raw sums so exact
+            # ties are decided without any division rounding.
+            hits = 0
+            for mask in range(1 << n):
+                signed_sum = Decimal(0)
+                for index, value in enumerate(values):
+                    if (mask >> index) & 1:
+                        signed_sum -= value
+                    else:
+                        signed_sum += value
+                if abs(signed_sum) >= abs(total):
+                    hits += 1
+            p_value = Decimal(hits) / Decimal(1 << n)
+            ordered.append(
+                (
+                    p_value,
+                    category_index,
+                    category,
+                    pick,
+                    factor_index,
+                    n,
+                    mean,
+                )
+            )
+
+        ordered.sort(
+            key=lambda row: (
+                row[0], row[1], row[2], row[3], row[4]
+            )
+        )
+        tested = len(ordered)
+        stats: dict[
+            tuple[int, str, tuple[str, ...], int],
+            tuple[int, Decimal, Decimal, Decimal],
+        ] = {}
+        running = Decimal(1)
+        for rank_index in range(tested, 0, -1):
+            (p_value, category_index, category, pick, factor_index,
+             n, mean) = ordered[rank_index - 1]
+            candidate = Decimal(tested) * p_value / Decimal(rank_index)
+            if candidate < running:
+                running = candidate
+            q_value = min(Decimal(1), running)
+            stats[(category_index, category, pick, factor_index)] = (
+                n, mean, p_value, q_value
+            )
+
+        group_keys = sorted(
+            {
+                (category_index, category)
+                for category_index, category, _pick, _factor in stats
+            }
+        )
+        group_tokens: list[str] = []
+        for category_index, category in group_keys:
+            by = _REGION_ATTR_FACTORS[category_index]
+            item_keys = sorted(
+                (
+                    (pick, factor_index)
+                    for c_index, c_name, pick, factor_index in stats
+                    if c_index == category_index and c_name == category
+                ),
+                key=lambda key: (key[0], key[1]),
+            )
+            item_tokens: list[str] = []
+            for pick, factor_index in item_keys:
+                n, mean, p_value, q_value = stats[
+                    (category_index, category, pick, factor_index)
+                ]
+                reject = q_value <= alpha
+                item_tokens.append(
+                    '{"pick":' + _driver_plan_string_array(pick)
+                    + ',"factor":'
+                    + json.dumps(
+                        _REGION_ATTR_FACTORS[factor_index],
+                        ensure_ascii=False,
+                    )
+                    + ',"n":' + str(n)
+                    + ',"mean":' + _format6(mean)
+                    + ',"p":' + _format6(p_value)
+                    + ',"q":' + _format6(q_value)
+                    + ',"reject":' + ("true" if reject else "false")
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(category, ensure_ascii=False)
                 + ',"items":[' + ",".join(item_tokens) + "]}"
             )
 
