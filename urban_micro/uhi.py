@@ -117,6 +117,7 @@ __all__ = [
     "region_attr_layer_report",
     "region_attr_layer_stability",
     "region_attr_layer_trend",
+    "scenario_eval",
 ]
 
 _RECORD_KEYS = frozenset({"station_id", "timestamp", "temp_c"})
@@ -27523,3 +27524,334 @@ def surface_thermal_zone_scenario_report(
             + ',"delta":"' + _format6(urban[2] - rural[2]) + '"'
             + '}}'
         )
+
+
+_SCENARIO_EVAL_REPORT_ERROR = (
+    "report must be a region_attr_layer_priority JSON output"
+)
+
+
+def _scenario_eval_report_parse(
+    raw: object,
+) -> list[tuple[str, str, list[tuple[tuple[str, ...], int, Decimal, int]]]]:
+    """Parse one byte-for-byte canonical
+    :func:`region_attr_layer_priority` JSON output.
+
+    Returns the groups in report order as ``(by, key, items)`` triples
+    with each item a ``(pick, n, score, rank)`` tuple. The input must
+    reproduce a canonical output exactly (key order, escaping, group and
+    item order and the six-decimal number tokens included); any
+    deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_SCENARIO_EVAL_REPORT_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+
+    groups: list[
+        tuple[str, str, list[tuple[tuple[str, ...], int, Decimal, int]]]
+    ] = []
+    group_tokens: list[str] = []
+    previous_group: tuple[int, str] | None = None
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"by", "key", "items"}:
+            raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+        by = group["by"]
+        key = group["key"]
+        raw_items = group["items"]
+        if (
+            by not in _REGION_ATTR_FACTORS
+            or not isinstance(key, str)
+            or not key
+            or not isinstance(raw_items, list)
+            or not raw_items
+        ):
+            raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+        by_order = _REGION_ATTR_FACTORS.index(by)
+        if previous_group is not None and (by_order, key) <= previous_group:
+            raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+        previous_group = (by_order, key)
+
+        items: list[tuple[tuple[str, ...], int, Decimal, int]] = []
+        item_tokens: list[str] = []
+        for rank, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict) or set(item) != {
+                "pick", "n", "score", "rank",
+            }:
+                raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+            pick = _rank_pick(item["pick"], _SCENARIO_EVAL_REPORT_ERROR)
+            n = item["n"]
+            score = item["score"]
+            item_rank = item["rank"]
+            if (
+                isinstance(n, bool)
+                or not isinstance(n, int)
+                or not _REGION_ATTR_LAYER_REPORTS_MIN <= n <= (
+                    _REGION_ATTR_LAYER_REPORTS_MAX
+                )
+                or not isinstance(score, _RankTrajectoryNumber)
+                or score < 0
+                or score > 7
+                or isinstance(item_rank, bool)
+                or not isinstance(item_rank, int)
+                or item_rank != rank
+            ):
+                raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+            if (by, key, pick) in seen:
+                raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+            seen.add((by, key, pick))
+            items.append((pick, n, score, rank))
+            item_tokens.append(
+                '{"pick":' + _driver_plan_string_array(pick)
+                + ',"n":' + str(n)
+                + ',"score":' + _format6(score)
+                + ',"rank":' + str(rank)
+                + "}"
+            )
+        groups.append((by, key, items))
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"key":' + json.dumps(key, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_SCENARIO_EVAL_REPORT_ERROR)
+
+    return groups
+
+
+def scenario_eval(report: str, rows: list, *, alpha: float = 0.05) -> str:
+    """Sign-flip stability evaluation for priority-ranked scenario picks.
+
+    ``report`` must be a byte-for-byte canonical
+    :func:`region_attr_layer_priority` JSON output. ``rows`` is a list
+    of strict ``(by, key, pick, u, e, v)`` six-tuples: ``pick`` is a
+    tuple, ``u`` (uhi), ``e`` (energy) and ``v`` (vent) are finite
+    non-boolean int/float numbers and every ``(by, key, pick)`` triple
+    must match one report item. Each report item must carry between 1
+    and 16 rows. A non-string ``report`` or a non-list ``rows`` raises
+    ``TypeError``; every other contract violation raises ``ValueError``.
+    ``alpha`` is a finite non-boolean number with ``0 < alpha <= 1``.
+    An empty report pairs with an empty ``rows`` list and yields
+    ``"groups": []``.
+
+    For every report item and each of the three metrics (``uhi``,
+    ``energy``, ``vent`` in that order), with the metric values ``x_i``
+    and ``n`` the item's row count, ``mean`` is ``sum(x_i) / n`` and
+    ``p`` is the exact two-sided sign-flip p-value
+    ``2 ** -n * #{|sum(s_i x_i) / n| >= |mean|}`` over all ``2 ** n``
+    sign vectors ``s_i`` in ``{-1, 1}``.
+
+    All ``3 * number_of_items`` tests share one global
+    Benjamini-Hochberg pass: they rank ascending by ``(p, report item
+    order, metric order)`` and rank ``j`` (1-based) gets
+    ``q_j = min(1, min(N * p_l / l for l in j..N))``. An item is
+    ``stable`` when all three ``q`` are at most ``alpha`` and the uhi
+    and energy means are negative while the vent mean is positive;
+    ``benefit`` is ``-mean_uhi - mean_energy + mean_vent``. Within each
+    group items are ranked by ``stable`` first, then descending
+    ``benefit``, then ascending report ``rank``, with ``rank`` starting
+    at 1; comparisons use the unquantized values.
+
+    Numbers enter as ``Decimal(str(x))`` and arithmetic runs under a
+    precision-1000, ROUND_HALF_EVEN local context. Returns a compact
+    UTF-8 JSON string with no spaces and exactly one trailing newline;
+    the top-level key order is ``alpha, groups``, each group uses
+    ``by, key, items`` and each item uses ``pick, n, mean, q, benefit,
+    stable, rank``. Groups keep the report order and items sort by
+    ``rank``; ``pick`` is a string array, ``n`` and ``rank`` are JSON
+    integers, ``stable`` is a JSON boolean, ``mean`` and ``q`` are
+    three-element arrays in uhi, energy, vent order and ``alpha``,
+    ``mean``, ``q`` and ``benefit`` render with six decimals, negative
+    zero normalized to ``0.000000``.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(rows, list):
+        raise TypeError("rows must be a list")
+    alpha_value = _validate_finite_number(alpha, "alpha")
+    if alpha_value <= 0 or alpha_value > 1:
+        raise ValueError("alpha must be greater than 0 and at most 1")
+
+    report_groups = _scenario_eval_report_parse(report)
+
+    # (by, key, pick) -> flat item index in report order
+    report_index: dict[tuple[str, str, tuple[str, ...]], int] = {}
+    for by, key, items in report_groups:
+        for pick, _n, _score, _rank in items:
+            report_index[(by, key, pick)] = len(report_index)
+
+    item_rows: dict[
+        tuple[str, str, tuple[str, ...]],
+        list[tuple[Decimal, Decimal, Decimal]],
+    ] = {}
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) != 6:
+            raise ValueError(
+                "each row must be a (by, key, pick, u, e, v) six-tuple"
+            )
+        by, key, pick, u, e, v = row
+        if not isinstance(by, str) or not isinstance(key, str):
+            raise ValueError("by and key must be strings")
+        if not isinstance(pick, tuple) or any(
+            not isinstance(member, str) for member in pick
+        ):
+            raise ValueError("pick must be a tuple of strings")
+        u_value = _validate_finite_number(u, "u")
+        e_value = _validate_finite_number(e, "e")
+        v_value = _validate_finite_number(v, "v")
+        identity = (by, key, pick)
+        if identity not in report_index:
+            raise ValueError(
+                f"(by, key, pick) {identity!r} matches no report item"
+            )
+        item_rows.setdefault(identity, []).append(
+            (u_value, e_value, v_value)
+        )
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+
+        # flat report item index -> (n, means, ps) in uhi/energy/vent order
+        stats: dict[
+            int, tuple[int, list[Decimal], list[Decimal]]
+        ] = {}
+        for by, key, items in report_groups:
+            for pick, _n, _score, _rank in items:
+                identity = (by, key, pick)
+                members = item_rows.get(identity)
+                if members is None:
+                    raise ValueError(
+                        f"report item {identity!r} has no rows"
+                    )
+                n = len(members)
+                if n > _PERMUTATION_MAX_N:
+                    raise ValueError(
+                        f"report item {identity!r} has {n} rows; "
+                        f"scenario_eval requires at most "
+                        f"{_PERMUTATION_MAX_N} rows per item"
+                    )
+                means: list[Decimal] = []
+                p_values: list[Decimal] = []
+                for metric_index in range(3):
+                    values = [member[metric_index] for member in members]
+                    total = Decimal(0)
+                    for value in values:
+                        total += value
+                    means.append(total / n)
+                    p_values.append(_pareto_attr_sign_p(values))
+                stats[report_index[identity]] = (n, means, p_values)
+
+        # Global Benjamini-Hochberg over every (item, metric) test, ranked
+        # by (p, report item order, metric order); accumulate N * p_l / l
+        # as a running minimum from the top rank down.
+        ranked = sorted(
+            (p_value, item_index, metric_index)
+            for item_index, (_n, _means, p_values) in stats.items()
+            for metric_index, p_value in enumerate(p_values)
+        )
+        count = len(ranked)
+        q_values: dict[tuple[int, int], Decimal] = {}
+        running = Decimal(1)
+        for rank in range(count, 0, -1):
+            p_value, item_index, metric_index = ranked[rank - 1]
+            candidate = Decimal(count) * p_value / rank
+            if candidate < running:
+                running = candidate
+            q_values[(item_index, metric_index)] = running
+
+        group_tokens: list[str] = []
+        for by, key, items in report_groups:
+            evaluated: list[tuple] = []
+            for pick, _n, _score, report_rank in items:
+                identity = (by, key, pick)
+                item_index = report_index[identity]
+                n, means, _p_values = stats[item_index]
+                qs = [
+                    q_values[(item_index, metric_index)]
+                    for metric_index in range(3)
+                ]
+                stable = (
+                    all(q_value <= alpha_value for q_value in qs)
+                    and means[0] < 0
+                    and means[1] < 0
+                    and means[2] > 0
+                )
+                benefit = -means[0] - means[1] + means[2]
+                evaluated.append(
+                    (pick, n, means, qs, benefit, stable, report_rank)
+                )
+            evaluated.sort(
+                key=lambda value: (not value[5], -value[4], value[6])
+            )
+            item_tokens: list[str] = []
+            for rank, (
+                pick, n, means, qs, benefit, stable, _report_rank
+            ) in enumerate(evaluated, start=1):
+                item_tokens.append(
+                    '{"pick":' + _driver_plan_string_array(pick)
+                    + ',"n":' + str(n)
+                    + ',"mean":[' + ",".join(
+                        _format6(mean) for mean in means
+                    ) + "]"
+                    + ',"q":[' + ",".join(
+                        _format6(q_value) for q_value in qs
+                    ) + "]"
+                    + ',"benefit":' + _format6(benefit)
+                    + ',"stable":' + ("true" if stable else "false")
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(by, ensure_ascii=False)
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha_value)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
