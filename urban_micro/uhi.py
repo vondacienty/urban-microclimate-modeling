@@ -113,6 +113,7 @@ __all__ = [
     "pareto_region_compare",
     "pareto_region_stability",
     "region_attr",
+    "region_attr_layer_priority",
     "region_attr_layer_report",
     "region_attr_layer_stability",
     "region_attr_layer_trend",
@@ -23124,6 +23125,306 @@ def region_attr_layer_trend(reports: dict) -> str:
                     + ',"changes":' + str(changes)
                     + ',"status":'
                     + json.dumps(status, ensure_ascii=False)
+                    + ',"rank":' + str(rank)
+                    + "}"
+                )
+            group_tokens.append(
+                '{"by":' + json.dumps(
+                    _REGION_ATTR_FACTORS[by_order], ensure_ascii=False
+                )
+                + ',"key":' + json.dumps(key, ensure_ascii=False)
+                + ',"items":[' + ",".join(item_tokens) + "]}"
+            )
+
+    return (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}\n"
+    )
+
+
+_REGION_ATTR_LAYER_PRIORITY_ERROR = (
+    "report must be a region_attr_layer_trend JSON output"
+)
+
+# Status points parallel to ``_REGION_ATTR_LAYER_TREND_STATUSES``:
+# 持续, 增强, 减弱, 翻转 and 不活跃 score 4, 3, 2, 1 and 0.
+_REGION_ATTR_LAYER_STATUS_POINTS = (4, 3, 2, 1, 0)
+
+
+def _region_attr_layer_trend_output_parse(
+    raw: object,
+) -> tuple[
+    Decimal,
+    dict[
+        tuple[str, str, tuple[str, ...], str],
+        tuple[int, Decimal, Decimal, str],
+    ],
+]:
+    """Parse one byte-for-byte canonical
+    :func:`region_attr_layer_trend` JSON output.
+
+    Returns ``(alpha, entries)`` mapping each
+    ``(by, key, pick, factor)`` identity to ``(n, slope, share,
+    status)``. The input must reproduce a canonical output exactly
+    (key order, escaping, group and item order and the six-decimal
+    number tokens included); any deviation raises ``ValueError``.
+    """
+    if not isinstance(raw, str):
+        raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+    if not raw.endswith("\n") or raw.endswith("\n\n"):
+        raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+    payload = raw[:-1]
+
+    def _parse_number(value: str) -> Decimal:
+        if not _INTERVALS_NUMBER_RE.fullmatch(value):
+            raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+        number = _RankTrajectoryNumber(value)
+        # Negative zero never serializes.
+        if number == 0 and value.startswith("-"):
+            raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+        return number
+
+    def _parse_constant(value: str) -> Decimal:
+        raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+
+    try:
+        data = json.loads(
+            payload,
+            parse_float=_parse_number,
+            parse_int=_rank_trajectory_parse_int,
+            parse_constant=_parse_constant,
+        )
+    except ValueError:
+        raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR) from None
+    if not isinstance(data, dict) or set(data) != {"alpha", "groups"}:
+        raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+    alpha = data["alpha"]
+    raw_groups = data["groups"]
+    if (
+        not isinstance(alpha, _RankTrajectoryNumber)
+        or alpha <= 0
+        or alpha > 1
+        or not isinstance(raw_groups, list)
+    ):
+        raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+
+    entries: dict[
+        tuple[str, str, tuple[str, ...], str],
+        tuple[int, Decimal, Decimal, str],
+    ] = {}
+    group_tokens: list[str] = []
+    previous_group: tuple[int, str] | None = None
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {"by", "key", "items"}:
+            raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+        by = group["by"]
+        key = group["key"]
+        raw_items = group["items"]
+        if (
+            by not in _REGION_ATTR_FACTORS
+            or not isinstance(key, str)
+            or not key
+            or not isinstance(raw_items, list)
+            or not raw_items
+        ):
+            raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+        by_order = _REGION_ATTR_FACTORS.index(by)
+        if previous_group is not None and (
+            by_order, key
+        ) <= previous_group:
+            raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+        previous_group = (by_order, key)
+
+        item_tokens: list[str] = []
+        for rank, item in enumerate(raw_items, start=1):
+            if not isinstance(item, dict) or set(item) != {
+                "pick", "factor", "n", "slope", "share", "changes",
+                "status", "rank",
+            }:
+                raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+            raw_pick = item["pick"]
+            factor = item["factor"]
+            n = item["n"]
+            slope = item["slope"]
+            share = item["share"]
+            changes = item["changes"]
+            status = item["status"]
+            item_rank = item["rank"]
+            pick = _rank_pick(raw_pick, _REGION_ATTR_LAYER_PRIORITY_ERROR)
+            if (
+                factor not in _REGION_ATTR_FACTORS
+                or isinstance(n, bool)
+                or not isinstance(n, int)
+                or not _REGION_ATTR_LAYER_REPORTS_MIN <= n <= (
+                    _REGION_ATTR_LAYER_REPORTS_MAX
+                )
+                or not isinstance(slope, _RankTrajectoryNumber)
+                or slope < -2
+                or slope > 2
+                or not isinstance(share, _RankTrajectoryNumber)
+                or share < 0
+                or share > 1
+                or isinstance(changes, bool)
+                or not isinstance(changes, int)
+                or not 0 <= changes <= n - 1
+                or status not in _REGION_ATTR_LAYER_TREND_STATUSES
+                or isinstance(item_rank, bool)
+                or not isinstance(item_rank, int)
+                or item_rank != rank
+            ):
+                raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+            if (by, key, pick, factor) in entries:
+                raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+            entries[(by, key, pick, factor)] = (n, slope, share, status)
+            item_tokens.append(
+                '{"pick":' + _driver_plan_string_array(pick)
+                + ',"factor":'
+                + json.dumps(factor, ensure_ascii=False)
+                + ',"n":' + str(n)
+                + ',"slope":' + _format6(slope)
+                + ',"share":' + _format6(share)
+                + ',"changes":' + str(changes)
+                + ',"status":' + json.dumps(status, ensure_ascii=False)
+                + ',"rank":' + str(rank)
+                + "}"
+            )
+        group_tokens.append(
+            '{"by":' + json.dumps(by, ensure_ascii=False)
+            + ',"key":' + json.dumps(key, ensure_ascii=False)
+            + ',"items":[' + ",".join(item_tokens) + "]}"
+        )
+
+    # Structural validation alone accepts equivalent re-serializations;
+    # the payload must reproduce the canonical output byte-for-byte.
+    canonical = (
+        '{"alpha":' + _format6(alpha)
+        + ',"groups":[' + ",".join(group_tokens) + "]}"
+    )
+    if payload != canonical:
+        raise ValueError(_REGION_ATTR_LAYER_PRIORITY_ERROR)
+
+    return alpha, entries
+
+
+def region_attr_layer_priority(report: str, weights: dict) -> str:
+    """Score and rank the picks of a :func:`region_attr_layer_trend`
+    output with per-factor weights.
+
+    ``report`` must be a byte-for-byte canonical
+    :func:`region_attr_layer_trend` JSON output and ``weights`` a dict
+    with exactly the keys ``weather``, ``morph`` and ``cover``, each
+    mapping to a positive finite non-boolean int/float. A non-string
+    ``report`` or a non-dict ``weights`` raises ``TypeError``; every
+    other violation raises ``ValueError``.
+
+    Every ``(by, key, pick)`` triple must carry all three factors with
+    one shared ``n``. The statuses score 4, 3, 2, 1 and 0 points for
+    持续, 增强, 减弱, 翻转 and 不活跃; each factor item contributes
+    ``v = weights[factor] * (points + share + abs(slope)) / W`` with
+    ``W`` the sum of the weights and the pick's ``score`` is the sum of
+    its three ``v``. Within each group picks are ranked by descending
+    ``score`` then ascending ``pick``, with ``rank`` starting at 1.
+
+    Numbers enter as ``Decimal(str(x))`` and the scores run under a
+    precision-1000, ROUND_HALF_EVEN local context; ranking compares the
+    unquantized scores. Returns a compact UTF-8 JSON string with no
+    spaces and exactly one trailing newline; the top-level key order is
+    ``alpha, groups``, each group uses ``by, key, items`` and each item
+    uses ``pick, n, score, rank``. Groups sort by the
+    weather/morph/cover factor order then ``key`` and items by
+    ``rank``; ``pick`` is an ascending string array, ``n`` and ``rank``
+    render as JSON integers while ``alpha`` and ``score`` render with
+    six decimals, negative zero normalized to ``0.000000``. Empty
+    identities yield ``groups=[]``.
+    """
+    if not isinstance(report, str):
+        raise TypeError("report must be a str")
+    if not isinstance(weights, dict):
+        raise TypeError("weights must be a dict")
+    if set(weights) != set(_REGION_ATTR_FACTORS):
+        raise ValueError(
+            "weights keys must be exactly weather, morph and cover"
+        )
+    weight_values: dict[str, Decimal] = {}
+    for factor in _REGION_ATTR_FACTORS:
+        weight = weights[factor]
+        if isinstance(weight, bool) or not isinstance(
+            weight, (int, float)
+        ):
+            raise ValueError("each weight must be a finite int or float")
+        if isinstance(weight, float) and not math.isfinite(weight):
+            raise ValueError("each weight must be finite")
+        decimal_weight = Decimal(str(weight))
+        if decimal_weight <= 0:
+            raise ValueError("each weight must be positive")
+        weight_values[factor] = decimal_weight
+
+    alpha, entries = _region_attr_layer_trend_output_parse(report)
+
+    with localcontext() as ctx:
+        ctx.prec = _MODEL_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+        total_weight = Decimal(0)
+        for factor in _REGION_ATTR_FACTORS:
+            total_weight += weight_values[factor]
+
+        # (by order, key, pick) -> factor -> (n, slope, share, status)
+        triples: dict[
+            tuple[int, str, tuple[str, ...]],
+            dict[str, tuple[int, Decimal, Decimal, str]],
+        ] = {}
+        for (by, key, pick, factor), value in entries.items():
+            triples.setdefault(
+                (_REGION_ATTR_FACTORS.index(by), key, pick), {}
+            )[factor] = value
+
+        # (by order, key, pick) -> (n, score)
+        scores: dict[
+            tuple[int, str, tuple[str, ...]], tuple[int, Decimal]
+        ] = {}
+        for (by_order, key, pick), factor_entries in triples.items():
+            if set(factor_entries) != set(_REGION_ATTR_FACTORS):
+                raise ValueError(
+                    "each (by, key, pick) must have all three factors "
+                    "with the same n"
+                )
+            n_values = {value[0] for value in factor_entries.values()}
+            if len(n_values) != 1:
+                raise ValueError(
+                    "each (by, key, pick) must have all three factors "
+                    "with the same n"
+                )
+            n = n_values.pop()
+            score = Decimal(0)
+            for factor in _REGION_ATTR_FACTORS:
+                _n, slope, share, status = factor_entries[factor]
+                points = _REGION_ATTR_LAYER_STATUS_POINTS[
+                    _REGION_ATTR_LAYER_TREND_STATUSES.index(status)
+                ]
+                score += weight_values[factor] * (
+                    Decimal(points) + share + abs(slope)
+                ) / total_weight
+            scores[(by_order, key, pick)] = (n, score)
+
+        group_keys = sorted({
+            (by_order, key) for by_order, key, _pick in scores
+        })
+        group_tokens: list[str] = []
+        for by_order, key in group_keys:
+            ranked = sorted(
+                (
+                    (pick, n, score)
+                    for (b_order, b_key, pick), (n, score) in scores.items()
+                    if b_order == by_order and b_key == key
+                ),
+                key=lambda value: (-value[2], value[0]),
+            )
+            item_tokens: list[str] = []
+            for rank, (pick, n, score) in enumerate(ranked, start=1):
+                item_tokens.append(
+                    '{"pick":' + _driver_plan_string_array(pick)
+                    + ',"n":' + str(n)
+                    + ',"score":' + _format6(score)
                     + ',"rank":' + str(rank)
                     + "}"
                 )
